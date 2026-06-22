@@ -1,6 +1,7 @@
 # MSE Graph Language Model — v2.1 Implementation
 
 # Author: Clifford Chivhanga
+# Visit for more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 A fully deterministic, graph-based language engine that models language using discrete token transitions instead of continuous neural network weights. Built for ultra-low-resource environments, strict syntax guardrails, and 100% explainable symbolic execution.
 
