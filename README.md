@@ -123,8 +123,8 @@ Full design rationale, worked examples, and complexity analysis: [`docs/SDD_v2_1
 **No pip installs required.** Python 3.8+ standard library only.
 
 ```bash
-git clone https://github.com/cliffordchivhanga/mse-glm.git
-cd mse-glm
+git clone https://github.com/fodokidza/mse_glm.git
+cd mse_glm
 
 # train from a file (streamed — not bounded by RAM)
 python3 train.py --corpus path/to/corpus.txt --out runs/model --vocab-size 2000
