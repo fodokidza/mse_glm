@@ -1,5 +1,9 @@
 # MSE Graph Language Model (MSE-GLM)
 
+IS A DUAL-MODE ENGINE
+1. STRICT MODE
+2. OPEN MODE
+
 **Deterministic · Explainable · Zero learned weights · CPU only**
 
 A language model with no neural network. Language is represented as a
