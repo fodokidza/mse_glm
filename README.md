@@ -1,5 +1,9 @@
 # MSE Graph Language Model (MSE-GLM)
 
+Author: Clifford Chivhanga
+Email: cliffordchivhanga318@gmail.com
+For more in info: aircityshops.com/index.php?url=city/mse_blog
+
 **Deterministic · Explainable · Zero learned weights · CPU only**
 
 A language model with no neural network. Language is represented as a
@@ -227,25 +231,6 @@ This regression is covered by a dedicated automated test.
 
 ---
 
-## Limitations
-
-- No semantic understanding. No reasoning. No generalisation to unseen transitions.
-- Sequential context limited to `(previous, current)`; lineage tracking is a global signal, not a longer window.
-- Distributional clustering is slot-substitution only — does not distinguish synonyms from antonyms.
-- Tokens touching universal structural positions (`<BOS>`, `<EOS>`) cluster together even when otherwise unrelated.
-
-See [`docs/SDD_v2_1.pdf`](docs/SDD_v2_1.pdf) for the full discussion.
-
----
-
-## Roadmap
-
-| Version | Planned |
-|---|---|
-| v2.2 | Punctuation preservation · higher-order (4/5-token) bridge context · sparse storage |
-| v3.0 | Hybrid graph + embedding · disk-backed storage · weighted/frequency-aware clustering |
-
----
 
 ## License
 
@@ -259,4 +244,4 @@ a commercial license is available — open an issue or contact the author.
 ## Author
 
 **Clifford Chivhanga**  
-[github.com/cliffordchivhanga](https://github.com/cliffordchivhanga)
+[email](cliffordchivhanga318@gmail.com)
