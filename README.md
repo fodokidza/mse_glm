@@ -1,14 +1,16 @@
 # MSE Graph Language Model (MSE-GLM)
 
-Author: Clifford Chivhanga
-Email: cliffordchivhanga318@gmail.com
-For more in info: aircityshops.com/index.php?url=city/mse_blog
-
 **Deterministic · Explainable · Zero learned weights · CPU only**
 
 A language model with no neural network. Language is represented as a
 token-transition graph. Every generation decision is traceable back to the
 exact rule that produced it. No gradients, no GPU, no black box.
+
+Author: Clifford Chivhanga
+
+Email: cliffordchivhanga318@gmail.com
+
+For more in info: https://aircityshops.com/index.php?url=city/mse_blog
 
 ```
 $ python3 train.py --corpus corpus.txt --out runs/model
