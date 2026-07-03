@@ -15,6 +15,7 @@ Passing exp_edge/exp_bridge/exp_rel=None degrades gracefully to strict.
 """
 
 from collections import Counter
+import random
 from tokenizer import EOS
 
 class InferenceEngine:
@@ -170,10 +171,10 @@ class InferenceEngine:
 
         # Tie in Stage 1
         if previous is None:
-            # No previous context — all tied candidates are equally valid
-            token = next(iter(s1_pass))   # storage/sorted order
+            # No previous context — all tied candidates equally valid; pick randomly
+            token = random.choice(sorted(s1_pass))
             new_rels = self._narrow(active_rels, s1_pass[token])
-            return token, {"stage": 1, "rule": "no_previous_all_valid",
+            return token, {"stage": 1, "rule": "no_previous_all_valid_random",
                            "chosen": token, "active_rels": new_rels,
                            "candidates": list(s1_pass)}
 
@@ -206,26 +207,48 @@ class InferenceEngine:
                 return token, {"stage": 2, "rule": "exact_match_unique",
                                "chosen": token, "active_rels": new_rels,
                                "candidates": list(s2_pass)}
-            # Still tied — all are genuinely valid continuations
-            token = next(iter(s2_pass))
+            # Still tied — genuinely ambiguous; pick randomly
+            token = random.choice(sorted(s2_pass))
             new_rels = self._narrow(active_rels, s2_pass[token])
-            return token, {"stage": 2, "rule": "all_valid_first",
+            return token, {"stage": 2, "rule": "all_valid_random",
                            "chosen": token, "active_rels": new_rels,
                            "candidates": list(s2_pass)}
 
-        # Stage 2 found nothing — fall back to Stage 1 first candidate
-        token = next(iter(s1_pass))
+        # Stage 2 found nothing — fall back to Stage 1, random among tied
+        token = random.choice(sorted(s1_pass))
         new_rels = self._narrow(active_rels, s1_pass[token])
-        return token, {"stage": 1, "rule": "s2_empty_s1_first",
+        return token, {"stage": 1, "rule": "s2_empty_s1_random",
                        "chosen": token, "active_rels": new_rels,
                        "candidates": list(s1_pass)}
 
     def generate(self, prompt_ids, max_tokens=40):
-        ids         = list(prompt_ids)
-        # ── seed active_rels from prompt tokens ───────────────────────────
-        # Walk every consecutive triple in the prompt and narrow active_rels
-        # exactly as we would during generation, so the lineage established
-        # by the prompt carries into the first generated token.
+        ids = list(prompt_ids)
+
+        # ── validate every adjacent bigram in the prompt ──────────────
+        # If any (curr→next) pair does not exist in E (or EE in open
+        # mode), the prompt contains a transition the model has never
+        # seen. Return immediately — cannot legally continue.
+        def _has_edge(a, b):
+            if b in self.edges.successors(a):
+                return True
+            if self.exp_edges and b in self.exp_edges.successors(a):
+                return True
+            return False
+
+        # ── validate prompt bigrams (skip BOS→first_token) ──────────
+        # BOS is prepended artificially by encode() — it is not a real
+        # training token with known successors. Any real token is a valid
+        # generation starting point. Only validate pairs between real tokens.
+        for i in range(1, len(ids) - 1):
+            curr, nxt = ids[i], ids[i + 1]
+            if not _has_edge(curr, nxt):
+                return ids, [{"stage": 0,
+                              "rule": "illegal_prompt_bigram",
+                              "chosen": EOS,
+                              "detail": f"bigram ({curr}->{nxt}) not in edge matrix",
+                              "active_rels": set()}]
+
+        # ── seed active_rels from prompt triples ──────────────────────
         active_rels = set()
         for i in range(len(ids) - 2):
             rels = self._rel_ids(ids[i], ids[i+1], ids[i+2])
@@ -234,9 +257,9 @@ class InferenceEngine:
             else:
                 active_rels = set()   # lineage broken — reset, don't keep stale lock
         # ─────────────────────────────────────────────────────────────
-        trace       = []
-        previous    = ids[-2] if len(ids) >= 2 else None
-        current     = ids[-1]
+        trace    = []
+        previous = ids[-2] if len(ids) >= 2 else None
+        current  = ids[-1]
         for _ in range(max_tokens):
             token, step_trace = self.step(previous, current, active_rels)
             trace.append(step_trace)
