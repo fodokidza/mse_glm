@@ -14,7 +14,7 @@ Author: Clifford Chivhanga
 
 Email: cliffordchivhanga318@gmail.com
 
-For more in info: https://aircityshops.com/index.php?url=city/mse_blog
+For more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 ```
 $ python3 train.py --corpus corpus.txt --out runs/model
