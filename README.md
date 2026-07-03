@@ -64,10 +64,6 @@ model> next='sat'  stage=1  rule=storage_order_fallback  active_rels={1}
 - **CPU only** — array-backed, CSR-indexed storage. Runs on a Raspberry Pi.
 - **Distributional similarity without embeddings** — dual-axis cluster assignment identifies interchangeable tokens structurally, with no embedding model.
 
-## What this is not
-
-Not a transformer competitor for open-domain generation, reasoning, or long-range coherence. It has no semantic understanding — only observed token adjacency and structural slot-sharing. It does not generalise to unseen transitions.
-
 Best suited to **grammar-constrained generation** (SQL, JSON, config files, autocomplete, assembly), **embedded / low-resource environments**, and settings where **auditability and reproducibility** matter more than fluency.
 
 ---
