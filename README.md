@@ -1,20 +1,10 @@
 # MSE Graph Language Model (MSE-GLM)
 
-IS A DUAL-MODE ENGINE
-1. STRICT MODE
-2. OPEN MODE
-
 **Deterministic · Explainable · Zero learned weights · CPU only**
 
 A language model with no neural network. Language is represented as a
 token-transition graph. Every generation decision is traceable back to the
 exact rule that produced it. No gradients, no GPU, no black box.
-
-Author: Clifford Chivhanga
-
-Email: cliffordchivhanga318@gmail.com
-
-For more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 ```
 $ python3 train.py --corpus corpus.txt --out runs/model
@@ -41,28 +31,34 @@ $ python3 train.py --corpus corpus.txt --out runs/model
 ```
 
 ```
-$ python3 chat.py --model runs/model
+$ python3 chat.py --model runs/model --mode open
 you> the dog
 model> the dog sat on the carpet
 
 you> /shared cat dog
-model> cat dog -> sat  [bridge_axis, cluster_id=1, overlap=2]
+model> cat dog -> sat  [bridge_axis  {'cluster_id': 1, 'overlap': 2, 'source': 'training'}]
 
 you> /explain the | dog
-model> next='sat'  stage=1  rule=storage_order_fallback  active_rels={1}
+model> next='sat'  {'stage': 1, 'rule': 'bridge_lineage_unique', 'chosen': 12, 'active_rels': {1}, 'candidates': [12]}
 ```
 
-**Status:** Implemented and tested — 56 / 56 automated checks passing.
+**Status:** Implemented and tested — full regression suite passing, covering
+the core Strict-Mode pipeline plus the Experience Matrix / Open Mode subsystem.
 
 ---
 
 ## What this is
 
 - **Zero learned weights** — a BPE tokenizer feeds a deduplicated bigram/trigram graph. No floats, no backprop, no framework.
-- **Fully deterministic** — same input, same output, every time. No sampling, no temperature.
+- **Fully deterministic** — same input, same output, every time. The only randomness is a uniform tie-break among candidates already judged equally valid; it never changes *which* candidates are valid.
 - **Fully explainable** — every generated token traces back to the exact pipeline stage, rule, and candidate set that produced it, including tie-breaks.
 - **CPU only** — array-backed, CSR-indexed storage. Runs on a Raspberry Pi.
 - **Distributional similarity without embeddings** — dual-axis cluster assignment identifies interchangeable tokens structurally, with no embedding model.
+- **Two inference modes** — **Strict Mode** (training data only) and **Open Mode** (training data plus structurally-inferred Experience Matrices), sharing one engine.
+
+## What this is not
+
+Not a transformer competitor for open-domain generation, reasoning, or long-range coherence. It has no semantic understanding — only observed token adjacency and structural slot-sharing. Strict Mode does not generalise to unseen transitions at all; Open Mode generalises only as far as dual-axis clustering can structurally justify (see below).
 
 Best suited to **grammar-constrained generation** (SQL, JSON, config files, autocomplete, assembly), **embedded / low-resource environments**, and settings where **auditability and reproducibility** matter more than fluency.
 
@@ -82,35 +78,42 @@ Sentence Splitting         on  .  !  ?  \n
   ├──────────────────────────────────────────────────────────┐
   ▼                         ▼                                ▼
 Edge Matrix (E)        Bridge Matrix (B)          Relationship Matrix (R)
-deduplicated bigrams   deduplicated trigrams       (triple_id, rel_id) only
+deduplicated bigrams   deduplicated triples        (triple_id, rel_id) only
 CSR-indexed by source  + dual-axis cluster_id      no triple content
                        + T_index                   duplicated
   │
+  │   (optional, offline — one command: build_experience.py)
   ▼
-Inference Engine
-  Stage 1 — Exact Bridge Match  (lineage-aware tie-break via R)
-  Stage 2 — Bridge Voting       (2× weight if bridge matches current)
-  Stage 3 — Bigram Voting       (Edge Matrix fallback)
-  Stage 4 — Termination         (emit <EOS>)
-  +  infer_shared_role()        (unordered cluster-based query)
+Experience Builder
+  Rule 1 — bridge-axis structural expansion
+  Rule 2 — target-axis structural expansion
+  → Experience Edge / Bridge / Relationship Matrices (EE, EB, ER)
+  │
+  ▼
+Inference Engine                 (Strict: E,B,R only · Open: + EE,EB,ER)
+  Stage 1 — Current-token authority   (bridge-lineage vote via active_rels)
+  Stage 2 — Previous-token authority  (exact-triple lineage vote)
+  Termination                          (emit <EOS> when no successors)
+  +  infer_shared_role()               (unordered cluster-based query)
   │
   ▼
 MSEGraphLanguageModel
-generate · explain_step · infer_shared_role · save / load
+generate · explain_step · infer_shared_role · token_similarity
+train / build_experience / load_experience / save / load / stats
 ```
 
 | File | Role |
 |---|---|
 | `tokenizer.py` | BPE tokenizer — special tokens, normalization, in-memory or streamed training |
 | `graph.py` | `EdgeMatrix`, `BridgeMatrix` (dual-axis `cluster_id` + `T_index`), `RelationshipMatrix` |
-| `inference.py` | Four-stage deterministic pipeline, lineage-aware tie-break, `infer_shared_role()` |
-| `model.py` | `MSEGraphLanguageModel` — orchestrates everything, `train / generate / explain / save / load` |
+| `experience.py` | `ExperienceEdgeMatrix` / `ExperienceBridgeMatrix` / `ExperienceRelationshipMatrix` + `ExperienceBuilder` — derives Open Mode's structurally-inferred triples |
+| `build_experience.py` | Standalone CLI that builds Experience Matrices for a saved model, with a live progress display |
+| `inference.py` | Two-stage deterministic pipeline (current-token authority, then previous-token authority), lineage-aware tie-break via `active_rels`, `infer_shared_role()` |
+| `model.py` | `MSEGraphLanguageModel` — orchestrates everything, `train / generate / explain / infer_shared_role / token_similarity / save / load` |
 | `analyse.py` | Library + 12-subcommand CLI for corpus stats, topology, clusters, relationships, traces |
 | `train.py` | CLI training pipeline with live phase-by-phase progress display |
-| `chat.py` | Interactive REPL — generation, `/explain`, `/shared`, `/clusters`, `/stats` |
-| `test.py` | 56 automated regression checks |
-
-Full design rationale, worked examples, and complexity analysis: [`docs/SDD_v2_1.pdf`](docs/SDD_v2_1.pdf)
+| `chat.py` | Interactive REPL — generation, `/mode`, `/explain`, `/shared`, `/similarity`, `/stats`, `/clusters`, `/exp` |
+| `test.py` | Automated regression suite — Strict Mode core (56 original checks) plus full Experience Matrix / Open Mode coverage |
 
 ---
 
@@ -119,8 +122,8 @@ Full design rationale, worked examples, and complexity analysis: [`docs/SDD_v2_1
 **No pip installs required.** Python 3.8+ standard library only.
 
 ```bash
-git clone https://github.com/fodokidza/mse_glm.git
-cd mse_glm
+git clone https://github.com/fodokidza/mse-glm.git
+cd mse-glm
 
 # train from a file (streamed — not bounded by RAM)
 python3 train.py --corpus path/to/corpus.txt --out runs/model --vocab-size 2000
@@ -129,8 +132,12 @@ python3 train.py --corpus path/to/corpus.txt --out runs/model --vocab-size 2000
 python3 train.py --text "the cat sat on the mat. the dog sat on the carpet." \
                  --out runs/demo --vocab-size 200
 
-# chat with it
-python3 chat.py --model runs/model
+# (optional) derive Experience Matrices for Open Mode
+python3 build_experience.py --model runs/model
+
+# chat with it — strict (training data only) or open (+ experience)
+python3 chat.py --model runs/model --mode strict
+python3 chat.py --model runs/model --mode open
 
 # run the tests
 python3 test.py
@@ -143,17 +150,21 @@ from model import MSEGraphLanguageModel
 
 m = MSEGraphLanguageModel.load("runs/model")
 
-# generate
+# generate (mode="strict" by default, or "open" if experience matrices are loaded)
 text, ids, trace = m.generate("the dog", max_tokens=20)
 print(text)   # "the dog sat on the carpet"
 
 # explain every step
 for step in trace:
-    print(step["stage"], step["rule"], step["chosen_token"])
+    print(step["stage"], step["rule"], step["chosen"])
 
 # cluster-based shared-role inference
 print(m.infer_shared_role(["cat", "dog"]))
-# [('sat', 'bridge_axis', {'cluster_id': 1, 'overlap': 2}), ...]
+# [('sat', 'bridge_axis', {'cluster_id': 1, 'overlap': 2, 'source': 'training'}), ...]
+
+# build Experience Matrices in-process and switch to Open Mode
+m.build_experience(folder="runs/model")
+text, ids, trace = m.generate("the dog", max_tokens=20, mode="open")
 ```
 
 ---
@@ -188,11 +199,14 @@ python3 analyse.py --model runs/model --json out.json report
 
 | Command | What it does |
 |---|---|
-| `<any text>` | Generate a continuation |
+| `<any text>` | Generate a continuation in the current mode |
+| `/mode strict\|open` | Switch modes; switching to `open` auto-builds Experience Matrices on first use if not already present |
 | `/explain <prev> \| <curr>` | Show stage, rule, candidates for one step |
 | `/shared cat dog boy` | Run `infer_shared_role()` — what structural role do these share? |
-| `/clusters` | Show top dual-axis cluster groups |
-| `/stats` | Vocab / edge / bridge / cluster / relationship counts |
+| `/similarity <a> <b>` | Cluster-overlap similarity between two tokens |
+| `/clusters` | Show top dual-axis cluster groups (training data) |
+| `/stats` | Vocab / edge / bridge / cluster / relationship counts (plus experience counts if loaded) |
+| `/exp` | Experience Matrix summary (prompts to run `/mode open` first if none loaded) |
 | `/quit` | Exit |
 
 ---
@@ -222,17 +236,69 @@ on      carpet  the     2
 
 ---
 
+## Open Mode: Experience Matrices
+
+Strict Mode only ever emits transitions actually seen in training. **Open Mode**
+adds a second, opt-in layer: `build_experience.py` (or `model.build_experience()`)
+runs the same dual-axis clusters above through two expansion rules —
+
+- **Rule 1 (bridge axis)** — if token X shares a cluster with an attested bridge
+  B in slot `(S, T)`, and B also bridges a different slot `(S2, T2)`, then X can
+  bridge `(S2, T2)` too.
+- **Rule 2 (target axis)** — the same idea applied to interchangeable targets.
+
+— and saves the results as three separate Experience Matrices
+(`experience_edges.json`, `experience_bridges.json`, `experience_relationships.json`).
+These are never consulted by Strict Mode; Open Mode simply unions them in.
+
+```
+Training: "the cat sat on the mat.", "the dog sat on the carpet.",
+          "the boy sat on the mat.", "the boy ran on the road."
+          (cat and dog are never observed with "ran")
+
+$ python3 build_experience.py --model runs/model
+  Rule 1 complete — 2 new triples
+  ...
+
+$ python3 chat.py --model runs/model --mode open
+you> the cat
+model> the cat ran on the road        ← inferred, never seen in training
+```
+
+Run `/exp` in `chat.py`, or `python3 analyse.py --model runs/model stats`
+after building, to see Experience Matrix counts alongside training counts.
+
+---
+
 ## Lineage-aware tie-breaking
 
-The Relationship Matrix `R` stores `(triple_id, relationship_id)` only — no triple content duplicated. A triple shared across multiple training sentences carries one R row per sentence. At inference, `active_rels` is **narrowed by intersection** at each step (never replaced), so the path stays locked to the most specific consistent lineage even when it passes through shared triples.
+The Relationship Matrix `R` stores `(triple_id, relationship_id)` only — no triple content duplicated. A triple shared across multiple training sentences carries one R row per sentence. At inference, `active_rels` is **narrowed by intersection** at each step (never widened back out), so the path stays locked to the most specific consistent lineage even when it passes through shared triples.
 
-Without narrowing: `the dog → the dog sat on the mat` (wrong).  
+Without narrowing: `the dog → the dog sat on the mat` (wrong).
 With narrowing: `the dog → the dog sat on the carpet` (correct).
 
 This regression is covered by a dedicated automated test.
 
 ---
 
+## Limitations
+
+- No semantic understanding. No reasoning. Strict Mode does not generalise to unseen transitions; Open Mode generalises only as far as dual-axis clustering can justify.
+- Sequential context is limited to `(previous, current)` at the triple level; lineage tracking (`active_rels`) is a global consistency signal, not a longer context window.
+- Distributional clustering is slot-substitution only — does not distinguish synonyms from antonyms.
+- Tokens touching universal structural positions (`<BOS>`, `<EOS>`) cluster together even when otherwise unrelated.
+- Experience Matrix expansion can grow combinatorially for very large, highly-substitutable clusters — there is currently no size cap or pruning step.
+
+---
+
+## Roadmap
+
+| Version | Planned |
+|---|---|
+| v2.2 | Punctuation preservation · higher-order (4/5-token) bridge context · sparse storage. (Open Mode / Experience Matrices, originally slated here, are already implemented.) |
+| v3.0 | Hybrid graph + embedding · disk-backed storage · weighted/frequency-aware clustering |
+
+---
 
 ## License
 
@@ -245,5 +311,5 @@ a commercial license is available — open an issue or contact the author.
 
 ## Author
 
-**Clifford Chivhanga**  
-[email](cliffordchivhanga318@gmail.com)
+**Clifford Chivhanga**
+[github.com/fodokidza](https://github.com/fodokidza)
