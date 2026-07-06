@@ -1,6 +1,7 @@
 # MSE Graph Language Model (MSE-GLM)
 
 **Deterministic · Explainable · Zero learned weights · CPU only**
+for more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 A language model with no neural network. Language is represented as a
 token-transition graph. Every generation decision is traceable back to the
