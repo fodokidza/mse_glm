@@ -56,9 +56,7 @@ the core Strict-Mode pipeline plus the Experience Matrix / Open Mode subsystem.
 - **Distributional similarity without embeddings** — dual-axis cluster assignment identifies interchangeable tokens structurally, with no embedding model.
 - **Two inference modes** — **Strict Mode** (training data only) and **Open Mode** (training data plus structurally-inferred Experience Matrices), sharing one engine.
 
-## What this is not
-
-Not a transformer competitor for open-domain generation, reasoning, or long-range coherence. It has no semantic understanding — only observed token adjacency and structural slot-sharing. Strict Mode does not generalise to unseen transitions at all; Open Mode generalises only as far as dual-axis clustering can structurally justify (see below).
+## Best use cases 
 
 Best suited to **grammar-constrained generation** (SQL, JSON, config files, autocomplete, assembly), **embedded / low-resource environments**, and settings where **auditability and reproducibility** matter more than fluency.
 
