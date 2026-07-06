@@ -289,14 +289,6 @@ This regression is covered by a dedicated automated test.
 
 ---
 
-## Roadmap
-
-| Version | Planned |
-|---|---|
-| v2.2 | Punctuation preservation · higher-order (4/5-token) bridge context · sparse storage. (Open Mode / Experience Matrices, originally slated here, are already implemented.) |
-| v3.0 | Hybrid graph + embedding · disk-backed storage · weighted/frequency-aware clustering |
-
----
 
 ## License
 
