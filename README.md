@@ -2,6 +2,8 @@
 
 **Deterministic · Explainable · Zero learned weights · CPU only**
 
+Email: cliffordchivhanga318@gmail.com
+
 For more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 A language model with no neural network. Language is represented as a
@@ -304,4 +306,7 @@ a commercial license is available — open an issue or contact the author.
 ## Author
 
 **Clifford Chivhanga**
+
+Email: cliffordchivhanga318@gmail.com
+
 [github.com/fodokidza](https://github.com/fodokidza)
