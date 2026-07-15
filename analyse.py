@@ -177,6 +177,50 @@ class Analyser:
             "similarity": len(shared), "shared_clusters": shared,
         }
 
+    # ------------------------------------------------------- interpretation
+    def cluster_interpretation(self, cluster_id: int, top_n: int = 5, mode: str = "strict") -> dict:
+        """
+        Propose a human-readable label for a cluster (e.g. {cat, dog, pig}
+        -> "animal"), derived purely from structure already in the trained
+        matrices. Returns None if the cluster_id doesn't exist or nothing
+        was found. `coverage` is a plain fraction, not a confidence score —
+        see interpret.py's module docstring before presenting this to a
+        user as a certainty figure.
+        """
+        return self.model.interpret_cluster(cluster_id, top_n=top_n, mode=mode)
+
+    def interpretation_report(self, min_coverage: float = 0.5, max_per_cluster: int = 3,
+                               mode: str = "strict") -> list:
+        """Every candidate clearing min_coverage per cluster (not just one)."""
+        return self.model.interpret_all_clusters(
+            min_coverage=min_coverage, max_per_cluster=max_per_cluster, mode=mode)
+
+    def interpreter_matrix(self, min_coverage: float = 0.5, min_signals: int = 2,
+                            max_per_cluster: int = None, mode: str = "strict") -> list:
+        """
+        The filtered Cluster Interpreter Matrix -- coverage AND a minimum
+        number of corroborating evidence_mask entries required. A cluster
+        can carry multiple qualifying labels at once (e.g. both "animal"
+        and "pet"); this is what should actually get persisted as "the"
+        interpreter matrix. interpretation_report()/interpret_cluster()
+        are the wider, unfiltered views used to sanity-check candidates
+        by eye.
+        """
+        return self.model.build_interpreter_matrix(
+            min_coverage=min_coverage, min_signals=min_signals,
+            max_per_cluster=max_per_cluster, mode=mode)
+
+    def zero_cluster_groups(self, min_group_size: int = 2, mode: str = "strict") -> list:
+        """
+        Mine cluster_id==0 for the "third axis" the standard dual-axis
+        rule never implements (fix bridge+target, source varies). Finds
+        groups the regular cluster_report()/interpreter_matrix() never
+        see at all -- see model.discover_zero_cluster_groups for caveats
+        (bigger candidate space, more prone to coincidental groupings).
+        """
+        return self.model.discover_zero_cluster_groups(
+            min_group_size=min_group_size, mode=mode)
+
     # -------------------------------------------------------------- traces
     def generation_trace(self, prompt: str, max_tokens: int = 20):
         text, ids, trace = self.model.generate(prompt, max_tokens=max_tokens)
@@ -268,6 +312,31 @@ def main():
     p = sub.add_parser("shared", help="infer_shared_role() across two or more tokens")
     p.add_argument("words", nargs="+")
 
+    p = sub.add_parser("interpret", help="Propose a human-readable label for one cluster_id")
+    p.add_argument("cluster_id", type=int)
+    p.add_argument("--top", type=int, default=5)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
+    p = sub.add_parser("interpretations", help="Every qualifying label per cluster (unfiltered)")
+    p.add_argument("--min-coverage", type=float, default=0.5)
+    p.add_argument("--max-per-cluster", type=int, default=3)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
+    p = sub.add_parser("interpreter-matrix",
+                        help="Filtered CI Matrix (coverage + corroborating evidence required); "
+                             "a cluster may carry multiple labels. "
+                             "Pipe with --json > interpreter_matrix.json to persist it.")
+    p.add_argument("--min-coverage", type=float, default=0.5)
+    p.add_argument("--min-signals", type=int, default=2)
+    p.add_argument("--max-per-cluster", type=int, default=None)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
+    p = sub.add_parser("zero-cluster",
+                        help="Mine cluster_id==0 for groups the standard dual-axis rule "
+                             "never assigns a cluster_id to (fix bridge+target, source varies)")
+    p.add_argument("--min-group-size", type=int, default=2)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
     p = sub.add_parser("trace", help="Step-by-step generation trace for a prompt")
     p.add_argument("prompt")
     p.add_argument("--max-tokens", type=int, default=20)
@@ -353,6 +422,62 @@ def main():
         _emit(result, args.json, lambda r: _print_table(
             [(x["predicted"], x["axis"], x["cluster_id"], x["overlap"]) for x in r],
             ["predicted", "axis", "cluster_id", "overlap"],
+        ) if r else None)
+
+    elif args.command == "interpret":
+        result = analyser.cluster_interpretation(args.cluster_id, top_n=args.top, mode=args.mode)
+        if result is None:
+            print(f"cluster_id {args.cluster_id} not found", file=sys.stderr)
+            sys.exit(1)
+        if not result["candidates"]:
+            print(f"  cluster {args.cluster_id} ({result['axis']} axis, "
+                  f"members: {', '.join(result['members'])}) — no interpreter found "
+                  f"(corpus has no matching categorical statement for these members)")
+        else:
+            _emit(result, args.json, lambda r: (
+                print(f"  cluster_id: {r['cluster_id']}   axis: {r['axis']}   "
+                      f"members: {', '.join(r['members'])}"),
+                _print_table(
+                    [(c["interpreter_token"], c["coverage"], ",".join(c["evidence_mask"]),
+                      ", ".join(c["members_covered"])) for c in r["candidates"]],
+                    ["interpreter", "coverage", "evidence_mask", "members_covered"],
+                ),
+            ))
+
+    elif args.command == "interpretations":
+        result = analyser.interpretation_report(min_coverage=args.min_coverage,
+                                                 max_per_cluster=args.max_per_cluster,
+                                                 mode=args.mode)
+        if not result:
+            print("  no clusters cleared the coverage threshold")
+        _emit(result, args.json, lambda r: _print_table(
+            [(c["cluster_id"], cand["interpreter_token"], cand["coverage"],
+              ",".join(cand["evidence_mask"]), ", ".join(cand["members_covered"]))
+             for c in r for cand in c["candidates"]],
+            ["cluster_id", "interpreter", "coverage", "evidence_mask", "members_covered"],
+        ) if r else None)
+
+    elif args.command == "interpreter-matrix":
+        result = analyser.interpreter_matrix(min_coverage=args.min_coverage,
+                                              min_signals=args.min_signals,
+                                              max_per_cluster=args.max_per_cluster,
+                                              mode=args.mode)
+        if not result:
+            print("  no clusters cleared both the coverage and evidence thresholds")
+        _emit(result, args.json, lambda r: _print_table(
+            [(row["cluster_id"], row["interpreter_token"], row["coverage"],
+              ",".join(row["evidence_mask"]), ", ".join(row["members_covered"])) for row in r],
+            ["cluster_id", "interpreter", "coverage", "evidence_mask", "members_covered"],
+        ) if r else None)
+
+    elif args.command == "zero-cluster":
+        result = analyser.zero_cluster_groups(min_group_size=args.min_group_size, mode=args.mode)
+        if not result:
+            print("  no groups found in the unclustered bucket at this min_group_size")
+        _emit(result, args.json, lambda r: _print_table(
+            [(row["interpreter_token"], row["member_count"], ",".join(row["evidence_mask"]),
+              ", ".join(row["members"])) for row in r],
+            ["interpreter", "member_count", "evidence_mask", "members"],
         ) if r else None)
 
     elif args.command == "trace":

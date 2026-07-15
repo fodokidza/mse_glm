@@ -192,6 +192,34 @@ class RelationshipMatrix:
         self.r_rel = array("i")
         self.index = array("i")  # CSR offsets keyed on relationship_id
         self._n_rels = 0
+        self._by_triple_rel = None    # lazily-built CSR keyed on triple_id
+        self._by_triple_index = None  # (rel array, offset array)
+
+    def _ensure_triple_index(self):
+        """
+        Build a secondary CSR index keyed on triple_id, on first use.
+        relationships_for_triple was previously an O(total R rows) linear
+        scan called from every candidate in every inference step; that made
+        per-step cost scale with total corpus size rather than local degree.
+        This index makes it O(occurrences for that triple), same as every
+        other lookup in the system. Built lazily so callers that never
+        query by triple_id (e.g. simple training/persistence round-trips)
+        pay nothing for it, and it is invalidated automatically whenever
+        build()/from_dict() repopulate r_triple/r_rel.
+        """
+        if self._by_triple_index is not None:
+            return
+        n_triples = (max(self.r_triple) + 1) if len(self.r_triple) else 0
+        pairs = sorted(range(len(self.r_triple)), key=lambda i: self.r_triple[i])
+        sorted_rel = array("i", [self.r_rel[i] for i in pairs])
+        sorted_tid = array("i", [self.r_triple[i] for i in pairs])
+        offsets = array("i", [0] * (n_triples + 1))
+        for tid in sorted_tid:
+            offsets[tid + 1] += 1
+        for i in range(1, len(offsets)):
+            offsets[i] += offsets[i - 1]
+        self._by_triple_rel = sorted_rel
+        self._by_triple_index = offsets
 
     def build(self, sequences, bridge: BridgeMatrix):
         # rebuild triple_id lookup matching BridgeMatrix's dedup + sort order
@@ -218,6 +246,8 @@ class RelationshipMatrix:
             self.index[r + 1] += 1
         for i in range(1, len(self.index)):
             self.index[i] += self.index[i - 1]
+        self._by_triple_rel = None
+        self._by_triple_index = None
 
     def triples_for_relationship(self, rel_id: int):
         if rel_id < 0 or rel_id + 1 >= len(self.index):
@@ -226,7 +256,12 @@ class RelationshipMatrix:
         return list(self.r_triple[start:end])
 
     def relationships_for_triple(self, triple_id: int):
-        return [rel for tid, rel in zip(self.r_triple, self.r_rel) if tid == triple_id]
+        self._ensure_triple_index()
+        offsets = self._by_triple_index
+        if triple_id < 0 or triple_id + 1 >= len(offsets):
+            return []
+        start, end = offsets[triple_id], offsets[triple_id + 1]
+        return list(self._by_triple_rel[start:end])
 
     def to_dict(self):
         return {

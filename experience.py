@@ -178,6 +178,25 @@ class ExperienceRelationshipMatrix:
         self._n_exp_rels     = 0
         self._n_training_rels = 0
         self.parent_map      = {}   # exp_rel_id → set of training rel_ids
+        self._by_triple_rel   = None
+        self._by_triple_index = None
+
+    def _ensure_triple_index(self):
+        """See RelationshipMatrix._ensure_triple_index — same fix, same reason:
+        avoids an O(total experience R rows) scan on every Open-Mode candidate."""
+        if self._by_triple_index is not None:
+            return
+        n_triples = (max(self.r_triple) + 1) if len(self.r_triple) else 0
+        pairs = sorted(range(len(self.r_triple)), key=lambda i: self.r_triple[i])
+        sorted_rel = array("i", [self.r_rel[i] for i in pairs])
+        sorted_tid = array("i", [self.r_triple[i] for i in pairs])
+        offsets = array("i", [0] * (n_triples + 1))
+        for tid in sorted_tid:
+            offsets[tid + 1] += 1
+        for i in range(1, len(offsets)):
+            offsets[i] += offsets[i - 1]
+        self._by_triple_rel = sorted_rel
+        self._by_triple_index = offsets
 
     def build_from_rows(self, rows, n_exp_rels, n_training_rels, parent_map):
         rows_sorted = sorted(rows, key=lambda r: r[1])
@@ -196,10 +215,16 @@ class ExperienceRelationshipMatrix:
                 self.index[local + 1] += 1
         for i in range(1, len(self.index)):
             self.index[i] += self.index[i - 1]
+        self._by_triple_rel = None
+        self._by_triple_index = None
 
     def relationships_for_exp_triple(self, exp_triple_id):
-        return [rel for tid, rel in zip(self.r_triple, self.r_rel)
-                if tid == exp_triple_id]
+        self._ensure_triple_index()
+        offsets = self._by_triple_index
+        if exp_triple_id < 0 or exp_triple_id + 1 >= len(offsets):
+            return []
+        start, end = offsets[exp_triple_id], offsets[exp_triple_id + 1]
+        return list(self._by_triple_rel[start:end])
 
     def training_rels_for_exp_triple(self, exp_triple_id):
         """All training rel_ids reachable via parent_map for this exp triple."""

@@ -38,6 +38,10 @@ class BPETokenizer:
         self.token_to_id = dict(SPECIAL_TOKENS)
         self.id_to_token = {v: k for k, v in SPECIAL_TOKENS.items()}
         self.merges = []  # ordered list of (a, b) -> merged_string, applied in order
+        self._word_ids_cache = {}  # memoizes _ids_for_word(word) -> ids, since natural
+                                    # text repeats a small set of distinct words very
+                                    # often; avoids recomputing the full merge pass
+                                    # for every occurrence of the same word.
 
     # ---------------------------------------------------------------- train
     def train(self, corpus: str):
@@ -134,9 +138,13 @@ class BPETokenizer:
         return symbols
 
     def _ids_for_word(self, word: str):
+        cached = self._word_ids_cache.get(word)
+        if cached is not None:
+            return cached
         ids = []
         for sym in self._apply_merges(word):
             ids.append(self.token_to_id.get(sym, UNK))
+        self._word_ids_cache[word] = ids
         return ids
 
     def encode(self, text: str):

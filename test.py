@@ -74,17 +74,30 @@ def main():
     check("R has shared triple",        any(len(r.relationships_for_triple(t)) > 1 for t in set(r.r_triple)))
 
     section("Lineage tie-breaking (regression)")
-    for prompt, must in [("the cat","mat"),("the dog","carpet"),("the boy","mat"),
-                          ("the cat ran","road"),("the dog ran","road"),
-                          ("the fish","pond"),("the duck","pond")]:
+    lineage_checks = [
+        ("the cat",    ["mat","road"]),   # sat or ran — both valid
+        ("the dog",    ["carpet","road"]),
+        ("the boy",    ["mat"]),
+        ("the cat ran",["road"]),
+        ("the dog ran",["road"]),
+        ("the fish",   ["pond","river"]),
+        ("the duck",   ["pond"]),
+    ]
+    for prompt, valid in lineage_checks:
         text, _, _ = model.generate(prompt, max_tokens=12)
-        check(f"'{prompt}' → '{must}'", must in text, f"got '{text}'")
+        check(f"'{prompt}' → one of {valid}", any(v in text for v in valid), f"got '{text}'")
     text, _, _ = model.generate("a bird flew over", max_tokens=12)
     check("bird lands on lake or hill", ("lake" in text) or ("hill" in text), text)
 
     section("Determinism")
-    runs = {model.generate("the dog", max_tokens=12)[0] for _ in range(5)}
-    check("5 runs identical", len(runs) == 1, runs)
+    # Genuinely unambiguous prompts must be deterministic
+    for det_prompt in ["the boy", "the girl", "the duck", "the cat ran", "the dog sat"]:
+        runs = {model.generate(det_prompt, max_tokens=12)[0] for _ in range(5)}
+        check(f"unambiguous '{det_prompt}' deterministic", len(runs) == 1, runs)
+    # Genuinely ambiguous prompts must vary across runs
+    for amb_prompt in ["the cat", "the dog", "the fish", "a bird"]:
+        runs = {model.generate(amb_prompt, max_tokens=12)[0] for _ in range(20)}
+        check(f"ambiguous '{amb_prompt}' produces varied output", len(runs) > 1, runs)
 
     section("explain_step()")
     next_tok, tr = model.explain_step("the", "dog")
@@ -123,16 +136,159 @@ def main():
     _, gt = a.generation_trace("the dog", max_tokens=10)
     check("generation trace", len(gt) > 0 and all("stage" in s for s in gt))
 
+    section("Cluster Interpreter (CI)")
+    # Separate corpus: cat/dog/pig share a bridge-axis cluster from the
+    # "sat" sentences AND are each the source of a 3-token "X is animal"
+    # triple. Interpreter discovery requires the label to fit inside a
+    # single (source, bridge, target) window, so the hypernym sentence is
+    # deliberately phrased "X is animal" (3 tokens), not "X is an animal"
+    # (4 tokens) which falls outside any single triple's reach.
+    CORPUS_CI = """
+the cat sat on the mat.
+the dog sat on the carpet.
+the boy sat on the mat.
+cat is animal.
+dog is animal.
+pig is animal.
+the boy ran on the road.
+the pig ran on the road.
+"""
+    m_ci = MSEGraphLanguageModel(vocab_size=200)
+    m_ci.train(CORPUS_CI)
+    ci_report = m_ci.interpret_all_clusters(min_coverage=0.3)
+    check("interpret_all_clusters returns results", len(ci_report) > 0, ci_report)
+    animal_hit = [r for r in ci_report
+                  if set(r["members"]) == {"cat", "dog", "pig"}]
+    check("cat/dog/pig cluster found", len(animal_hit) == 1, ci_report)
+    if animal_hit:
+        top = animal_hit[0]["candidates"][0]
+        check("cat/dog/pig interpreted as 'animal'",
+              top["interpreter_token"] == "animal", top)
+        check("cat/dog/pig coverage is full", top["coverage"] == 1.0, top)
+        check("bridge_source_axis always present in evidence_mask",
+              "bridge_source_axis" in top["evidence_mask"], top)
+        check("relationship_ids reflects >=1 supporting training sentence",
+              len(top["relationship_ids"]) >= 1, top)
+        check("relationship_robustness flagged since >1 sentence assert it",
+              "relationship_robustness" in top["evidence_mask"], top)
+    # Unknown cluster_id must return None, not raise
+    check("unknown cluster_id returns None", m_ci.interpret_cluster(99999) is None)
+    # A cluster with no matching categorical statement should surface
+    # nothing (or a low/partial-coverage candidate), not a fabricated label
+    sat_only = MSEGraphLanguageModel(vocab_size=100)
+    sat_only.train("the cat sat on the mat.\nthe dog sat on the carpet.\n")
+    empty_report = sat_only.interpret_all_clusters(min_coverage=0.99)
+    check("no spurious full-coverage interpreter without categorical data",
+          all(r["candidates"][0]["coverage"] < 1.0
+              or r["candidates"][0]["interpreter_token"] not in ("animal",)
+              for r in empty_report), empty_report)
+
+    # Known, documented limitation: on a corpus this small, relationship_ids
+    # counts a distinct rel_id per training SENTENCE, so grammatical
+    # continuations shared by >=2 sentences ("on" via "sat"/"ran") clear
+    # relationship_robustness exactly as easily as a real categorical fact
+    # ("animal" via "is") does, and shared_role_overlap stays empty
+    # everywhere because no token happens to double up across clusters in
+    # such a tiny vocabulary. So min_signals=2 does NOT yet separate the
+    # semantic hit from the syntactic ones at this scale -- this test
+    # documents that honestly rather than asserting a discrimination that
+    # doesn't actually hold yet, so a future change to the scoring is
+    # forced to update this test consciously instead of silently.
+    ci_matrix = m_ci.build_interpreter_matrix(min_coverage=0.3, min_signals=2)
+    interpreters_found = {row["interpreter_token"] for row in ci_matrix}
+    check("interpreter_matrix still includes the real 'animal' hit at min_signals=2",
+          "animal" in interpreters_found, ci_matrix)
+    check("interpreter_matrix (documented limitation) does not yet exclude "
+          "grammatical 'on' hit at min_signals=2",
+          "on" in interpreters_found, ci_matrix)
+    check("every row's evidence_mask meets the requested min_signals floor",
+          all(len(row["evidence_mask"]) >= 2 for row in ci_matrix), ci_matrix)
+
+    # A cluster must be able to carry more than one qualifying label at
+    # once -- e.g. {cat, dog, pig} = "animal" (full coverage) AND the
+    # {cat, dog} subset within it also supports "pet" (partial coverage,
+    # since pig is never called a pet). Both must survive filtering
+    # independently rather than the second being discarded just because
+    # the first has higher coverage.
+    m_multi = MSEGraphLanguageModel(vocab_size=200)
+    m_multi.train("""
+the cat sat on the mat.
+the dog sat on the carpet.
+the boy sat on the mat.
+cat is animal.
+dog is animal.
+pig is animal.
+cat is pet.
+dog is pet.
+the boy ran on the road.
+the pig ran on the road.
+""")
+    multi_matrix = m_multi.build_interpreter_matrix(min_coverage=0.5, min_signals=2)
+    cdp_rows = [row for row in multi_matrix if set(row["members"]) == {"cat", "dog", "pig"}]
+    cdp_labels = {row["interpreter_token"] for row in cdp_rows}
+    check("cat/dog/pig cluster keeps 'animal' label", "animal" in cdp_labels, cdp_rows)
+    check("cat/dog/pig cluster ALSO keeps 'pet' label (not discarded for lower coverage)",
+          "pet" in cdp_labels, cdp_rows)
+    pet_row = next(row for row in cdp_rows if row["interpreter_token"] == "pet")
+    check("'pet' label correctly covers only cat+dog, not pig",
+          set(pet_row["members_covered"]) == {"cat", "dog"}, pet_row)
+
+    section("Zero-cluster mining (3rd axis)")
+    # cat/dog/pig deliberately never share a verb OR a lead-in word, so
+    # they get NO cluster_id at all under the standard dual-axis rule
+    # (which only clusters by fixed source) -- they must be invisible
+    # to cluster_report() and interpret_all_clusters(), and ONLY
+    # recoverable by mining cluster_id==0 directly.
+    CORPUS_ZERO = """
+the cat slept on a mat.
+the dog barked at a car.
+the pig rolled in a puddle.
+well cat is animal.
+sure dog is animal.
+hey pig is animal.
+"""
+    m_zero = MSEGraphLanguageModel(vocab_size=200)
+    m_zero.train(CORPUS_ZERO)
+    a_zero = Analyser(m_zero)
+
+    standard_clusters = a_zero.cluster_report(top_n=50)
+    check("cat/dog/pig never share a standard dual-axis cluster",
+          not any(set(c["members"]) >= {"cat", "dog", "pig"} for c in standard_clusters),
+          standard_clusters)
+    check("regular interpret_all_clusters never finds the animal grouping either",
+          not any("animal" in [cand["interpreter_token"] for cand in r["candidates"]]
+                  for r in m_zero.interpret_all_clusters(min_coverage=0.1)))
+
+    zero_groups = m_zero.discover_zero_cluster_groups(min_group_size=2)
+    check("zero-cluster mining returns results", len(zero_groups) > 0, zero_groups)
+    animal_group = [g for g in zero_groups if g["interpreter_token"] == "animal"]
+    check("zero-cluster mining recovers cat/dog/pig -> animal",
+          len(animal_group) == 1 and set(animal_group[0]["members"]) == {"cat", "dog", "pig"},
+          zero_groups)
+    if animal_group:
+        check("recovered group's evidence_mask starts from zero_cluster_source_axis",
+              animal_group[0]["evidence_mask"][0] == "zero_cluster_source_axis",
+              animal_group[0])
+    # Self-referential groups (bridge or target equal to a member) must
+    # never be proposed as their own label.
+    check("no self-referential interpreter proposed",
+          all(g["interpreter_token"] not in g["members"] for g in zero_groups), zero_groups)
+
     section("Save/load round-trip")
+
     tmp = tempfile.mkdtemp(prefix="mse_test_")
     try:
         model.save(tmp)
         m2 = MSEGraphLanguageModel.load(tmp)
         check("reloaded stats match", m2.stats() == model.stats())
-        for p in ["the cat","the dog","the boy","the fish"]:
+        # Reload test: same graph → same candidate sets (even if random picks differ)
+        t1_stats = m2.stats()
+        check("reloaded model has same stats", t1_stats == model.stats())
+        # Unambiguous prompts must be identical across reload
+        for p in ["the boy", "the girl", "the cat ran", "the dog sat"]:
             t1 = model.generate(p, max_tokens=12)[0]
             t2 = m2.generate(p, max_tokens=12)[0]
-            check(f"reload '{p}'", t1 == t2, f"'{t1}' vs '{t2}'")
+            check(f"reload '{p}' deterministic", t1 == t2, f"'{t1}' vs '{t2}'")
         check("reload shared-role", model.infer_shared_role(["cat","dog"]) ==
               m2.infer_shared_role(["cat","dog"]))
     finally:
@@ -244,10 +400,13 @@ if __name__ == "__main__":
 
 def test_prompt_seeding_and_mode_boundaries():
     """
-    Documents the exact boundary of where strict / open_strict / open diverge.
-    Added after discovering that 'cat ran' resolves in strict because 'ran' is
-    given in the prompt — and that prompt seeding carries experience lineage
-    forward into generation.
+    Documents the strict bigram-validation boundary and random-tie behaviour.
+
+    Key findings after the two bug fixes:
+    - Strict mode rejects any prompt containing a bigram not in E.
+    - Open mode can extend E via experience edges, so 'the cat ran'
+      becomes legal in open mode (cat->ran added via experience).
+    - Genuine ties now resolve randomly, not by storage order.
     """
     section("Prompt seeding and mode boundaries")
 
@@ -261,42 +420,50 @@ the boy ran on the road.
     mb.train(CORPUS_BOUNDARY)
     mb.build_experience()
 
-    # Case 1: short prompts that map directly to training sentences
-    # — all three modes agree, experience adds nothing
-    for prompt, expected in [("the cat", "mat"), ("the dog", "carpet"), ("the boy", "mat")]:
-        for mode in ["strict", "strict", "open"]:
+    # Case 1: short prompts — valid in both modes, produce known valid outputs
+    for prompt, valid in [("the cat",["mat"]), ("the dog",["carpet"]),
+                           ("the boy",["mat","road"])]:
+        for mode in ["strict","open"]:
             text, _, _ = mb.generate(prompt, max_tokens=12, mode=mode)
-            check(f"case1 '{prompt}' {mode} → contains '{expected}'",
-                  expected in text, f"got '{text}'")
+            check(f"case1 '{prompt}' {mode} → one of {valid}",
+                  any(v in text for v in valid), f"got '{text}'")
 
-    # Case 2: prompts that cross into experience territory
-    # — once 'ran' is in the prompt, all modes follow boy's training path
+    # Case 2: 'the cat ran' — cat->ran not in training E
+    # Strict: illegal bigram → rejected at stage 0
+    # Open:   cat->ran exists in EE (experience edge) → resolves via boy's path
     for prompt in ["the cat ran", "the dog ran"]:
-        for mode in ["strict", "strict", "open"]:
-            text, _, _ = mb.generate(prompt, max_tokens=10, mode=mode)
-            check(f"case2 '{prompt}' {mode} → road",
-                  "road" in text, f"got '{text}'")
+        ts, _, trace_s = mb.generate(prompt, max_tokens=10, mode="strict")
+        check(f"case2 '{prompt}' strict → illegal_prompt_bigram",
+              trace_s[0].get("rule") == "illegal_prompt_bigram",
+              f"rule={trace_s[0].get('rule')} out='{ts}'")
+        to, _, _ = mb.generate(prompt, max_tokens=10, mode="open")
+        check(f"case2 '{prompt}' open → road",
+              "road" in to, f"got '{to}'")
 
-    # Case 3: the critical case — only open modes can disambiguate 'on the'
-    # because they carry experience lineage to active_rels={3}
+    # Case 3: 'the cat ran on the' — also illegal in strict (same bad bigram)
+    # Open resolves correctly via experience lineage
     for prompt in ["the cat ran on the", "the dog ran on the"]:
-        ts, _, _ = mb.generate(prompt, max_tokens=4, mode="strict")
+        ts, _, trace_s = mb.generate(prompt, max_tokens=4, mode="strict")
+        check(f"case3 '{prompt}' strict → illegal_prompt_bigram",
+              trace_s[0].get("rule") == "illegal_prompt_bigram",
+              f"rule={trace_s[0].get('rule')} out='{ts}'")
         to, _, _ = mb.generate(prompt, max_tokens=4, mode="open")
-        check(f"case3 '{prompt}' strict→road (new engine disambiguates via lineage)",
-              "road" in ts, f"got '{ts}'")
-        check(f"case3 '{prompt}' open→road (experience lineage_overlap)",
-              "road" in to, f"got '{to}'")
-        check(f"case3 '{prompt}' open→road (experience lineage_overlap)",
+        check(f"case3 '{prompt}' open → road",
               "road" in to, f"got '{to}'")
 
-    # Case 4: cat ran resolves correctly in strict because 'ran' is in prompt
-    # — experience matrices are the DOOR, training is the CORRIDOR
-    text, _, trace = mb.generate("the cat ran", max_tokens=10, mode="strict")
-    check("cat ran resolves via training after 'ran' is in prompt",
-          "road" in text, f"got '{text}'")
-    # Stage 2 (bridge voting) should fire for the first step (cat,ran → on)
-    check("first step resolves via bridge_vote (stage 1)",
-          trace[0]["stage"] == 1, f"stage was {trace[0]['stage']}")
+    # Case 4: legal unambiguous prompt resolves correctly in strict
+    text, _, trace = mb.generate("the cat sat", max_tokens=10, mode="strict")
+    check("legal prompt 'the cat sat' → on",
+          "on" in text, f"got '{text}'")
+    check("first step uses stage 1 or 2",
+          trace[0]["stage"] in (1, 2), f"stage was {trace[0]['stage']}")
+
+    # Case 5: random ties — 'the boy' has two valid paths in CORPUS_BOUNDARY
+    # Must produce varied output across runs
+    boy_runs = {mb.generate("the boy", max_tokens=10, mode="strict")[0]
+                for _ in range(30)}
+    check("ambiguous 'the boy' produces varied output (sat/ran both valid)",
+          len(boy_runs) > 1, f"always gave: {boy_runs}")
 
 if __name__ == "__main__":
     main()
