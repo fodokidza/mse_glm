@@ -4,6 +4,9 @@
 
 Email: cliffordchivhanga318@gmail.com
 
+Full info:
+https://tonlexianert.com/pages/blog.php
+
 For more info: https://aircityshops.com/index.php?url=city/mse_blog
 
 A language model with no neural network. Language is represented as a
