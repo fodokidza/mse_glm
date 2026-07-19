@@ -32,6 +32,43 @@ def split_sentences(text: str):
     return [p.strip() for p in parts if p.strip()]
 
 
+def stream_word_freq(path: str, word_freq: Counter, chunk_size: int = 1 << 20) -> int:
+    """
+    Accumulate word frequencies from one file into an existing Counter,
+    reading in fixed-size chunks so the file's full text is never held
+    in memory at once (only the current chunk + a small carry-over
+    buffer for a sentence split across a chunk boundary).
+
+    Mutates `word_freq` in place so callers can share one Counter across
+    many files (see train_corpus.py) without concatenating their text
+    first. Returns the number of complete sentences seen in this file.
+    """
+    buffer = ""
+    sentence_count = 0
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            buffer += chunk
+            sentences = _SENT_SPLIT_RE.split(buffer)
+            buffer = sentences.pop()  # keep last partial sentence for next chunk
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                sentence_count += 1
+                for word in normalize(sent).split(" "):
+                    if word:
+                        word_freq[word] += 1
+    if buffer.strip():
+        sentence_count += 1
+        for word in normalize(buffer).split(" "):
+            if word:
+                word_freq[word] += 1
+    return sentence_count
+
+
 class BPETokenizer:
     def __init__(self, vocab_size: int = 2000):
         self.vocab_size = vocab_size
@@ -55,26 +92,7 @@ class BPETokenizer:
 
     def train_from_file(self, path: str, chunk_size: int = 1 << 20):
         word_freq = Counter()
-        buffer = ""
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                buffer += chunk
-                sentences = _SENT_SPLIT_RE.split(buffer)
-                buffer = sentences.pop()  # keep last partial sentence for next chunk
-                for sent in sentences:
-                    sent = sent.strip()
-                    if not sent:
-                        continue
-                    for word in normalize(sent).split(" "):
-                        if word:
-                            word_freq[word] += 1
-        if buffer.strip():
-            for word in normalize(buffer).split(" "):
-                if word:
-                    word_freq[word] += 1
+        stream_word_freq(path, word_freq, chunk_size)
         self._train_from_word_freq(word_freq)
 
     def _train_from_word_freq(self, word_freq: Counter):
@@ -185,6 +203,94 @@ class BPETokenizer:
     @property
     def vocab_size_actual(self):
         return len(self.token_to_id)
+
+    def extend_vocab(self, corpus: str, target_vocab_size: int):
+        """
+        Grow the vocabulary using a NEW corpus, without touching any
+        existing token id. Every character and merge already in
+        token_to_id keeps the exact same id it had before, so every
+        Edge/Bridge/Relationship triple built under the old vocabulary
+        stays byte-for-byte valid. Only new characters and new merges
+        (learned from `corpus` alone) get appended on top.
+
+        This is a real limitation to know about: word-frequency counts
+        from whatever corpus originally trained this tokenizer are not
+        retained anywhere, so the merges chosen here are picked using
+        ONLY the new corpus's frequencies. This is not the same as
+        retraining from scratch on the concatenation of old + new text
+        -- it will not necessarily pick the same merges a joint retrain
+        would -- but it never invalidates anything already learned, and
+        it's the only option that doesn't require keeping the entire
+        training history around forever.
+
+        Returns the number of new vocabulary entries actually added
+        (0 if target_vocab_size <= current vocab_size_actual, or if the
+        new corpus has no pairs left to merge).
+        """
+        if target_vocab_size <= self.vocab_size_actual:
+            return 0
+
+        sentences = split_sentences(corpus)
+        word_freq = Counter()
+        for sent in sentences:
+            for word in normalize(sent).split(" "):
+                if word:
+                    word_freq[word] += 1
+        if not word_freq:
+            return 0
+
+        start_size = self.vocab_size_actual
+        next_id = max(self.token_to_id.values()) + 1
+
+        # New base characters this corpus introduces that the existing
+        # vocabulary has never seen (e.g. digits, if the original corpus
+        # never had any) -- added first, same as a from-scratch train.
+        chars = set()
+        for w in word_freq:
+            chars.update(list(w))
+        for c in sorted(chars):
+            if c not in self.token_to_id and len(self.token_to_id) < target_vocab_size:
+                self.token_to_id[c] = next_id
+                self.id_to_token[next_id] = c
+                next_id += 1
+
+        # Re-apply every merge already learned, in the original order,
+        # so this corpus's words start from the SAME symbol state a
+        # from-scratch encode() would have produced -- only then do we
+        # start choosing genuinely new merges on top.
+        word_symbols = {w: self._apply_merges(w) for w in word_freq}
+
+        while len(self.token_to_id) < target_vocab_size:
+            pair_counts = Counter()
+            for w, freq in word_freq.items():
+                symbols = word_symbols[w]
+                for i in range(len(symbols) - 1):
+                    pair_counts[(symbols[i], symbols[i + 1])] += freq
+            if not pair_counts:
+                break
+            (a, b), _ = pair_counts.most_common(1)[0]
+            merged = a + b
+            if merged not in self.token_to_id:
+                self.token_to_id[merged] = next_id
+                self.id_to_token[next_id] = merged
+                next_id += 1
+            self.merges.append((a, b))
+
+            for w in word_symbols:
+                symbols = word_symbols[w]
+                new_symbols = []
+                i = 0
+                while i < len(symbols):
+                    if i < len(symbols) - 1 and symbols[i] == a and symbols[i + 1] == b:
+                        new_symbols.append(merged)
+                        i += 2
+                    else:
+                        new_symbols.append(symbols[i])
+                        i += 1
+                word_symbols[w] = new_symbols
+
+        self._word_ids_cache.clear()  # new merges can change how known words split
+        return self.vocab_size_actual - start_size
 
     def save(self, path: str):
         data = {

@@ -30,6 +30,7 @@ class MSEGraphLanguageModel:
         self.exp_edges   = None
         self.exp_bridges = None
         self.exp_rels    = None
+        self.ctm         = None   # ContextTriggerMatrix — None until built
 
     # ─── training ─────────────────────────────────────────────────────────
 
@@ -46,6 +47,194 @@ class MSEGraphLanguageModel:
         seqs = [self.tokenizer.encode_for_training(s)
                 for s in split_sentences(text)]
         self._build_graphs(seqs)
+
+    def train_incremental(self, corpus, extend_vocab=False, target_vocab_size=None):
+        """
+        Add a new corpus to an ALREADY-TRAINED model, without discarding
+        what it already knows.
+
+        By default the tokenizer stays frozen: new text is encoded with
+        the existing vocabulary (falling back to <UNK> for genuinely
+        novel characters, same as encoding any out-of-vocabulary text),
+        so every previously-built triple stays valid unchanged. Pass
+        extend_vocab=True (with target_vocab_size > current vocab_size)
+        to also grow the vocabulary from this new corpus first -- see
+        BPETokenizer.extend_vocab for what that does and doesn't
+        guarantee.
+
+        The Edge, Bridge, and Relationship matrices are then rebuilt
+        from the UNION of old + new structural facts (not just old
+        facts plus new ones appended side by side): clusters are
+        recomputed from scratch over the merged triple set, because a
+        cluster can only form once you know about ALL the triples that
+        might belong to it -- e.g. two sentences that each independently
+        arrived in a different training call ("the cat sat on the mat"
+        now, "the dog sat on the carpet" later) only form a real
+        bridge-axis cluster once both exist together. Existing
+        relationship_ids (one per originally-trained sentence) are
+        preserved and only remapped to whatever row position their
+        triple ends up at after the merge; new sentences get new
+        relationship_ids continuing after the last existing one.
+
+        Any previously-built Experience Matrices (Open Mode) are
+        invalidated -- they were derived from the pre-merge cluster
+        structure and can't be trusted after it changes. Call
+        build_experience() again if you want Open Mode back.
+
+        Returns a summary dict of before/after counts.
+        """
+        if self._strict is None:
+            raise RuntimeError(
+                "train_incremental() requires an already-trained or "
+                "loaded model. Call train()/train_from_file()/load() first.")
+
+        before = self.stats()
+
+        added_vocab = 0
+        if extend_vocab:
+            if not target_vocab_size:
+                raise ValueError(
+                    "extend_vocab=True requires target_vocab_size > current vocab_size")
+            added_vocab = self.tokenizer.extend_vocab(corpus, target_vocab_size)
+
+        new_seqs = [self.tokenizer.encode_for_training(s)
+                    for s in split_sentences(corpus)]
+        had_ctm = self.ctm is not None
+        self._merge_graphs(new_seqs)
+
+        after = self.stats()
+        return {
+            "sentences_added": len(new_seqs),
+            "vocab_added": added_vocab,
+            "before": before,
+            "after": after,
+            "experience_invalidated": before.get("exp_edges") is not None,
+            "ctm_invalidated": had_ctm,
+        }
+
+    def _merge_graphs(self, new_seqs):
+        """
+        Rebuild Edge/Bridge/Relationship matrices as the union of the
+        model's current matrices and the structural facts in new_seqs.
+        See train_incremental's docstring for why this is a full
+        recompute rather than an append.
+        """
+        from array import array
+        from collections import defaultdict
+
+        vsz = self.tokenizer.vocab_size_actual
+
+        # ── Edge Matrix: union of (src, dst) pairs ──────────────────────
+        merged_edges = set(zip(self.edges.src, self.edges.dst))
+        for seq in new_seqs:
+            for i in range(len(seq) - 1):
+                merged_edges.add((seq[i], seq[i + 1]))
+        merged_edges = sorted(merged_edges, key=lambda p: p[0])
+
+        em = EdgeMatrix()
+        em.src = array("i", [p[0] for p in merged_edges])
+        em.dst = array("i", [p[1] for p in merged_edges])
+        em.index = array("i", [0] * (vsz + 1))
+        for s in em.src:
+            em.index[s + 1] += 1
+        for i in range(1, len(em.index)):
+            em.index[i] += em.index[i - 1]
+        em._vocab_size = vsz
+
+        # ── Bridge Matrix: union of (source,target,bridge) triples,
+        #    cluster_id recomputed from scratch over the merged set ────
+        old_triple_content = list(zip(self.bridges.source, self.bridges.target,
+                                       self.bridges.bridge))
+        merged_triples = set(old_triple_content)
+        for seq in new_seqs:
+            for i in range(len(seq) - 2):
+                source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
+                merged_triples.add((source, target, bridge_tok))
+        merged_triples = sorted(merged_triples, key=lambda t: t[0])
+
+        n = len(merged_triples)
+        cluster_id = [0] * n
+        groups_by_st = defaultdict(list)
+        groups_by_sb = defaultdict(list)
+        for idx, (s, t, b) in enumerate(merged_triples):
+            groups_by_st[(s, t)].append(idx)
+            groups_by_sb[(s, b)].append(idx)
+        next_cluster = 1
+        for _key, idxs in groups_by_st.items():
+            if len(idxs) > 1:
+                for i in idxs:
+                    cluster_id[i] = next_cluster
+                next_cluster += 1
+        for _key, idxs in groups_by_sb.items():
+            if len(idxs) > 1 and all(cluster_id[i] == 0 for i in idxs):
+                for i in idxs:
+                    cluster_id[i] = next_cluster
+                next_cluster += 1
+
+        bm = BridgeMatrix()
+        bm.source = array("i", [t[0] for t in merged_triples])
+        bm.target = array("i", [t[1] for t in merged_triples])
+        bm.bridge = array("i", [t[2] for t in merged_triples])
+        bm.cluster_id = array("i", cluster_id)
+        bm.index = array("i", [0] * (vsz + 1))
+        for s in bm.source:
+            bm.index[s + 1] += 1
+        for i in range(1, len(bm.index)):
+            bm.index[i] += bm.index[i - 1]
+        bm._vocab_size = vsz
+        t_index = defaultdict(set)
+        for s, t, b, c in zip(bm.source, bm.target, bm.bridge, bm.cluster_id):
+            if c != 0:
+                t_index[b].add(c)
+                t_index[t].add(c)
+        bm.t_index = {k: sorted(v) for k, v in t_index.items()}
+
+        # ── Relationship Matrix: remap existing rows to their new
+        #    triple_id (content unchanged, row position may have moved),
+        #    then append new sentences with fresh relationship_ids ─────
+        new_triple_to_id = {trip: idx for idx, trip in enumerate(merged_triples)}
+        old_n_rels = self.rels._n_rels
+
+        merged_rows = []
+        for old_tid, rel_id in zip(self.rels.r_triple, self.rels.r_rel):
+            content = old_triple_content[old_tid]
+            merged_rows.append((new_triple_to_id[content], rel_id))
+
+        for local_idx, seq in enumerate(new_seqs):
+            rel_id = old_n_rels + local_idx
+            for i in range(len(seq) - 2):
+                source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
+                tid = new_triple_to_id.get((source, target, bridge_tok))
+                if tid is not None:
+                    merged_rows.append((tid, rel_id))
+
+        merged_rows.sort(key=lambda r: r[1])
+        rm = RelationshipMatrix()
+        rm._n_rels = old_n_rels + len(new_seqs)
+        rm.r_triple = array("i", [r[0] for r in merged_rows])
+        rm.r_rel = array("i", [r[1] for r in merged_rows])
+        rm.index = array("i", [0] * (rm._n_rels + 1))
+        for r in rm.r_rel:
+            rm.index[r + 1] += 1
+        for i in range(1, len(rm.index)):
+            rm.index[i] += rm.index[i - 1]
+        rm._by_triple_rel = None
+        rm._by_triple_index = None
+
+        self.edges, self.bridges, self.rels = em, bm, rm
+        self._strict = InferenceEngine(self.edges, self.bridges, self.rels)
+
+        # Experience Matrices were derived from the pre-merge cluster
+        # structure -- no longer trustworthy, must be rebuilt explicitly.
+        self.exp_edges = None
+        self.exp_bridges = None
+        self.exp_rels = None
+        self._open = None
+
+        # Same reasoning applies to the Context Trigger Matrix -- its
+        # signatures were built from the pre-merge triple/relationship
+        # structure.
+        self.ctm = None
 
     def _build_graphs(self, seqs):
         vsz = self.tokenizer.vocab_size_actual
@@ -100,12 +289,29 @@ class MSEGraphLanguageModel:
     def has_experience(self):
         return self.exp_edges is not None
 
+    def build_context_triggers(self, mode="strict", min_support=1):
+        """
+        Build and cache a Context Trigger Matrix -- per-cluster,
+        per-member trigger signatures from whole-sentence co-occurrence
+        (see ctm.py). This does not change generate()'s behavior by
+        itself; pass use_context_triggers=True to generate() to opt in.
+        Returns the built ContextTriggerMatrix (also stored on self.ctm).
+        """
+        from ctm import ContextTriggerMatrix
+        self.ctm = ContextTriggerMatrix.build(self, mode=mode, min_support=min_support)
+        return self.ctm
+
+    def has_context_triggers(self):
+        return self.ctm is not None
+
     # ─── generate ─────────────────────────────────────────────────────────
 
-    def generate(self, prompt, max_tokens=40, mode="strict"):
+    def generate(self, prompt, max_tokens=40, mode="strict", use_context_triggers=False):
         engine = self._engine(mode)
+        triggers = self.ctm if (use_context_triggers and self.ctm) else None
         ids, trace = engine.generate(
-            self.tokenizer.encode(prompt), max_tokens=max_tokens)
+            self.tokenizer.encode(prompt), max_tokens=max_tokens,
+            context_triggers=triggers)
         return self.tokenizer.decode(ids), ids, trace
 
     def explain_step(self, previous_text, current_text, mode="strict"):

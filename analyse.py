@@ -221,6 +221,22 @@ class Analyser:
         return self.model.discover_zero_cluster_groups(
             min_group_size=min_group_size, mode=mode)
 
+    def context_trigger_matrix(self, min_support: int = 1, mode: str = "strict") -> list:
+        """
+        Flat Context Trigger Matrix table: which surrounding tokens
+        (from whole-sentence co-occurrence) support which cluster
+        member. This is analysis/display only -- it does not build or
+        cache model.ctm; call model.build_context_triggers() for that
+        (needed before generate(..., use_context_triggers=True)).
+        """
+        from ctm import build_context_trigger_matrix
+        rows = build_context_trigger_matrix(self.model, min_support=min_support, mode=mode)
+        dec = self.model._dec_tok
+        return [
+            {**r, "trigger_token": dec(r["trigger_token"]), "member_token": dec(r["member_token"])}
+            for r in rows
+        ]
+
     # -------------------------------------------------------------- traces
     def generation_trace(self, prompt: str, max_tokens: int = 20):
         text, ids, trace = self.model.generate(prompt, max_tokens=max_tokens)
@@ -335,6 +351,15 @@ def main():
                         help="Mine cluster_id==0 for groups the standard dual-axis rule "
                              "never assigns a cluster_id to (fix bridge+target, source varies)")
     p.add_argument("--min-group-size", type=int, default=2)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
+    p = sub.add_parser("context-triggers",
+                        help="Context Trigger Matrix: which surrounding tokens (whole-sentence "
+                             "co-occurrence) support which cluster member, for contextual "
+                             "disambiguation. Display/analysis only -- does not build/cache "
+                             "model.ctm (needed for generate(use_context_triggers=True)); "
+                             "that's a Python-API-only call: model.build_context_triggers().")
+    p.add_argument("--min-support", type=int, default=1)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("trace", help="Step-by-step generation trace for a prompt")
@@ -478,6 +503,16 @@ def main():
             [(row["interpreter_token"], row["member_count"], ",".join(row["evidence_mask"]),
               ", ".join(row["members"])) for row in r],
             ["interpreter", "member_count", "evidence_mask", "members"],
+        ) if r else None)
+
+    elif args.command == "context-triggers":
+        result = analyser.context_trigger_matrix(min_support=args.min_support, mode=args.mode)
+        if not result:
+            print("  no triggers found at this min_support")
+        _emit(result, args.json, lambda r: _print_table(
+            [(row["trigger_token"], row["cluster_id"], row["member_token"], row["support"])
+             for row in r],
+            ["trigger_token", "cluster_id", "member_token", "support"],
         ) if r else None)
 
     elif args.command == "trace":

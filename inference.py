@@ -130,9 +130,23 @@ class InferenceEngine:
         narrowed = active_rels & new_rels
         return narrowed if narrowed else new_rels
 
+    def _ctm_resolve(self, tied_candidates, context_tokens, context_triggers):
+        """
+        Try to break a genuine tie using a Context Trigger Matrix, if
+        one was passed for this call. Returns a winning token id, or
+        None if context_triggers is None, context_tokens is empty, the
+        candidates share no cluster, or CTM itself can't discriminate
+        -- every None case means "fall back to the existing random
+        tie-break," unchanged from before this existed.
+        """
+        if context_triggers is None:
+            return None
+        return context_triggers.resolve_tie(
+            tied_candidates, self.bridges, self.exp_bridge, context_tokens)
+
     # ── main step ─────────────────────────────────────────────────────────
 
-    def step(self, previous, current, active_rels=None):
+    def step(self, previous, current, active_rels=None, context_tokens=None, context_triggers=None):
         active_rels = active_rels or set()
 
         # ── Collect legal successors (bigram check) ───────────────────────
@@ -171,10 +185,14 @@ class InferenceEngine:
 
         # Tie in Stage 1
         if previous is None:
-            # No previous context — all tied candidates equally valid; pick randomly
-            token = random.choice(sorted(s1_pass))
+            # No previous context — try Context Trigger resolution first,
+            # then fall back to random among tied candidates (all equally
+            # legitimate structurally either way).
+            winner = self._ctm_resolve(list(s1_pass), context_tokens, context_triggers)
+            token = winner if winner is not None else random.choice(sorted(s1_pass))
             new_rels = self._narrow(active_rels, s1_pass[token])
-            return token, {"stage": 1, "rule": "no_previous_all_valid_random",
+            rule = "context_trigger_resolved" if winner is not None else "no_previous_all_valid_random"
+            return token, {"stage": 1, "rule": rule,
                            "chosen": token, "active_rels": new_rels,
                            "candidates": list(s1_pass)}
 
@@ -207,21 +225,27 @@ class InferenceEngine:
                 return token, {"stage": 2, "rule": "exact_match_unique",
                                "chosen": token, "active_rels": new_rels,
                                "candidates": list(s2_pass)}
-            # Still tied — genuinely ambiguous; pick randomly
-            token = random.choice(sorted(s2_pass))
+            # Still tied — try Context Trigger resolution first, then
+            # fall back to random (genuinely ambiguous either way).
+            winner = self._ctm_resolve(list(s2_pass), context_tokens, context_triggers)
+            token = winner if winner is not None else random.choice(sorted(s2_pass))
             new_rels = self._narrow(active_rels, s2_pass[token])
-            return token, {"stage": 2, "rule": "all_valid_random",
+            rule = "context_trigger_resolved" if winner is not None else "all_valid_random"
+            return token, {"stage": 2, "rule": rule,
                            "chosen": token, "active_rels": new_rels,
                            "candidates": list(s2_pass)}
 
-        # Stage 2 found nothing — fall back to Stage 1, random among tied
-        token = random.choice(sorted(s1_pass))
+        # Stage 2 found nothing — try Context Trigger resolution among
+        # the Stage 1 survivors first, then fall back to random.
+        winner = self._ctm_resolve(list(s1_pass), context_tokens, context_triggers)
+        token = winner if winner is not None else random.choice(sorted(s1_pass))
         new_rels = self._narrow(active_rels, s1_pass[token])
-        return token, {"stage": 1, "rule": "s2_empty_s1_random",
+        rule = "context_trigger_resolved" if winner is not None else "s2_empty_s1_random"
+        return token, {"stage": 1, "rule": rule,
                        "chosen": token, "active_rels": new_rels,
                        "candidates": list(s1_pass)}
 
-    def generate(self, prompt_ids, max_tokens=40):
+    def generate(self, prompt_ids, max_tokens=40, context_triggers=None):
         ids = list(prompt_ids)
 
         # ── validate every adjacent bigram in the prompt ──────────────
@@ -261,7 +285,10 @@ class InferenceEngine:
         previous = ids[-2] if len(ids) >= 2 else None
         current  = ids[-1]
         for _ in range(max_tokens):
-            token, step_trace = self.step(previous, current, active_rels)
+            context_tokens = set(ids)
+            token, step_trace = self.step(previous, current, active_rels,
+                                           context_tokens=context_tokens,
+                                           context_triggers=context_triggers)
             trace.append(step_trace)
             if token == EOS:
                 break

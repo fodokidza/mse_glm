@@ -565,19 +565,98 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
     return model.stats()
 
 
+# ─── Incremental training CLI (no live display -- just before/after) ─────────
+
+def continue_training_cli(args):
+    from model import MSEGraphLanguageModel
+
+    print()
+    print(f"  {bold('MSE Graph Language Model')}  {dim('─  Continuing training')}")
+    print(f"  {dim('loading')}   {teal(os.path.abspath(args.continue_from))}")
+
+    model = MSEGraphLanguageModel.load(args.continue_from)
+
+    if args.corpus:
+        with open(args.corpus, "r", encoding="utf-8", errors="ignore") as f:
+            new_text = f.read()
+        size = os.path.getsize(args.corpus)
+        print(f"  {dim('new corpus')}   {teal(args.corpus)}  {dim(f'({size:,} bytes)')}")
+    else:
+        new_text = args.text
+        preview = new_text[:72].replace("\n", " ") + ("…" if len(new_text) > 72 else "")
+        print(f"  {dim('new corpus')}   {teal(preview)}")
+
+    out_path = args.out or args.continue_from
+    print(f"  {dim('output')}   {teal(os.path.abspath(out_path))}")
+    if args.extend_vocab:
+        print(f"  {dim('extend_vocab')}   {teal('yes')}"
+              f"  {dim(f'(target vocab_size {args.target_vocab_size})')}")
+    print()
+
+    summary = model.train_incremental(
+        new_text,
+        extend_vocab=args.extend_vocab,
+        target_vocab_size=args.target_vocab_size,
+    )
+    model.save(out_path)
+
+    before, after = summary["before"], summary["after"]
+    rows = [
+        ("Sentences added",   str(summary["sentences_added"])),
+        ("Vocabulary added",  f"{summary['vocab_added']:,} tokens"
+                               f"  ({before['vocab_size']:,} → {after['vocab_size']:,})"),
+        ("Edge Matrix",       f"{before['edges']:,} → {after['edges']:,} unique bigrams"),
+        ("Bridge Matrix",     f"{before['bridges']:,} → {after['bridges']:,} unique triples"),
+        ("Clustered triples", f"{before['clustered_bridges']:,} → {after['clustered_bridges']:,}"
+                               f"  ({before['clusters']} → {after['clusters']} clusters)"),
+        ("Relationship rows", f"{before['relationship_rows']:,} → {after['relationship_rows']:,}"
+                               f"  ({before['relationships']} → {after['relationships']} sentences)"),
+    ]
+    if summary["experience_invalidated"]:
+        rows.append(("Experience Matrices", amber("invalidated — rebuild with build_experience.py")))
+
+    w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"  {dim(k.ljust(w))}  {teal(v)}")
+    print()
+    print(f"  {green('✓')}  {bold('Saved to')} {os.path.abspath(out_path)}")
+    print()
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description="Train an MSE Graph Language Model")
     p.add_argument("--corpus",     help="Path to a text file (streamed)")
     p.add_argument("--text",       help="Inline corpus string")
-    p.add_argument("--out",        required=True, help="Output folder")
+    p.add_argument("--out",        help="Output folder (required for fresh training; "
+                                         "defaults to --continue-from's folder otherwise)")
     p.add_argument("--vocab-size", type=int, default=1000)
     p.add_argument("--quiet",      action="store_true")
+    p.add_argument("--continue-from", metavar="FOLDER",
+                    help="Add this corpus to an already-trained model instead of "
+                         "training a fresh one. Loads FOLDER, merges the new corpus "
+                         "into it, saves to --out (or back to FOLDER if --out is omitted).")
+    p.add_argument("--extend-vocab", action="store_true",
+                    help="With --continue-from: also grow the vocabulary using the new "
+                         "corpus (requires --target-vocab-size). Default: keep the "
+                         "existing vocabulary frozen.")
+    p.add_argument("--target-vocab-size", type=int, default=None,
+                    help="New vocab_size ceiling when --extend-vocab is set; must be "
+                         "greater than the loaded model's current vocab_size.")
     args = p.parse_args()
 
     if not args.corpus and not args.text:
         print("Provide --corpus <file> or --text <string>", file=sys.stderr)
+        sys.exit(1)
+
+    if args.continue_from:
+        continue_training_cli(args)
+        return
+
+    if not args.out:
+        print("Provide --out <folder> (or use --continue-from to update a model in place)",
+              file=sys.stderr)
         sys.exit(1)
 
     from model import MSEGraphLanguageModel

@@ -1,315 +1,412 @@
-# MSE Graph Language Model (MSE-GLM)
+# MSE-GLM — Command Reference
 
-**Deterministic · Explainable · Zero learned weights · CPU only**
+**Matrix-Structured Edge — Graph Language Model.** Deterministic,
+zero-weight, explainable. No embeddings, no gradient descent — every
+output traces back to specific rows in specific matrices built from
+training text.
 
-Email: cliffordchivhanga318@gmail.com
+Repo: `fodokidza/mse_glm` · Author: Clifford Chivhanga
 
-Full info:
-https://tonlexianert.com/pages/blog.php
-
-For more info: https://aircityshops.com/index.php?url=city/mse_blog
-
-A language model with no neural network. Language is represented as a
-token-transition graph. Every generation decision is traceable back to the
-exact rule that produced it. No gradients, no GPU, no black box.
-
-```
-$ python3 train.py --corpus corpus.txt --out runs/model
-
-  MSE Graph Language Model  ─  Training
-  corpus   corpus.txt  (14,823 bytes)
-  vocab    1000  target tokens
-  output   /home/user/runs/model
-
-  Phase  Tokenizer (BPE)       [████████████████████████████████]  100%  step 756/756   0.31s
-  Phase  Edge Matrix (E)       [████████████████████████████████]  100%  620 unique bigrams  0.08s
-  Phase  Bridge Matrix (B)     [████████████████████████████████]  100%  891 unique triples  0.11s
-  Phase  Cluster Assignment    [████████████████████████████████]  100%  14 clusters  0.04s
-  Phase  Relationship Matrix   [████████████████████████████████]  100%  1,243 rows  0.06s
-  Phase  Saving Model          [████████████████████████████████]  100%
-
-  ✓  Training complete
-  Vocabulary        1,000 tokens
-  Edge Matrix         620 unique bigrams
-  Bridge Matrix       891 unique triples
-  Clustered triples   412  (14 clusters)
-  Relationship rows 1,243  (38 sentences)
-  Total time          0.64s
-```
-
-```
-$ python3 chat.py --model runs/model --mode open
-you> the dog
-model> the dog sat on the carpet
-
-you> /shared cat dog
-model> cat dog -> sat  [bridge_axis  {'cluster_id': 1, 'overlap': 2, 'source': 'training'}]
-
-you> /explain the | dog
-model> next='sat'  {'stage': 1, 'rule': 'bridge_lineage_unique', 'chosen': 12, 'active_rels': {1}, 'candidates': [12]}
-```
-
-**Status:** Implemented and tested — full regression suite passing, covering
-the core Strict-Mode pipeline plus the Experience Matrix / Open Mode subsystem.
+Requires **Python 3** only — zero external dependencies (standard
+library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
+`argparse`, `shutil`, `tempfile`). No `pip install` needed.
 
 ---
 
-## What this is
+## Contents
 
-- **Zero learned weights** — a BPE tokenizer feeds a deduplicated bigram/trigram graph. No floats, no backprop, no framework.
-- **Fully deterministic** — same input, same output, every time. The only randomness is a uniform tie-break among candidates already judged equally valid; it never changes *which* candidates are valid.
-- **Fully explainable** — every generated token traces back to the exact pipeline stage, rule, and candidate set that produced it, including tie-breaks.
-- **CPU only** — array-backed, CSR-indexed storage. Runs on a Raspberry Pi.
-- **Distributional similarity without embeddings** — dual-axis cluster assignment identifies interchangeable tokens structurally, with no embedding model.
-- **Two inference modes** — **Strict Mode** (training data only) and **Open Mode** (training data plus structurally-inferred Experience Matrices), sharing one engine.
-
-## Best use cases 
-
-Best suited to **grammar-constrained generation** (SQL, JSON, config files, autocomplete, assembly), **embedded / low-resource environments**, and settings where **auditability and reproducibility** matter more than fluency.
-
----
-
-## Architecture
-
-```
-Corpus
-  │
-  ▼
-Tokenizer (BPE)           from-scratch, streaming, no RAM limit
-  │
-  ▼
-Sentence Splitting         on  .  !  ?  \n
-  │
-  ├──────────────────────────────────────────────────────────┐
-  ▼                         ▼                                ▼
-Edge Matrix (E)        Bridge Matrix (B)          Relationship Matrix (R)
-deduplicated bigrams   deduplicated triples        (triple_id, rel_id) only
-CSR-indexed by source  + dual-axis cluster_id      no triple content
-                       + T_index                   duplicated
-  │
-  │   (optional, offline — one command: build_experience.py)
-  ▼
-Experience Builder
-  Rule 1 — bridge-axis structural expansion
-  Rule 2 — target-axis structural expansion
-  → Experience Edge / Bridge / Relationship Matrices (EE, EB, ER)
-  │
-  ▼
-Inference Engine                 (Strict: E,B,R only · Open: + EE,EB,ER)
-  Stage 1 — Current-token authority   (bridge-lineage vote via active_rels)
-  Stage 2 — Previous-token authority  (exact-triple lineage vote)
-  Termination                          (emit <EOS> when no successors)
-  +  infer_shared_role()               (unordered cluster-based query)
-  │
-  ▼
-MSEGraphLanguageModel
-generate · explain_step · infer_shared_role · token_similarity
-train / build_experience / load_experience / save / load / stats
-```
-
-| File | Role |
-|---|---|
-| `tokenizer.py` | BPE tokenizer — special tokens, normalization, in-memory or streamed training |
-| `graph.py` | `EdgeMatrix`, `BridgeMatrix` (dual-axis `cluster_id` + `T_index`), `RelationshipMatrix` |
-| `experience.py` | `ExperienceEdgeMatrix` / `ExperienceBridgeMatrix` / `ExperienceRelationshipMatrix` + `ExperienceBuilder` — derives Open Mode's structurally-inferred triples |
-| `build_experience.py` | Standalone CLI that builds Experience Matrices for a saved model, with a live progress display |
-| `inference.py` | Two-stage deterministic pipeline (current-token authority, then previous-token authority), lineage-aware tie-break via `active_rels`, `infer_shared_role()` |
-| `model.py` | `MSEGraphLanguageModel` — orchestrates everything, `train / generate / explain / infer_shared_role / token_similarity / save / load` |
-| `analyse.py` | Library + 12-subcommand CLI for corpus stats, topology, clusters, relationships, traces |
-| `train.py` | CLI training pipeline with live phase-by-phase progress display |
-| `chat.py` | Interactive REPL — generation, `/mode`, `/explain`, `/shared`, `/similarity`, `/stats`, `/clusters`, `/exp` |
-| `test.py` | Automated regression suite — Strict Mode core (56 original checks) plus full Experience Matrix / Open Mode coverage |
+- [File overview](#file-overview)
+- [1. Train from scratch](#1-train-from-scratch)
+- [2. Continue training on new data](#2-continue-training-on-new-data)
+- [3. Train from a folder of .txt files](#3-train-from-a-folder-of-txt-files)
+- [4. Build Experience Matrices (Open Mode)](#4-build-experience-matrices-open-mode)
+- [5. Chat / generate interactively](#5-chat--generate-interactively)
+- [6. Analyse a trained model](#6-analyse-a-trained-model)
+- [7. Cluster Interpreter Matrix (naming clusters)](#7-cluster-interpreter-matrix-naming-clusters)
+- [8. Context Trigger Matrix (contextual disambiguation)](#8-context-trigger-matrix-contextual-disambiguation)
+- [9. Token Importance / Trigger analysis (Python API only)](#9-token-importance--trigger-analysis-python-api-only)
+- [10. Analyse raw text with no trained model](#10-analyse-raw-text-with-no-trained-model)
+- [11. Run the test suite](#11-run-the-test-suite)
+- [Typical end-to-end session](#typical-end-to-end-session)
+- [Notes and gotchas](#notes-and-gotchas)
 
 ---
 
-## Quickstart
+## File overview
 
-**No pip installs required.** Python 3.8+ standard library only.
+| File                  | What it's for                                                          |
+|-----------------------|--------------------------------------------------------------------------|
+| `tokenizer.py`        | From-scratch BPE tokenizer                                              |
+| `graph.py`            | Edge / Bridge / Relationship matrices + dual-axis clustering            |
+| `model.py`            | `MSEGraphLanguageModel` — orchestrates everything, save/load            |
+| `inference.py`        | Two-stage lineage-vote generation engine                                |
+| `experience.py`       | Cluster-substitution rules that derive Open Mode's Experience Matrices  |
+| `interpret.py`        | Cluster Interpreter Matrix — names clusters, mines the zero-cluster bucket |
+| `importance.py`       | Sequence reconstruction + per-triple importance/trigger tagging (Python API only) |
+| `ctm.py`               | Context Trigger Matrix — contextual disambiguation among cluster members |
+| `analyse.py`          | Read-only analysis CLI + `Analyser`/`CorpusAnalyser` Python API         |
+| `train.py`            | Fresh training + `--continue-from` incremental training, with live display |
+| `train_corpus.py`     | Large-corpus pipeline — train from a folder of `.txt` files             |
+| `build_experience.py` | CLI to build/save Experience Matrices for an already-trained model      |
+| `chat.py`             | Interactive REPL over a trained model                                  |
+| `test.py`             | Full regression suite (all features, 340+ checks)                       |
+
+---
+
+## 1. Train from scratch
 
 ```bash
-git clone https://github.com/fodokidza/mse_glm.git
-cd mse_glm
-
-# train from a file (streamed — not bounded by RAM)
-python3 train.py --corpus path/to/corpus.txt --out runs/model --vocab-size 2000
-
-# or from inline text
+# Inline text
 python3 train.py --text "the cat sat on the mat. the dog sat on the carpet." \
-                 --out runs/demo --vocab-size 200
+    --out runs/demo --vocab-size 1000
 
-# (optional) derive Experience Matrices for Open Mode
-python3 build_experience.py --model runs/model
+# From a file (streamed in chunks, doesn't load the whole file into memory for tokenizing)
+python3 train.py --corpus corpus.txt --out runs/model --vocab-size 2000
 
-# chat with it — strict (training data only) or open (+ experience)
-python3 chat.py --model runs/model --mode strict
-python3 chat.py --model runs/model --mode open
-
-# run the tests
-python3 test.py
+# Quiet mode (no live animated display, just a final summary)
+python3 train.py --corpus corpus.txt --out runs/model --quiet
 ```
 
-### Python API
+| Flag             | Meaning                                              |
+|------------------|-------------------------------------------------------|
+| `--text`         | Inline corpus string (use this OR `--corpus`)         |
+| `--corpus`       | Path to a text file (streamed)                        |
+| `--out`          | Output folder — **required** for fresh training       |
+| `--vocab-size`   | Target BPE vocabulary size (default 1000)             |
+| `--quiet`        | Skip the live animated display                        |
+
+---
+
+## 2. Continue training on new data
+
+Adds a new corpus to an already-trained model **without discarding
+what it already knows**. Clusters are recomputed over the union of
+old + new facts (a cluster can only form once every triple that
+belongs to it exists). Experience Matrices AND the Context Trigger
+Matrix are both invalidated automatically if present (both are
+derived from the pre-merge structure).
+
+```bash
+# Frozen vocabulary (default, safest) -- reuses the existing tokenizer as-is
+python3 train.py --continue-from runs/model --text "the pig sat on the rug." \
+    --out runs/model
+
+# Grow the vocabulary too (needed if the new text has substantially new words --
+# otherwise unseen characters collapse onto the same <UNK> id and can create
+# false structural matches between unrelated new words)
+python3 train.py --continue-from runs/model --corpus new_data.txt \
+    --extend-vocab --target-vocab-size 3000
+```
+
+| Flag                    | Meaning                                                        |
+|-------------------------|-------------------------------------------------------------------|
+| `--continue-from FOLDER`| Load this model and merge new data into it                      |
+| `--out`                 | Where to save (omit to save back into `--continue-from`'s folder) |
+| `--extend-vocab`        | Also grow the vocabulary from the new corpus (requires `--target-vocab-size`) |
+| `--target-vocab-size`   | New vocab ceiling; must exceed the loaded model's current vocab size |
+
+Python API equivalent:
+```python
+model = MSEGraphLanguageModel.load("runs/model")
+summary = model.train_incremental(new_text, extend_vocab=True, target_vocab_size=3000)
+# summary["experience_invalidated"] / summary["ctm_invalidated"] tell you what to rebuild
+model.save("runs/model")
+```
+
+---
+
+## 3. Train from a folder of .txt files
+
+For a large corpus split across many files. Two bounded-memory passes:
+builds one shared vocabulary by streaming word frequencies across every
+file first, then builds the graph in batches, reusing the same merge
+machinery as `--continue-from` above.
+
+```bash
+python3 train_corpus.py --corpus-dir data/ --out runs/big_model --vocab-size 8000
+
+# Merge 5 files per step instead of 1 (fewer full-recompute passes, more memory per step)
+python3 train_corpus.py --corpus-dir data/ --out runs/big_model --batch-size 5
+
+# Only scan the top level of the folder, not subfolders
+python3 train_corpus.py --corpus-dir data/ --out runs/big_model --no-recursive
+
+python3 train_corpus.py --corpus-dir data/ --out runs/big_model --quiet
+```
+
+| Flag             | Meaning                                                              |
+|------------------|----------------------------------------------------------------------|
+| `--corpus-dir`   | Folder containing `.txt` files — **required**                       |
+| `--out`          | Output folder — **required**                                        |
+| `--vocab-size`   | Target BPE vocabulary size (default 2000)                            |
+| `--batch-size`   | Files merged into the graph per step (default 1 — safest memory profile; raise for fewer, faster merge passes on large corpora) |
+| `--no-recursive` | Only scan the top level, skip subfolders                             |
+| `--quiet`        | Suppress progress output                                             |
+
+> Files are discovered recursively by default, sorted for a
+> deterministic training order. Reads each file's full text at once
+> (doesn't chunk within a single file) — this pipeline assumes a
+> corpus split across many reasonably-sized files, not one giant file.
+
+---
+
+## 4. Build Experience Matrices (Open Mode)
+
+Derives inferred (never-literally-seen) triples from cluster
+substitutability, enabling `--mode open` in generation/analysis.
+
+```bash
+python3 build_experience.py --model runs/model
+
+python3 build_experience.py --model runs/model --dry-run   # preview without writing files
+python3 build_experience.py --model runs/model --quiet
+```
+
+---
+
+## 5. Chat / generate interactively
+
+```bash
+python3 chat.py --model runs/model
+python3 chat.py --model runs/model --mode open --max-tokens 40
+```
+
+REPL commands once inside:
+
+| Command                     | What it does                                      |
+|------------------------------|----------------------------------------------------|
+| `<any text>`                 | Generate a continuation in the current mode        |
+| `/mode strict` / `/mode open`| Switch modes (builds Experience Matrices on first use if needed) |
+| `/explain <prev> \| <curr>`  | Explain one inference step                         |
+| `/shared <tok1> <tok2> ...`  | `infer_shared_role()` across a token set           |
+| `/similarity <a> <b>`        | Cluster-overlap similarity between two tokens      |
+| `/stats`                     | Model stats (includes experience counts if built)  |
+| `/clusters`                  | Top dual-axis cluster groups                       |
+| `/exp`                       | Experience matrix summary                          |
+| `/quit`                      | Exit                                                |
+
+> `chat.py` does not currently expose Context Trigger Matrix
+> disambiguation (`use_context_triggers`) — that's available through
+> the Python API (`model.generate(..., use_context_triggers=True)`)
+> and could be wired into the REPL as a `/ctm` toggle if useful.
+
+---
+
+## 6. Analyse a trained model
+
+All subcommands need `--model FOLDER`. Add `--json PATH` (**before**
+the subcommand) to write the result as JSON to a file instead of
+printing it.
+
+```bash
+python3 analyse.py --model runs/model <subcommand> [options]
+
+# Write to JSON instead of printing -- note --json comes BEFORE the subcommand
+python3 analyse.py --model runs/model --json out.json clusters
+```
+
+| Subcommand      | Example                                              | What it shows |
+|------------------|--------------------------------------------------------|---------------|
+| `stats`          | `analyse.py --model runs/model stats`                  | vocab/edges/bridges/clusters/relationship counts |
+| `topology`       | `... topology --top 10`                                | hub tokens (highest out-degree), dead-end count |
+| `clusters`       | `... clusters --top 20 --axis bridge`                   | dual-axis cluster report |
+| `cluster`        | `... cluster 3`                                         | full detail for one cluster_id |
+| `relationships`  | `... relationships`                                     | Relationship Matrix summary |
+| `relationship`   | `... relationship 2`                                    | full detail for one training sentence |
+| `token`          | `... token cat`                                         | successors, bridge triples, clusters for one token |
+| `similarity`     | `... similarity cat dog`                                | cluster-overlap similarity between two tokens |
+| `shared`         | `... shared cat dog pig`                                | `infer_shared_role()` across 2+ tokens |
+| `trace`          | `... trace "the cat" --max-tokens 10`                   | step-by-step generation trace (stage/rule/lineage per token) |
+| `report`         | `... report --top 10`                                   | combined stats + topology + clusters + relationships |
+
+---
+
+## 7. Cluster Interpreter Matrix (naming clusters)
+
+```bash
+# All candidates for one cluster, unfiltered, ranked best-first
+python3 analyse.py --model runs/model interpret 1 --top 10 --mode open
+
+# Every candidate clearing --min-coverage, up to --max-per-cluster per cluster
+python3 analyse.py --model runs/model interpretations --min-coverage 0.5 --max-per-cluster 3
+
+# The filtered CI Matrix: coverage AND evidence_mask size both required
+# (a cluster may carry more than one qualifying label at once)
+python3 analyse.py --model runs/model interpreter-matrix --min-coverage 0.5 --min-signals 2
+
+# Persist it
+python3 analyse.py --model runs/model --json runs/model/interpreter_matrix.json \
+    interpreter-matrix --min-coverage 0.5 --min-signals 2
+
+# Mine cluster_id==0 for groups the standard dual-axis rule never assigns
+# an id to at all (fix bridge+target, source varies)
+python3 analyse.py --model runs/model zero-cluster --min-group-size 2
+```
+
+`--mode open` is available on `interpret`, `interpretations`,
+`interpreter-matrix`, and `zero-cluster` — it additionally folds in
+the Experience Matrices (requires Experience Matrices to already
+exist; see section 4).
+
+---
+
+## 8. Context Trigger Matrix (contextual disambiguation)
+
+The Bridge Matrix answers "which tokens can occupy this slot?"
+(cat/dog/pig are interchangeable). The Context Trigger Matrix answers
+"given this surrounding context, which one SHOULD?" — built from
+whole-sentence co-occurrence, no new training.
+
+```bash
+# Inspect the flat trigger table (analysis only -- see below for actually
+# enabling this in generation)
+python3 analyse.py --model runs/model context-triggers --min-support 1
+python3 analyse.py --model runs/model context-triggers --min-support 3 --mode open
+```
+
+**Building and using it for generation is Python-API only:**
 
 ```python
 from model import MSEGraphLanguageModel
 
-m = MSEGraphLanguageModel.load("runs/model")
+model = MSEGraphLanguageModel.load("runs/model")
+model.build_context_triggers()          # builds + caches model.ctm
 
-# generate (mode="strict" by default, or "open" if experience matrices are loaded)
-text, ids, trace = m.generate("the dog", max_tokens=20)
-print(text)   # "the dog sat on the carpet"
+text, ids, trace = model.generate(
+    "the farmer fed the", max_tokens=5, use_context_triggers=True)
+```
 
-# explain every step
-for step in trace:
-    print(step["stage"], step["rule"], step["chosen"])
+Without `use_context_triggers=True` (the default), generation is
+byte-for-byte identical to before this feature existed — it's strictly
+opt-in. When enabled, it only ever activates at a genuine tie between
+members of the same cluster (never overrides a unique answer), and
+falls straight back to the existing random tie-break if the context
+gives it no signal. Look for `"rule": "context_trigger_resolved"` in
+the trace to see exactly when it fired.
 
-# cluster-based shared-role inference
-print(m.infer_shared_role(["cat", "dog"]))
-# [('sat', 'bridge_axis', {'cluster_id': 1, 'overlap': 2, 'source': 'training'}), ...]
-
-# build Experience Matrices in-process and switch to Open Mode
-m.build_experience(folder="runs/model")
-text, ids, trace = m.generate("the dog", max_tokens=20, mode="open")
+```python
+model.has_context_triggers()   # bool
 ```
 
 ---
 
-## Analyse
+## 9. Token Importance / Trigger analysis (Python API only)
+
+Not wired into the CLI — import directly:
+
+```python
+from importance import (sequence_for_relationship, important_tokens_in_sequence,
+                         trigger_matrix, expected_importance)
+
+seq = sequence_for_relationship(model, rel_id=0)          # reconstruct a training sentence
+tagged = important_tokens_in_sequence(model, rel_id=0)     # which tokens in it are "important", and why
+triggers = trigger_matrix(model, min_sequences=2)          # local (immediate-window) trigger generalization
+expected_importance(model, prev_token_id, current_token_id)  # what Stage 2 already implies comes next
+```
+
+See `importance.py`'s module docstring for the distinction between
+this (immediate 2-3 token window) and the Context Trigger Matrix in
+section 8 (whole-sentence window) — they're deliberately different
+granularities of the same underlying idea.
+
+---
+
+## 10. Analyse raw text with no trained model
 
 ```bash
-# corpus stats — no trained model needed
-python3 analyse.py corpus --file mycorpus.txt
+python3 analyse.py corpus --text "the cat sat on the mat." --top 10
+python3 analyse.py corpus --file corpus.txt --top 10
+```
 
-# graph stats
-python3 analyse.py --model runs/model stats
-python3 analyse.py --model runs/model topology
-python3 analyse.py --model runs/model clusters
-python3 analyse.py --model runs/model clusters --axis bridge
-python3 analyse.py --model runs/model cluster 1
-python3 analyse.py --model runs/model relationships
-python3 analyse.py --model runs/model relationship 0
-python3 analyse.py --model runs/model token cat
-python3 analyse.py --model runs/model similarity cat dog
-python3 analyse.py --model runs/model shared cat dog
-python3 analyse.py --model runs/model trace "the dog" --max-tokens 12
-python3 analyse.py --model runs/model report
+The only subcommand that doesn't need `--model` — just word/sentence
+statistics over raw text.
 
-# export any command as JSON
-python3 analyse.py --model runs/model --json out.json report
+---
+
+## 11. Run the test suite
+
+```bash
+python3 test.py
+```
+
+No flags. Runs the full regression suite (tokenizer, graph
+construction, generation determinism, Experience Matrix / Open Mode,
+Cluster Interpreter, zero-cluster mining, Token Importance analysis,
+Context Trigger Matrix, incremental training, large-corpus pipeline,
+save/load round-trips) and prints a final `N passed, 0 failed` summary.
+
+---
+
+## Typical end-to-end session
+
+```bash
+# 1. Train on a folder of files
+python3 train_corpus.py --corpus-dir data/ --out runs/model --vocab-size 4000
+
+# 2. Look at what it learned
+python3 analyse.py --model runs/model clusters --top 20
+python3 analyse.py --model runs/model interpreter-matrix --min-coverage 0.5 --min-signals 2
+python3 analyse.py --model runs/model context-triggers --min-support 2
+
+# 3. Build Open Mode + Context Trigger Matrix
+python3 build_experience.py --model runs/model
+python3 -c "from model import MSEGraphLanguageModel as M; m=M.load('runs/model'); \
+    m.build_context_triggers(); print('ok')"
+# (CTM isn't persisted by save()/load() -- rebuild it each session, or
+#  add your own caching around ContextTriggerMatrix.to_dict()/from_dict())
+
+# 4. Chat with it
+python3 chat.py --model runs/model --mode open
+
+# 5. Add more data later, in place
+python3 train.py --continue-from runs/model --corpus more_data.txt \
+    --extend-vocab --target-vocab-size 6000
+# Experience Matrices AND the Context Trigger Matrix are now invalidated:
+python3 build_experience.py --model runs/model
+# (rebuild CTM in your own script/session too, per step 3)
 ```
 
 ---
 
-## Chat commands
+## Notes and gotchas
 
-| Command | What it does |
-|---|---|
-| `<any text>` | Generate a continuation in the current mode |
-| `/mode strict\|open` | Switch modes; switching to `open` auto-builds Experience Matrices on first use if not already present |
-| `/explain <prev> \| <curr>` | Show stage, rule, candidates for one step |
-| `/shared cat dog boy` | Run `infer_shared_role()` — what structural role do these share? |
-| `/similarity <a> <b>` | Cluster-overlap similarity between two tokens |
-| `/clusters` | Show top dual-axis cluster groups (training data) |
-| `/stats` | Vocab / edge / bridge / cluster / relationship counts (plus experience counts if loaded) |
-| `/exp` | Experience Matrix summary (prompts to run `/mode open` first if none loaded) |
-| `/quit` | Exit |
-
----
-
-## Dual-axis clustering
-
-`cluster_id` in the Bridge Matrix groups structurally interchangeable tokens without any embedding model:
-
-- **Bridge axis** — triples sharing `(source, target)` → same cluster. Members are interchangeable *bridges* (middle tokens).
-- **Target axis** — triples sharing `(source, bridge)` → same cluster. Members are interchangeable *targets*.
-- `cluster_id = 0` — triple matches no other on either axis.
-
-```
-Corpus: "the cat sat on the mat.  the dog sat on the carpet."
-
-source  target  bridge  cluster_id
-the     sat     cat     1          ← cat and dog share cluster 1
-cat     on      sat     0             (same source+target, bridge varies)
-sat     the     on      0
-on      mat     the     2          ← mat and carpet share cluster 2
-the     sat     dog     1             (same source+bridge, target varies)
-dog     on      sat     0
-on      carpet  the     2
-```
-
-`infer_shared_role(["cat","dog"])` intersects T_index sets → shared cluster 1 → predicted: `sat`.
-
----
-
-## Open Mode: Experience Matrices
-
-Strict Mode only ever emits transitions actually seen in training. **Open Mode**
-adds a second, opt-in layer: `build_experience.py` (or `model.build_experience()`)
-runs the same dual-axis clusters above through two expansion rules —
-
-- **Rule 1 (bridge axis)** — if token X shares a cluster with an attested bridge
-  B in slot `(S, T)`, and B also bridges a different slot `(S2, T2)`, then X can
-  bridge `(S2, T2)` too.
-- **Rule 2 (target axis)** — the same idea applied to interchangeable targets.
-
-— and saves the results as three separate Experience Matrices
-(`experience_edges.json`, `experience_bridges.json`, `experience_relationships.json`).
-These are never consulted by Strict Mode; Open Mode simply unions them in.
-
-```
-Training: "the cat sat on the mat.", "the dog sat on the carpet.",
-          "the boy sat on the mat.", "the boy ran on the road."
-          (cat and dog are never observed with "ran")
-
-$ python3 build_experience.py --model runs/model
-  Rule 1 complete — 2 new triples
-  ...
-
-$ python3 chat.py --model runs/model --mode open
-you> the cat
-model> the cat ran on the road        ← inferred, never seen in training
-```
-
-Run `/exp` in `chat.py`, or `python3 analyse.py --model runs/model stats`
-after building, to see Experience Matrix counts alongside training counts.
-
----
-
-## Lineage-aware tie-breaking
-
-The Relationship Matrix `R` stores `(triple_id, relationship_id)` only — no triple content duplicated. A triple shared across multiple training sentences carries one R row per sentence. At inference, `active_rels` is **narrowed by intersection** at each step (never widened back out), so the path stays locked to the most specific consistent lineage even when it passes through shared triples.
-
-Without narrowing: `the dog → the dog sat on the mat` (wrong).
-With narrowing: `the dog → the dog sat on the carpet` (correct).
-
-This regression is covered by a dedicated automated test.
-
----
-
-## Limitations
-
-- No semantic understanding. No reasoning. Strict Mode does not generalise to unseen transitions; Open Mode generalises only as far as dual-axis clustering can justify.
-- Sequential context is limited to `(previous, current)` at the triple level; lineage tracking (`active_rels`) is a global consistency signal, not a longer context window.
-- Distributional clustering is slot-substitution only — does not distinguish synonyms from antonyms.
-- Tokens touching universal structural positions (`<BOS>`, `<EOS>`) cluster together even when otherwise unrelated.
-- Experience Matrix expansion can grow combinatorially for very large, highly-substitutable clusters — there is currently no size cap or pruning step.
-
----
-
-
-## License
-
-[AGPL-3.0](LICENSE) — source-available, including for network use.
-
-If AGPL terms do not suit your use case (proprietary embedding, closed commercial service),
-a commercial license is available — open an issue or contact the author.
-
----
-
-## Author
-
-**Clifford Chivhanga**
-
-Email: cliffordchivhanga318@gmail.com
-
-[github.com/fodokidza](https://github.com/fodokidza)
+- **`--json` is a path, not a flag**, and belongs on the *main*
+  `analyse.py` parser — it must come before the subcommand:
+  `analyse.py --model X --json out.json clusters`, not
+  `analyse.py --model X clusters --json out.json`.
+- **Incremental training invalidates both Experience Matrices AND the
+  Context Trigger Matrix.** If you use `--mode open` or
+  `use_context_triggers=True` anywhere, rebuild both after any
+  `--continue-from` or `train_corpus.py` run.
+  `train_incremental()`'s return value tells you which were affected:
+  `summary["experience_invalidated"]` / `summary["ctm_invalidated"]`.
+- **The Context Trigger Matrix is not persisted by `save()`/`load()`.**
+  It's cheap enough to rebuild per session
+  (`model.build_context_triggers()`) but if you want it cached to
+  disk, `ContextTriggerMatrix.to_dict()`/`from_dict()` are
+  JSON-safe — wire your own save/load around them if needed.
+- **`use_context_triggers=True` only ever changes behavior at a
+  genuine tie.** It never overrides a unique, structurally-determined
+  answer, and it falls back to the exact pre-existing random
+  tie-break whenever it has no signal. Default is `False` everywhere.
+- **Frozen vocabulary is the default** for incremental/continued
+  training. It's safe for corpora similar to what the model already
+  knows; pass `--extend-vocab --target-vocab-size N` when the new
+  text introduces substantially new vocabulary, or unseen characters
+  will collapse onto the same `<UNK>` id and can create false
+  structural matches between unrelated words.
+- **`--batch-size` in `train_corpus.py` is a memory/speed knob, not a
+  correctness one** — the final model is identical regardless of
+  batch size (verified in `test.py`). Raise it for large corpora to
+  reduce the number of full-recompute merge passes.
+- **Common tokens will show up as Context Trigger Matrix noise.**
+  `"the"`, `"on"`, `"is"` etc. accumulate support across nearly every
+  cluster member on a small/repetitive corpus, since there's no
+  stopword filtering — only reserved tokens
+  (`<PAD>/<UNK>/<BOS>/<EOS>`) are excluded. Use `--min-support` to
+  cut noise, and don't treat a high-support common-word trigger as
+  meaningful without checking what else fired for that member.
+- **Cluster Interpreter caveats** (coverage isn't a probability,
+  evidence signals are correlated not independent, zero-cluster
+  mining has a much larger candidate space than the regular matrix)
+  are documented in depth in `interpret.py`'s module docstring.

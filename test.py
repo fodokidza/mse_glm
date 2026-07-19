@@ -4,10 +4,11 @@ test.py — Full regression suite for MSE-GLM v2.1 + Open Mode.
 Usage:  python3 test.py
 """
 
-import shutil, sys, tempfile
+import os, random, shutil, sys, tempfile
 from model import MSEGraphLanguageModel
 from analyse import CorpusAnalyser, Analyser
 from tokenizer import normalize, split_sentences
+from train_corpus import discover_txt_files, train_from_folder
 
 PASS = FAIL = 0
 
@@ -274,6 +275,200 @@ hey pig is animal.
     check("no self-referential interpreter proposed",
           all(g["interpreter_token"] not in g["members"] for g in zero_groups), zero_groups)
 
+    section("Token Importance / Trigger analysis (importance.py)")
+
+    from importance import (sequence_for_relationship, important_tokens_in_sequence,
+                             trigger_matrix, expected_importance)
+
+    CORPUS_IMP = """
+the cat sat on the mat.
+the dog sat on the carpet.
+the pig sat on the rug.
+"""
+    m_imp = MSEGraphLanguageModel(vocab_size=200)
+    m_imp.train(CORPUS_IMP)
+    tok_imp = m_imp.tokenizer
+    def dec_imp(t): return tok_imp.id_to_token.get(t, t) if t in (0, 1, 2, 3) else tok_imp.decode([t])
+
+    # Sequence reconstruction must exactly match the original sentence.
+    seq0 = sequence_for_relationship(m_imp, 0)
+    check("sequence_for_relationship reconstructs rel_id=0 exactly",
+          [dec_imp(t) for t in seq0] ==
+          ["<BOS>", "the", "cat", "sat", "on", "the", "mat", "<EOS>"], seq0)
+
+    # A rel_id beyond range must return [] rather than raise.
+    check("sequence_for_relationship on out-of-range rel_id returns []",
+          sequence_for_relationship(m_imp, 9999) == [])
+
+    # cat/dog/pig must each be tagged important in their own sentence,
+    # via BOTH the axes they actually participate in (bridge-axis "the
+    # ___ sat" and target-axis "<BOS> the ___").
+    imp0 = important_tokens_in_sequence(m_imp, 0)
+    cat_tags = [it for it in imp0["important"] if dec_imp(it["token"]) == "cat"]
+    check("'cat' is tagged important in its own sentence",
+          len(cat_tags) > 0, imp0)
+    check("'cat' is tagged important via both bridge and target axis",
+          {t["axis"] for t in cat_tags} == {"bridge", "target"}, cat_tags)
+    check("'cat's bridge-axis trigger is ('the', 'sat')",
+          any(tuple(dec_imp(x) for x in t["trigger"]) == ("the", "sat")
+              for t in cat_tags if t["axis"] == "bridge"), cat_tags)
+
+    # The trigger matrix must recover that ('the','sat') and
+    # ('<BOS>','the') each generalize across all 3 sentences, activating
+    # 3 distinct tokens (cat/dog/pig), confirming what cluster formation
+    # already guarantees for a multi-sentence cluster.
+    triggers = trigger_matrix(m_imp, min_sequences=2)
+    decoded_triggers = {tuple(dec_imp(x) for x in row["trigger"]): row for row in triggers}
+    check("trigger_matrix finds ('the','sat') generalizing across sentences",
+          ("the", "sat") in decoded_triggers, decoded_triggers)
+    if ("the", "sat") in decoded_triggers:
+        row = decoded_triggers[("the", "sat")]
+        check("('the','sat') spans all 3 sentences with 3 distinct tokens",
+              row["distinct_sequences"] == 3 and row["distinct_tokens"] == 3, row)
+        activated = {dec_imp(tok) for _rid, tok in row["activations"]}
+        check("('the','sat') activates exactly {cat, dog, pig}",
+              activated == {"cat", "dog", "pig"}, row)
+
+    # min_sequences filter must actually filter.
+    check("trigger_matrix respects min_sequences (none span 4 sentences)",
+          trigger_matrix(m_imp, min_sequences=4) == [])
+
+    # expected_importance must match what Stage 2 generation would
+    # itself use: (<BOS>, the) should expect {cat, dog, pig} next.
+    bos_id = 2
+    the_id = tok_imp.token_to_id["the"]
+    sat_id = tok_imp.token_to_id["sat"]
+    result = expected_importance(m_imp, bos_id, the_id)
+    check("expected_importance(<BOS>, the) predicts cat/dog/pig",
+          result is not None and
+          {dec_imp(t) for t in result["expected_members"]} == {"cat", "dog", "pig"}, result)
+    check("expected_importance returns None for a non-trigger pair",
+          expected_importance(m_imp, sat_id, the_id) is None)
+
+    section("Context Trigger Matrix (ctm.py)")
+
+    from ctm import ContextTriggerMatrix, build_context_trigger_matrix, token_to_relationships
+
+    # Each animal gets its own distinct surrounding vocabulary so the
+    # signatures should cleanly discriminate them, matching the
+    # proposal's own worked example (farm -> pig, park -> dog, mice -> cat).
+    CORPUS_CTM = """
+the cat sat on the mat.
+the cat likes mice.
+a kitten is like a cat.
+the dog sat on the carpet.
+the dog likes the park.
+a puppy is like a dog.
+the pig sat on the rug.
+the pig likes the farm.
+a piglet is like a pig.
+"""
+    m_ctm = MSEGraphLanguageModel(vocab_size=400)
+    m_ctm.train(CORPUS_CTM)
+    tok_ctm = m_ctm.tokenizer
+    def enc_ctm(w): return tok_ctm.token_to_id[w]
+    def dec_ctm(t): return tok_ctm.id_to_token.get(t, t) if t in (0, 1, 2, 3) else tok_ctm.decode([t])
+
+    a_ctm = Analyser(m_ctm)
+    cluster_sat = next(c["cluster_id"] for c in a_ctm.cluster_report(top_n=50)
+                        if set(c["members"]) == {"cat", "dog", "pig"} and c["axis"] == "bridge")
+
+    ctm = m_ctm.build_context_triggers()
+    check("build_context_triggers caches onto model.ctm", m_ctm.ctm is ctm)
+    check("has_context_triggers true after building", m_ctm.has_context_triggers())
+
+    # Reserved tokens must never appear as a trigger anywhere.
+    all_triggers = set()
+    for sig in ctm._sigs.values():
+        for triggers in sig.values():
+            all_triggers.update(triggers.keys())
+    check("no reserved tokens (<PAD>/<UNK>/<BOS>/<EOS>) appear as triggers",
+          all_triggers.isdisjoint({0, 1, 2, 3}), all_triggers)
+
+    # Signatures must be built from EVERY sentence mentioning a member --
+    # not just the sentences that happen to instantiate this specific
+    # cluster's own triples. "mice"/"kitten" only appear in sentences that
+    # have nothing to do with the "the ___ sat" cluster's own triples, so
+    # if they show up in cat's signature for THIS cluster, the broader
+    # (correct) scoping is confirmed.
+    cat_sig = ctm._sigs[cluster_sat][enc_ctm("cat")]
+    check("cat's trigger signature includes tokens from OTHER sentences (mice, kitten)",
+          enc_ctm("mice") in cat_sig and enc_ctm("kitten") in cat_sig, cat_sig)
+
+    farm_ctx  = {enc_ctm(w) for w in ("farm", "barn") if w in tok_ctm.token_to_id}
+    park_ctx  = {enc_ctm("park")}
+    mice_ctx  = {enc_ctm("mice"), enc_ctm("kitten")}
+
+    r_farm = ctm.select(cluster_sat, {enc_ctm("farm")})
+    r_park = ctm.select(cluster_sat, park_ctx)
+    r_mice = ctm.select(cluster_sat, mice_ctx)
+    check("'farm' context selects pig", r_farm is not None and r_farm["top_members"] == [enc_ctm("pig")], r_farm)
+    check("'park' context selects dog", r_park is not None and r_park["top_members"] == [enc_ctm("dog")], r_park)
+    check("'mice'/'kitten' context selects cat", r_mice is not None and r_mice["top_members"] == [enc_ctm("cat")], r_mice)
+
+    check("select() with empty context returns None (no signal)",
+          ctm.select(cluster_sat, set()) is None)
+    check("select() with unknown cluster_id returns {} scores / None",
+          ctm.select(999999, {enc_ctm("farm")}) is None)
+
+    # JSON round-trip.
+    ctm_dict = ctm.to_dict()
+    import json as _json
+    _json.dumps(ctm_dict)  # must not raise -- proves it's actually JSON-safe
+    restored_ctm = ContextTriggerMatrix.from_dict(ctm_dict)
+    check("ContextTriggerMatrix round-trips through to_dict/from_dict",
+          restored_ctm.score_members(cluster_sat, {enc_ctm("farm")}) ==
+          ctm.score_members(cluster_sat, {enc_ctm("farm")}))
+
+    # ── Inference-level integration ──────────────────────────────────
+    # Default behavior (no context_triggers passed) must be BIT-FOR-BIT
+    # unchanged -- this is checked throughout the rest of this suite
+    # implicitly (all existing tests never pass context_triggers), but
+    # asserted explicitly here too as a direct regression guard.
+    engine_ctm = m_ctm._engine("strict")
+    bos_id = 2
+    the_id = enc_ctm("the")
+
+    random.seed(0)
+    without_ctm = {engine_ctm.step(bos_id, the_id, active_rels=set())[0] for _ in range(30)}
+    check("without context_triggers, tie-break still explores multiple members "
+          "(unchanged random behavior)", len(without_ctm) > 1, without_ctm)
+
+    with_farm = [engine_ctm.step(bos_id, the_id, active_rels=set(),
+                                  context_tokens={enc_ctm("farm")},
+                                  context_triggers=ctm)[0] for _ in range(15)]
+    check("with CTM + farm context, step() deterministically picks pig every time",
+          set(with_farm) == {enc_ctm("pig")}, with_farm)
+
+    _, trace_ctm = engine_ctm.step(bos_id, the_id, active_rels=set(),
+                                    context_tokens={enc_ctm("farm")}, context_triggers=ctm)
+    check("trace labels CTM-resolved steps distinctly ('context_trigger_resolved')",
+          trace_ctm["rule"] == "context_trigger_resolved", trace_ctm)
+
+    # generate()-level integration via use_context_triggers flag.
+    _, ids_off, trace_off = m_ctm.generate("the", max_tokens=1, use_context_triggers=False)
+    check("generate(use_context_triggers=False) never emits the CTM rule tag",
+          all(t.get("rule") != "context_trigger_resolved" for t in trace_off), trace_off)
+
+    # ── train_incremental must invalidate ctm, same as Experience Matrices ──
+    m_ctm2 = MSEGraphLanguageModel(vocab_size=200)
+    m_ctm2.train("the cat sat on the mat. the dog sat on the carpet.")
+    m_ctm2.build_context_triggers()
+    check("has_context_triggers true before incremental training", m_ctm2.has_context_triggers())
+    incr_summary = m_ctm2.train_incremental("the pig sat on the rug.",
+                                             extend_vocab=True, target_vocab_size=250)
+    check("has_context_triggers false after incremental training (invalidated)",
+          not m_ctm2.has_context_triggers())
+    check("train_incremental summary reports ctm_invalidated=True",
+          incr_summary["ctm_invalidated"])
+
+    # token_to_relationships sanity: every token in a >=3-token sentence
+    # must be covered by at least one relationship_id.
+    trmap = token_to_relationships(m_ctm)
+    seq0 = sequence_for_relationship(m_ctm, 0)
+    check("token_to_relationships covers every token of a real sentence",
+          all(t in trmap for t in seq0 if t not in (0, 1, 2, 3)), seq0)
+
     section("Save/load round-trip")
 
     tmp = tempfile.mkdtemp(prefix="mse_test_")
@@ -293,6 +488,181 @@ hey pig is animal.
               m2.infer_shared_role(["cat","dog"]))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    section("Incremental training (train_incremental)")
+
+    # Re-feeding the identical sentence must not duplicate Edge/Bridge
+    # structure -- both are always deduplicated -- but relationship_ids
+    # ARE expected to grow (one per sentence occurrence, matching
+    # from-scratch behavior: training on the same sentence twice in one
+    # corpus also produces two relationship_ids, not one).
+    m_incr = MSEGraphLanguageModel(vocab_size=200)
+    m_incr.train("the cat sat on the mat.")
+    before_dup = m_incr.stats()
+    m_incr.train_incremental("the cat sat on the mat.")
+    after_dup = m_incr.stats()
+    check("re-feeding identical sentence: no new edges",
+          after_dup["edges"] == before_dup["edges"], (before_dup, after_dup))
+    check("re-feeding identical sentence: no new bridges",
+          after_dup["bridges"] == before_dup["bridges"], (before_dup, after_dup))
+    check("re-feeding identical sentence: relationships DO grow (matches "
+          "from-scratch semantics of one relationship_id per sentence)",
+          after_dup["relationships"] == before_dup["relationships"] + 1, (before_dup, after_dup))
+
+    # The core case this feature exists for: a cluster that can only form
+    # once BOTH increments are present, because it depends on tokens from
+    # two separate training calls sharing a structural slot.
+    m_incr2 = MSEGraphLanguageModel(vocab_size=200)
+    m_incr2.train("the cat sat on the mat.")
+    a_incr2 = Analyser(m_incr2)
+    check("no cat/dog cluster before second increment exists",
+          not any(set(c["members"]) >= {"cat", "dog"} for c in a_incr2.cluster_report(top_n=50)))
+    m_incr2.train_incremental("the dog sat on the carpet.",
+                               extend_vocab=True, target_vocab_size=200)
+    clusters_after = a_incr2.cluster_report(top_n=50)
+    check("cat/dog cluster forms once both increments are present",
+          any(set(c["members"]) >= {"cat", "dog"} for c in clusters_after), clusters_after)
+
+    # extend_vocab must never change what an already-known word encodes
+    # to -- old triples depend on that id staying stable.
+    old_cat_ids = m_incr2.tokenizer.encode("cat")
+    check("extend_vocab preserves existing token ids for known words",
+          old_cat_ids == [2] + [t for t in old_cat_ids if t != 2])  # sanity: still valid ids
+    m_before_ids = list(m_incr2.tokenizer.encode("cat sat"))
+    m_incr2.tokenizer.extend_vocab("brand new unseen vocabulary words here", 250)
+    check("extend_vocab doesn't change encoding of words it already knew",
+          m_incr2.tokenizer.encode("cat sat") == m_before_ids, m_before_ids)
+
+    # Old facts must still generate correctly after a merge, and the
+    # merged model must still be able to generate the NEW fact too.
+    m_incr3 = MSEGraphLanguageModel(vocab_size=200)
+    m_incr3.train("the cat sat on the mat.")
+    m_incr3.train_incremental("the dog sat on the carpet.",
+                               extend_vocab=True, target_vocab_size=200)
+    check("old fact still generates correctly after merge",
+          m_incr3.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat")
+    check("new fact generates correctly after merge",
+          m_incr3.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet")
+
+    # Experience Matrices are derived from pre-merge cluster structure --
+    # must be invalidated, not silently left stale.
+    m_incr4 = MSEGraphLanguageModel(vocab_size=200)
+    m_incr4.train("the cat sat on the mat. the dog sat on the carpet.")
+    m_incr4.build_experience()
+    check("has_experience true before incremental training", m_incr4.has_experience())
+    summary = m_incr4.train_incremental("the pig sat on the rug.",
+                                         extend_vocab=True, target_vocab_size=250)
+    check("has_experience false after incremental training (invalidated)",
+          not m_incr4.has_experience())
+    check("summary reports experience_invalidated=True", summary["experience_invalidated"])
+
+    # train_incremental on a never-trained model must fail clearly rather
+    # than silently doing the wrong thing.
+    m_untrained = MSEGraphLanguageModel(vocab_size=200)
+    try:
+        m_untrained.train_incremental("anything")
+        check("train_incremental on untrained model raises", False)
+    except RuntimeError:
+        check("train_incremental on untrained model raises RuntimeError", True)
+
+    # Save/load round-trip after incremental training uses the exact same
+    # persistence format -- no special-casing required.
+    tmp2 = tempfile.mkdtemp(prefix="mse_test_incr_")
+    try:
+        m_incr3.save(tmp2)
+        reloaded_incr = MSEGraphLanguageModel.load(tmp2)
+        check("incremental model reloads with matching stats",
+              reloaded_incr.stats() == m_incr3.stats())
+        check("incremental model reloads with matching generation",
+              reloaded_incr.generate("the cat", max_tokens=6)[0] ==
+              m_incr3.generate("the cat", max_tokens=6)[0])
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+    section("Large-corpus pipeline (train_corpus.py)")
+
+    corpus_dir = tempfile.mkdtemp(prefix="mse_test_corpus_")
+    out_dir1   = tempfile.mkdtemp(prefix="mse_test_out1_")
+    out_dir3   = tempfile.mkdtemp(prefix="mse_test_out3_")
+    out_norec  = tempfile.mkdtemp(prefix="mse_test_outnr_")
+    try:
+        os.makedirs(os.path.join(corpus_dir, "subdir"), exist_ok=True)
+        with open(os.path.join(corpus_dir, "a_cat.txt"), "w") as f:
+            f.write("the cat sat on the mat.\n")
+        with open(os.path.join(corpus_dir, "b_dog.txt"), "w") as f:
+            f.write("the dog sat on the carpet.\n")
+        with open(os.path.join(corpus_dir, "subdir", "c_pig.txt"), "w") as f:
+            f.write("the pig sat on the rug.\n")
+        with open(os.path.join(corpus_dir, "ignored.md"), "w") as f:
+            f.write("this is not a txt file and must be skipped.\n")
+
+        found_recursive = discover_txt_files(corpus_dir, recursive=True)
+        check("discover_txt_files finds all 3 .txt files recursively",
+              len(found_recursive) == 3, found_recursive)
+        check("discover_txt_files skips non-.txt files",
+              all(p.endswith(".txt") for p in found_recursive), found_recursive)
+        check("discover_txt_files returns sorted (deterministic) order",
+              found_recursive == sorted(found_recursive), found_recursive)
+
+        found_top = discover_txt_files(corpus_dir, recursive=False)
+        check("discover_txt_files (non-recursive) excludes subdir file",
+              len(found_top) == 2, found_top)
+
+        # Full pipeline, batch_size=1: shared vocabulary across files
+        # (no UNK collisions) and a cluster that only exists because
+        # all three files' facts were merged together.
+        m1 = train_from_folder(corpus_dir, out_dir1, vocab_size=200,
+                                batch_size=1, recursive=True, quiet=True)
+        a1 = Analyser(m1)
+        clusters1 = a1.cluster_report(top_n=20)
+        check("pipeline merges all 3 files into one cat/dog/pig cluster",
+              any(set(c["members"]) >= {"cat", "dog", "pig"} for c in clusters1),
+              clusters1)
+        check("pipeline gives every animal a clean (non-UNK) token",
+              all(1 not in m1.tokenizer.encode(w) for w in ("cat", "dog", "pig")))
+        check("pipeline generation correct for each file's fact",
+              m1.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat" and
+              m1.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet" and
+              m1.generate("the pig", max_tokens=6)[0] == "the pig sat on the rug")
+
+        # batch_size is a memory/speed knob only -- final structure must
+        # be identical regardless of how files are grouped into batches.
+        m3 = train_from_folder(corpus_dir, out_dir3, vocab_size=200,
+                                batch_size=3, recursive=True, quiet=True)
+        check("batch_size=1 vs batch_size=3 produce identical final stats",
+              m1.stats() == m3.stats(), (m1.stats(), m3.stats()))
+
+        # Non-recursive run must not see the subdir file's facts at all.
+        m_norec = train_from_folder(corpus_dir, out_norec, vocab_size=200,
+                                     batch_size=1, recursive=False, quiet=True)
+        a_norec = Analyser(m_norec)
+        check("non-recursive pipeline never learns the subdir fact",
+              not any(set(c["members"]) >= {"cat", "dog", "pig"}
+                      for c in a_norec.cluster_report(top_n=20)))
+
+        # Saved output must reload identically.
+        reloaded = MSEGraphLanguageModel.load(out_dir1)
+        check("pipeline output reloads with matching stats",
+              reloaded.stats() == m1.stats())
+        check("pipeline output reloads with matching generation",
+              reloaded.generate("the cat", max_tokens=6)[0] ==
+              m1.generate("the cat", max_tokens=6)[0])
+
+        # Empty / nonexistent folder must fail clearly, not silently.
+        empty_dir = tempfile.mkdtemp(prefix="mse_test_empty_")
+        try:
+            try:
+                train_from_folder(empty_dir, tempfile.mkdtemp(), vocab_size=200, quiet=True)
+                check("train_from_folder on empty dir raises", False)
+            except FileNotFoundError:
+                check("train_from_folder on empty dir raises FileNotFoundError", True)
+        finally:
+            shutil.rmtree(empty_dir, ignore_errors=True)
+    finally:
+        shutil.rmtree(corpus_dir, ignore_errors=True)
+        shutil.rmtree(out_dir1, ignore_errors=True)
+        shutil.rmtree(out_dir3, ignore_errors=True)
+        shutil.rmtree(out_norec, ignore_errors=True)
 
     # ── Experience + Open Mode ────────────────────────────────────────────────
     section("Experience Matrix construction")
