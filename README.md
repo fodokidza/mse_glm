@@ -5,7 +5,8 @@ zero-weight, explainable. No embeddings, no gradient descent — every
 output traces back to specific rows in specific matrices built from
 training text.
 
-Repo: `fodokidza/mse_glm` · Author: Clifford Chivhanga
+Repo: `fodokidza/mse_glm` · 
+Author: Clifford Chivhanga
 
 Requires **Python 3** only — zero external dependencies (standard
 library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
