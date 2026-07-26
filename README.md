@@ -1,7 +1,6 @@
 # MSE-GLM — Command Reference
 
-# MSE-GLM: 32MB, CPU-only, 0% hallucination 
-LLM — every token has a receipt
+# MSE-GLM: 32MB, CPU-only, 0% hallucination LLM — every token has a receipt
 
 **Transformers guess with 100B weights on $40k GPUs and can't tell you why.**
 **MSE-GLM counts relationships on a $0 CPU and shows you the 3 training sentences it used.**
