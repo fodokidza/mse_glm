@@ -1,4 +1,4 @@
-# MSE-GLM — Command Reference
+# MSE-GLM — ZERO WEIGHT DETERMINISTIC GRAPH LANGUAGE MODEL 
 
 # MSE-GLM: 32MB, CPU-only, 0% hallucination LLM — every token has a receipt
 
