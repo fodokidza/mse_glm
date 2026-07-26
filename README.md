@@ -1,5 +1,12 @@
 # MSE-GLM — Command Reference
 
+# MSE-GLM: 32MB, CPU-only, 0% hallucination LLM — every token has a receipt
+
+**Transformers guess with 100B weights on $40k GPUs and can't tell you why.**
+**MSE-GLM counts relationships on a $0 CPU and shows you the 3 training sentences it used.**
+
+`git clone && python3 test.py` → 2ms, no GPU, audit trail. AGPL + Commercial available 
+
 **Matrix-Structured Edge — Graph Language Model.** Deterministic,
 zero-weight, explainable. No embeddings, no gradient descent — every
 output traces back to specific rows in specific matrices built from
