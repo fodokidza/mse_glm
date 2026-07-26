@@ -17,9 +17,9 @@ Author: Clifford Chivhanga
 
 Email: cliffordchivhanga318@gmail.com
 
-https://tonlexianert.com/pages/blog.php
+More info: https://tonlexianert.com/pages/blog.php
 
-https://aircityshops.com/index.php?url=city/mse_blog
+More info: https://aircityshops.com/index.php?url=city/mse_blog
 
 Requires **Python 3** only — zero external dependencies (standard
 library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
