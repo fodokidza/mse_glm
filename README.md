@@ -5,7 +5,7 @@
 **Transformers guess with 100B weights on $40k GPUs and can't tell you why.**
 **MSE-GLM counts relationships on a $0 CPU and shows you the 3 training sentences it used.**
 
-`git clone && python3 test.py` → 2ms, no GPU, audit trail. AGPL + Commercial available 
+`git clone https://github.com/fodokidza/mse_glm.git && python3 test.py` → 2ms, no GPU, audit trail. AGPL + Commercial available 
 
 **Matrix-Structured Edge — Graph Language Model.** Deterministic,
 zero-weight, explainable. No embeddings, no gradient descent — every
