@@ -3,7 +3,7 @@
 # MSE-GLM: 32MB, CPU-only, 0% hallucination LLM — every token has a receipt
 
 **Transformers guess with 100B weights on $40k GPUs and can't tell you why.**
-**MSE-GLM counts relationships on a $0 CPU and shows you the 3 training sentences it used.**
+**MSE-GLM counts relationships on a $0 CPU and shows you the training sentences it used.**
 
 `git clone https://github.com/fodokidza/mse_glm.git && python3 test.py` → 2ms, no GPU, audit trail. AGPL + Commercial available 
 
@@ -21,9 +21,13 @@ More info: https://tonlexianert.com/pages/blog.php
 
 More info: https://aircityshops.com/index.php?url=city/mse_blog
 
-Requires **Python 3** only — zero external dependencies (standard
-library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
-`argparse`, `shutil`, `tempfile`). No `pip install` needed.
+Requires **Python 3** only — zero external dependencies for the core
+library (standard library: `array`, `collections`, `json`, `re`,
+`os`, `time`, `argparse`, `shutil`, `tempfile`). No `pip install`
+needed. Nothing in the core library uses `random` — Strict and Open
+Mode are both fully deterministic by construction (see section 8).
+The optional `server.py` HTTP server additionally needs `flask`
+(`pip install flask`); nothing else does.
 
 ---
 
@@ -33,14 +37,15 @@ library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
 - [1. Train from scratch](#1-train-from-scratch)
 - [2. Continue training on new data](#2-continue-training-on-new-data)
 - [3. Train from a folder of .txt files](#3-train-from-a-folder-of-txt-files)
-- [4. Build Experience Matrices (Open Mode)](#4-build-experience-matrices-open-mode)
-- [5. Chat / generate interactively](#5-chat--generate-interactively)
+- [4. Chat / generate interactively](#4-chat--generate-interactively)
+- [5. Run the HTTP API server](#5-run-the-http-api-server)
 - [6. Analyse a trained model](#6-analyse-a-trained-model)
 - [7. Cluster Interpreter Matrix (naming clusters)](#7-cluster-interpreter-matrix-naming-clusters)
-- [8. Context Trigger Matrix (contextual disambiguation)](#8-context-trigger-matrix-contextual-disambiguation)
-- [9. Token Importance / Trigger analysis (Python API only)](#9-token-importance--trigger-analysis-python-api-only)
-- [10. Analyse raw text with no trained model](#10-analyse-raw-text-with-no-trained-model)
-- [11. Run the test suite](#11-run-the-test-suite)
+- [8. Open Mode's primary mechanism: IVM weighted voting (V1-V6)](#8-open-modes-primary-mechanism-ivm-weighted-voting-v1-v6)
+- [9. Context Trigger Matrix (contextual disambiguation)](#9-context-trigger-matrix-contextual-disambiguation)
+- [10. Token Importance / Trigger analysis (Python API only)](#10-token-importance--trigger-analysis-python-api-only)
+- [11. Analyse raw text with no trained model](#11-analyse-raw-text-with-no-trained-model)
+- [12. Run the test suite](#12-run-the-test-suite)
 - [Typical end-to-end session](#typical-end-to-end-session)
 - [Notes and gotchas](#notes-and-gotchas)
 
@@ -53,17 +58,17 @@ library: `array`, `collections`, `json`, `re`, `os`, `random`, `time`,
 | `tokenizer.py`        | From-scratch BPE tokenizer                                              |
 | `graph.py`            | Edge / Bridge / Relationship matrices + dual-axis clustering            |
 | `model.py`            | `MSEGraphLanguageModel` — orchestrates everything, save/load            |
-| `inference.py`        | Two-stage lineage-vote generation engine                                |
-| `experience.py`       | Cluster-substitution rules that derive Open Mode's Experience Matrices  |
+| `inference.py`        | Deterministic inference engine — Strict Mode's two-stage lineage-vote pipeline and Open Mode's IVM-scored candidate selection |
+| `ivm.py`               | Importance Vote Matrix — Open Mode's PRIMARY candidate-scoring mechanism (V1-V6 weighted voting, see section 8); also Strict Mode's legacy opt-in tie-break |
 | `interpret.py`        | Cluster Interpreter Matrix — names clusters, mines the zero-cluster bucket |
 | `importance.py`       | Sequence reconstruction + per-triple importance/trigger tagging (Python API only) |
 | `ctm.py`               | Context Trigger Matrix — contextual disambiguation among cluster members |
 | `analyse.py`          | Read-only analysis CLI + `Analyser`/`CorpusAnalyser` Python API         |
 | `train.py`            | Fresh training + `--continue-from` incremental training, with live display |
 | `train_corpus.py`     | Large-corpus pipeline — train from a folder of `.txt` files             |
-| `build_experience.py` | CLI to build/save Experience Matrices for an already-trained model      |
 | `chat.py`             | Interactive REPL over a trained model                                  |
-| `test.py`             | Full regression suite (all features, 340+ checks)                       |
+| `server.py`           | Optional Flask HTTP API + web UI over a trained model (needs `flask`)   |
+| `test.py`             | Full regression suite (all features, 240+ checks)                       |
 
 ---
 
@@ -82,7 +87,7 @@ python3 train.py --corpus corpus.txt --out runs/model --quiet
 ```
 
 | Flag             | Meaning                                              |
-|------------------|-------------------------------------------------------|
+|------------------|---------------------------------------------------------|
 | `--text`         | Inline corpus string (use this OR `--corpus`)         |
 | `--corpus`       | Path to a text file (streamed)                        |
 | `--out`          | Output folder — **required** for fresh training       |
@@ -96,9 +101,12 @@ python3 train.py --corpus corpus.txt --out runs/model --quiet
 Adds a new corpus to an already-trained model **without discarding
 what it already knows**. Clusters are recomputed over the union of
 old + new facts (a cluster can only form once every triple that
-belongs to it exists). Experience Matrices AND the Context Trigger
-Matrix are both invalidated automatically if present (both are
-derived from the pre-merge structure).
+belongs to it exists). Open Mode (`self._open`/`self.open_ctm`) is
+automatically rebuilt from the merged graphs — no separate step
+needed, it just stays in sync. The Context Trigger Matrix is NOT
+auto-rebuilt (it's an opt-in add-on, not part of the default
+pipeline) — it's invalidated instead, since it was derived from the
+pre-merge structure.
 
 ```bash
 # Frozen vocabulary (default, safest) -- reuses the existing tokenizer as-is
@@ -108,7 +116,7 @@ python3 train.py --continue-from runs/model --text "the pig sat on the rug." \
 # Grow the vocabulary too (needed if the new text has substantially new words --
 # otherwise unseen characters collapse onto the same <UNK> id and can create
 # false structural matches between unrelated new words)
-python3 train.py --continue-from runs/model --corpus new_data.txt \
+python3 train.py --continue-from runs/model --corpus new_data.txt
     --extend-vocab --target-vocab-size 3000
 ```
 
@@ -123,7 +131,8 @@ Python API equivalent:
 ```python
 model = MSEGraphLanguageModel.load("runs/model")
 summary = model.train_incremental(new_text, extend_vocab=True, target_vocab_size=3000)
-# summary["experience_invalidated"] / summary["ctm_invalidated"] tell you what to rebuild
+# summary["ctm_invalidated"] tells you whether to rebuild the Context
+# Trigger Matrix (Open Mode needs no action -- it's already rebuilt)
 model.save("runs/model")
 ```
 
@@ -149,7 +158,7 @@ python3 train_corpus.py --corpus-dir data/ --out runs/big_model --quiet
 ```
 
 | Flag             | Meaning                                                              |
-|------------------|----------------------------------------------------------------------|
+|------------------|------------------------------------------------------------------------|
 | `--corpus-dir`   | Folder containing `.txt` files — **required**                       |
 | `--out`          | Output folder — **required**                                        |
 | `--vocab-size`   | Target BPE vocabulary size (default 2000)                            |
@@ -164,21 +173,7 @@ python3 train_corpus.py --corpus-dir data/ --out runs/big_model --quiet
 
 ---
 
-## 4. Build Experience Matrices (Open Mode)
-
-Derives inferred (never-literally-seen) triples from cluster
-substitutability, enabling `--mode open` in generation/analysis.
-
-```bash
-python3 build_experience.py --model runs/model
-
-python3 build_experience.py --model runs/model --dry-run   # preview without writing files
-python3 build_experience.py --model runs/model --quiet
-```
-
----
-
-## 5. Chat / generate interactively
+## 4. Chat / generate interactively
 
 ```bash
 python3 chat.py --model runs/model
@@ -190,19 +185,83 @@ REPL commands once inside:
 | Command                     | What it does                                      |
 |------------------------------|----------------------------------------------------|
 | `<any text>`                 | Generate a continuation in the current mode        |
-| `/mode strict` / `/mode open`| Switch modes (builds Experience Matrices on first use if needed) |
+| `/mode strict` / `/mode open`| Switch modes (Open Mode is always ready — no separate build step) |
 | `/explain <prev> \| <curr>`  | Explain one inference step                         |
+| `/scores <prompt>`           | Open Mode only: full V1-V6 IVM score breakdown for the next token (see section 8), plus which tie-break stage (if any) decided the winner |
+| `/bigram <prev> <curr>`      | Bigram evidence for a pair — training/total counts (Strict Mode's tie-break and Open Mode's first tie-break stage), plus how many distinct training sentences literally witnessed the bigram (V5's evidence set) |
 | `/shared <tok1> <tok2> ...`  | `infer_shared_role()` across a token set           |
 | `/similarity <a> <b>`        | Cluster-overlap similarity between two tokens      |
-| `/stats`                     | Model stats (includes experience counts if built)  |
+| `/stats`                     | Model stats                                        |
 | `/clusters`                  | Top dual-axis cluster groups                       |
-| `/exp`                       | Experience matrix summary                          |
 | `/quit`                      | Exit                                                |
+
+Commands that take arguments (`/explain`, `/scores`, `/bigram`,
+`/shared`, `/similarity`) tolerate a stray quote character
+immediately after the command name with no space (e.g.
+`/bigram"the cat"`) and strip matching `"`/`'` wrapping from each
+argument.
 
 > `chat.py` does not currently expose Context Trigger Matrix
 > disambiguation (`use_context_triggers`) — that's available through
 > the Python API (`model.generate(..., use_context_triggers=True)`)
 > and could be wired into the REPL as a `/ctm` toggle if useful.
+
+---
+
+## 5. Run the HTTP API server
+
+Optional — needs `pip install flask`. Serves a small web chat UI
+plus a JSON API over an already-trained model. Same deterministic
+generation underneath as `chat.py`/`analyse.py`; this is just a
+network-facing wrapper with sessions, rate limiting, and SSE
+streaming layered on top. There is no system-prompt concept here —
+see the "no persona, only a mode" note below.
+
+```bash
+python3 server.py --model runs/model --mode strict --port 5000
+
+# Default to Open Mode, build the Context Trigger Matrix at startup
+python3 server.py --model runs/model --mode open --ctm --port 5000
+```
+
+| Flag             | Meaning                                                     |
+|------------------|-----------------------------------------------------------------|
+| `--model`        | Saved model folder (default `mse_model`)                    |
+| `--mode`         | Default inference mode for new sessions: `strict` \| `open` |
+| `--ctm`          | Build the Context Trigger Matrix at startup and use it for tie-break disambiguation |
+| `--port`         | Port to listen on (default 5000)                             |
+
+Endpoints:
+
+| Method | Route       | Body / query                                       | What it does |
+|--------|-------------|-----------------------------------------------------|--------------|
+| GET    | `/health`   | —                                                   | Server + model status (vocab/edges/bridges/clusters, whether Open Mode + IVM are available) |
+| GET    | `/vocab`    | —                                                   | Full vocabulary word list |
+| POST   | `/generate` | `{"prompt", "session_id"?, "max_tokens"?}`           | One-shot generation for a session (stateless per call; session only tracks chat history + current mode) |
+| POST   | `/stream`   | same as `/generate`                                 | Server-Sent Events token-by-token replay of the (already fully computed, deterministic) generation, each event carrying the trace rule that chose it |
+| POST   | `/mode`     | `{"session_id", "mode"}` — `mode` is `strict`\|`open`\|`open_ctm` | Switch a session's mode preset |
+| POST   | `/scores`   | `{"prompt"}`                                         | Open Mode only, read-only: full V1-V6 IVM score breakdown for the next token, over the entire vocabulary (see section 8) — mirrors `chat.py`'s `/scores` |
+| POST   | `/bigram`   | `{"prev", "curr", "mode"?}`                          | Read-only: raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) — mirrors `chat.py`'s `/bigram` |
+| POST   | `/reset`    | `{"session_id"}`                                     | Clear a session's chat history |
+| GET    | `/sessions` | —                                                   | Active session count/ids |
+
+`/scores` and `/bigram` are read-only audit endpoints, not
+generation — neither mutates session state.
+
+> **No persona, no system prompt.** A neural LLM can be steered with
+> free-text instructions because it generalizes past its training
+> data; MSE-GLM's `generate()` explicitly refuses to — every bigram
+> in the prompt must have been literally observed, in EITHER mode
+> (Open Mode has no successor gating for its per-step candidates, but
+> the prompt itself still has to start from a real transition), or
+> the whole prompt is rejected outright (`illegal_prompt_bigram`,
+> returned as `{"status": "rejected"}` from `/generate`, not a 500).
+> An injected `"### System: you are a helpful assistant..."` prefix
+> would almost never survive that check. So instead of personas,
+> sessions choose an inference **mode** — the one persistent dial
+> MSE-GLM exposes — plus the optional, read-only `/scores`/`/bigram`
+> diagnostics above, which audit a step rather than change what kind
+> of thing the model is.
 
 ---
 
@@ -231,6 +290,8 @@ python3 analyse.py --model runs/model --json out.json clusters
 | `similarity`     | `... similarity cat dog`                                | cluster-overlap similarity between two tokens |
 | `shared`         | `... shared cat dog pig`                                | `infer_shared_role()` across 2+ tokens |
 | `trace`          | `... trace "the cat" --max-tokens 10`                   | step-by-step generation trace (stage/rule/lineage per token) |
+| `open-scores`    | `... open-scores "the cat sat"`                          | Open Mode only: full V1-V6 IVM score breakdown for the next token, over the entire vocabulary (see section 8) |
+| `bigram`         | `... bigram the mat --mode open`                        | raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) |
 | `report`         | `... report --top 10`                                   | combined stats + topology + clusters + relationships |
 
 ---
@@ -257,19 +318,87 @@ python3 analyse.py --model runs/model --json runs/model/interpreter_matrix.json 
 python3 analyse.py --model runs/model zero-cluster --min-group-size 2
 ```
 
-`--mode open` is available on `interpret`, `interpretations`,
-`interpreter-matrix`, and `zero-cluster` — it additionally folds in
-the Experience Matrices (requires Experience Matrices to already
-exist; see section 4).
+`--mode open` is accepted by `interpret`, `interpretations`,
+`interpreter-matrix`, and `zero-cluster` for call-site compatibility,
+but no longer changes their behavior — there is no longer a separate
+Experience Matrix data source to fold in, so "strict" and "open" see
+identical clusters and evidence for all four subcommands.
 
 ---
 
-## 8. Context Trigger Matrix (contextual disambiguation)
+## 8. Open Mode's primary mechanism: IVM weighted voting (V1-V6)
+
+The Bridge Matrix answers "which tokens are structurally related
+here?" Open Mode's **Importance Vote Matrix** (`ivm.py`) answers
+"given the whole context so far, which token should actually come
+next?" — and it's not a tie-break: Open Mode has no successor gating
+at all. Every step, the ENTIRE vocabulary is scored by summing six
+independent, weighted vote layers:
+
+| Layer | What it measures | Default weight | Role |
+|-------|-------------------|-----------------|------|
+| V1 `important_vote` | Binary: did an "important" context token (cluster member) ever co-occur with this candidate at all? | 0.1 | Small — can only nudge a tie V3 left open |
+| V2 `influence_vote`  | Same, but scaled by how much total evidence that important token carries (its "influence") | 0.09 | Small, same role as V1 |
+| V3 `context_vote`    | Binary: did ANY context token (important or not) ever co-occur with this candidate? Full weight, every context token counted | 1.0 | Primary signal |
+| V4 `context_influence_vote` | Same as V3 but scaled by raw co-occurrence count, for every context token | 0.01 | Tiny refinement, can't override V3 |
+| V5 `bigram_witness_vote` | Binary per context token: was that token EVER in a training sentence containing the exact literal bigram `(current -> candidate)`? A narrower, stronger claim than V3's "co-occurred anywhere" | 1.0 | Peer-weighted with V3 — usually the single largest contributor once the exact bigram was literally seen |
+| V6 `adjacency_vote` | Binary per context token: was that token EVER DIRECTIONALLY, literally, immediately followed by this candidate in training (`token -> candidate`, not the reverse) — not necessarily this specific transition (contrast V5), but must have been actually consecutive in that exact order, not just co-occurring (contrast V3) | 1.0 | Peer-weighted with V3/V5 — often the largest contributor once the token was ever directly followed by the candidate |
+
+`score(candidate) = V1 + V2 + V3 + V4 + V5 + V6`, highest score wins;
+a genuine tie falls to a deterministic cascade (bigram frequency,
+then global frequency, then lowest token id — never randomness).
+V1/V2/V4 are deliberately kept smaller than V3 by design, so
+important-token membership or raw evidence magnitude alone can never
+override what plain context presence already decided — they can
+only break a tie V3 left open. V5 and V6 are the two layers NOT
+bound by that "stay small" rule: both are independently strong,
+specific (bigram-level, not merely sentence-level) evidence, so both
+are peer-weighted with V3 rather than riding on top of it. They
+differ from each other in specificity: V5 requires witnessing the
+exact `current -> candidate` transition; V6 only requires that the
+context token was EVER immediately followed by the candidate,
+directionally, in any sentence — the reverse observation (candidate
+immediately followed by the context token) does not count.
+
+```python
+from model import MSEGraphLanguageModel
+model = MSEGraphLanguageModel.load("runs/model")
+# Open Mode is ready immediately -- no separate build step, it's
+# auto-built alongside self._strict as soon as the model is trained
+# or loaded (see model.py's _rebuild_open_engine()).
+
+info = model.open_mode_candidate_scores("the cat sat on the")
+# info["scores"], info["winner"], info["tie_break_stage"], plus each
+# layer separately: important_vote / influence_vote / context_vote /
+# context_influence_vote / bigram_witness_vote / adjacency_vote
+# info["candidates"] always covers the entire vocabulary.
+
+text, ids, trace = model.generate("the cat sat on the", mode="open")
+```
+
+CLI/REPL equivalents: `analyse.py open-scores` and `chat.py`'s
+`/scores` (section 6 and 4); `/bigram` and `analyse.py bigram`
+expose V5's raw evidence (`witness_sentences`) for one pair without
+running the full vote.
+
+`ivm.py`'s `ImportanceVoteMatrix` also has a Strict Mode LEGACY role
+(`resolve_tie()`) — opt-in only, substituting importance voting for
+Strict Mode's Stage 2 lineage tie-break when explicitly passed to
+`generate(..., use_importance_votes=True)`. That's a different
+object/build than Open Mode's `model.open_ctm` (which is auto-built
+alongside training/loading); Strict Mode's is built separately via
+`model.build_importance_votes()` and is `None` unless you call it.
+
+---
+
+## 9. Context Trigger Matrix (contextual disambiguation)
 
 The Bridge Matrix answers "which tokens can occupy this slot?"
 (cat/dog/pig are interchangeable). The Context Trigger Matrix answers
 "given this surrounding context, which one SHOULD?" — built from
-whole-sentence co-occurrence, no new training.
+whole-sentence co-occurrence, no new training. This is a **Strict
+Mode** opt-in disambiguation aid (see section 8 for Open Mode's
+actual primary mechanism, which doesn't use this at all).
 
 ```bash
 # Inspect the flat trigger table (analysis only -- see below for actually
@@ -294,8 +423,10 @@ Without `use_context_triggers=True` (the default), generation is
 byte-for-byte identical to before this feature existed — it's strictly
 opt-in. When enabled, it only ever activates at a genuine tie between
 members of the same cluster (never overrides a unique answer), and
-falls straight back to the existing random tie-break if the context
-gives it no signal. Look for `"rule": "context_trigger_resolved"` in
+falls back to the same deterministic bigram-frequency tie-break
+Strict Mode always uses if the context gives it no signal — never
+randomness; see section 8's table and `inference.py`'s
+`_bigram_tie_break`. Look for `"rule": "context_trigger_resolved"` in
 the trace to see exactly when it fired.
 
 ```python
@@ -304,7 +435,7 @@ model.has_context_triggers()   # bool
 
 ---
 
-## 9. Token Importance / Trigger analysis (Python API only)
+## 10. Token Importance / Trigger analysis (Python API only)
 
 Not wired into the CLI — import directly:
 
@@ -320,12 +451,12 @@ expected_importance(model, prev_token_id, current_token_id)  # what Stage 2 alre
 
 See `importance.py`'s module docstring for the distinction between
 this (immediate 2-3 token window) and the Context Trigger Matrix in
-section 8 (whole-sentence window) — they're deliberately different
+section 9 (whole-sentence window) — they're deliberately different
 granularities of the same underlying idea.
 
 ---
 
-## 10. Analyse raw text with no trained model
+## 11. Analyse raw text with no trained model
 
 ```bash
 python3 analyse.py corpus --text "the cat sat on the mat." --top 10
@@ -337,17 +468,19 @@ statistics over raw text.
 
 ---
 
-## 11. Run the test suite
+## 12. Run the test suite
 
 ```bash
 python3 test.py
 ```
 
 No flags. Runs the full regression suite (tokenizer, graph
-construction, generation determinism, Experience Matrix / Open Mode,
-Cluster Interpreter, zero-cluster mining, Token Importance analysis,
-Context Trigger Matrix, incremental training, large-corpus pipeline,
-save/load round-trips) and prints a final `N passed, 0 failed` summary.
+construction, generation determinism, Open Mode's vocabulary-as-
+candidates architecture, IVM weighted voting incl. V5 bigram-witness
+and V6 adjacency, Cluster Interpreter, zero-cluster mining, Token
+Importance analysis, Context Trigger Matrix, incremental training,
+large-corpus pipeline, save/load round-trips) and prints a final
+`N passed, 0 failed` summary.
 
 ---
 
@@ -362,22 +495,27 @@ python3 analyse.py --model runs/model clusters --top 20
 python3 analyse.py --model runs/model interpreter-matrix --min-coverage 0.5 --min-signals 2
 python3 analyse.py --model runs/model context-triggers --min-support 2
 
-# 3. Build Open Mode + Context Trigger Matrix
-python3 build_experience.py --model runs/model
+# 3. Open Mode is already ready -- no build step. If you want the
+#    (optional, opt-in) Context Trigger Matrix for Strict Mode too:
 python3 -c "from model import MSEGraphLanguageModel as M; m=M.load('runs/model'); \
     m.build_context_triggers(); print('ok')"
 # (CTM isn't persisted by save()/load() -- rebuild it each session, or
 #  add your own caching around ContextTriggerMatrix.to_dict()/from_dict())
 
-# 4. Chat with it
+# 4. Chat with it, or serve it over HTTP
 python3 chat.py --model runs/model --mode open
+python3 server.py --model runs/model --mode open --port 5000   # needs flask
 
-# 5. Add more data later, in place
+# 5. Audit why it picked what it picked
+python3 analyse.py --model runs/model open-scores "the farmer fed the"
+python3 analyse.py --model runs/model bigram the pig --mode open
+
+# 6. Add more data later, in place
 python3 train.py --continue-from runs/model --corpus more_data.txt \
     --extend-vocab --target-vocab-size 6000
-# Experience Matrices AND the Context Trigger Matrix are now invalidated:
-python3 build_experience.py --model runs/model
-# (rebuild CTM in your own script/session too, per step 3)
+# Open Mode is automatically rebuilt from the merged graphs -- no
+# action needed. Only the Context Trigger Matrix is invalidated:
+# (rebuild CTM in your own script/session too, per step 3, if you use it)
 ```
 
 ---
@@ -388,12 +526,13 @@ python3 build_experience.py --model runs/model
   `analyse.py` parser — it must come before the subcommand:
   `analyse.py --model X --json out.json clusters`, not
   `analyse.py --model X clusters --json out.json`.
-- **Incremental training invalidates both Experience Matrices AND the
-  Context Trigger Matrix.** If you use `--mode open` or
-  `use_context_triggers=True` anywhere, rebuild both after any
-  `--continue-from` or `train_corpus.py` run.
-  `train_incremental()`'s return value tells you which were affected:
-  `summary["experience_invalidated"]` / `summary["ctm_invalidated"]`.
+- **Incremental training auto-rebuilds Open Mode, but invalidates the
+  Context Trigger Matrix.** Open Mode (`self._open`/`self.open_ctm`)
+  is automatically kept in sync with the merged graphs after any
+  `--continue-from` or `train_corpus.py` run — no action needed. If
+  you use `use_context_triggers=True` anywhere, rebuild the CTM
+  after merging; `train_incremental()`'s return value tells you
+  whether it was affected: `summary["ctm_invalidated"]`.
 - **The Context Trigger Matrix is not persisted by `save()`/`load()`.**
   It's cheap enough to rebuild per session
   (`model.build_context_triggers()`) but if you want it cached to
@@ -401,8 +540,37 @@ python3 build_experience.py --model runs/model
   JSON-safe — wire your own save/load around them if needed.
 - **`use_context_triggers=True` only ever changes behavior at a
   genuine tie.** It never overrides a unique, structurally-determined
-  answer, and it falls back to the exact pre-existing random
+  answer, and it falls back to the deterministic bigram-frequency
   tie-break whenever it has no signal. Default is `False` everywhere.
+- **There is no randomness anywhere in generation, in either mode.**
+  Every tie — Strict Mode's lineage pipeline, Open Mode's IVM
+  scoring, the Context Trigger Matrix add-on — resolves through a
+  deterministic cascade (see section 8), down to lowest-token-id as
+  the final, always-available fallback. `random` is not imported
+  anywhere in the core library.
+- **`model.open_ctm` (Open Mode's IVM, the primary mechanism) and
+  `model.ivm` (Strict Mode's legacy opt-in tie-break) are different
+  objects, built separately.** `open_ctm` is auto-built alongside
+  training/loading (see `model.py`'s `_rebuild_open_engine()`);
+  `ivm` is `None` unless you explicitly call
+  `model.build_importance_votes()`. Both are `ImportanceVoteMatrix`
+  instances from `ivm.py`, and since there is no longer a separate
+  Experience data source at all, they're built from identical
+  evidence either way — bigram-witness evidence (V5, `_bigram_rels`)
+  and adjacency evidence (V6, `_adjacent`) are the same for both.
+- **Open Mode has no successor gating at all anymore.** Candidates
+  for every generation step are the entire vocabulary
+  (`model.all_candidate_tokens()` / `self._open.vocab`), scored by
+  IVM's six weighted vote layers — not narrowed by whether a bigram
+  was ever literally observed. There is no toggle for this; it's
+  simply how Open Mode works now. The PROMPT itself still has to
+  start from a literal training bigram, in both modes (same
+  Edge-Matrix-based check either way).
+- **`model._engine(mode)` validates `mode` strictly** — only
+  `"strict"` or `"open"` are accepted; anything else raises
+  `ValueError` rather than silently falling back to Strict Mode.
+  Matters most for API callers that pass an unchecked mode string
+  (e.g. `server.py`'s `/bigram` `mode` field).
 - **Frozen vocabulary is the default** for incremental/continued
   training. It's safe for corpora similar to what the model already
   knows; pass `--extend-vocab --target-vocab-size N` when the new
@@ -424,3 +592,8 @@ python3 build_experience.py --model runs/model
   evidence signals are correlated not independent, zero-cluster
   mining has a much larger candidate space than the regular matrix)
   are documented in depth in `interpret.py`'s module docstring.
+- **`server.py` is a development server** (Flask's built-in `app.run`,
+  not a production WSGI server) with a simple in-memory rate limiter
+  and in-memory sessions — fine for local use or a demo, not
+  hardened for production traffic. Put a real WSGI server (gunicorn,
+  etc.) in front of it for anything public-facing.

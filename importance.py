@@ -210,12 +210,14 @@ def expected_importance(model, prev_token, current_token, mode="strict"):
     inference.py, made deliberately and tested there -- not something
     this function should quietly influence.
 
+    `mode` is accepted for call-site compatibility but has no effect
+    -- there is no longer a separate Experience Bridge Matrix to check.
+
     Returns None if (prev_token, current_token) isn't a known
     target-axis trigger. Otherwise:
         {"cluster_id": int, "expected_members": [token_id, ...]}
     """
     bridges = model.bridges
-    exp_bridges = model.exp_bridges if (mode == "open" and model.exp_bridges) else None
 
     for target, bridge_tok, cid in bridges.triples_from_source(prev_token):
         if bridge_tok == current_token and cid != 0:
@@ -223,11 +225,4 @@ def expected_importance(model, prev_token, current_token, mode="strict"):
             if axis == "target":
                 members = sorted(set(t for _, t, _ in triples))
                 return {"cluster_id": cid, "expected_members": members}
-    if exp_bridges:
-        for target, bridge_tok, cid in exp_bridges.triples_from_source(prev_token):
-            if bridge_tok == current_token and cid != 0:
-                axis, triples = exp_bridges.cluster_axis(cid)
-                if axis == "target":
-                    members = sorted(set(t for _, t, _ in triples))
-                    return {"cluster_id": cid, "expected_members": members}
     return None

@@ -25,33 +25,22 @@ unique legal answer), score each tied member by summing the support
 of whichever of its known triggers are present in the context
 generated so far. The candidate with the highest score wins. If CTM
 itself doesn't discriminate (every candidate scores 0, or several tie
-for the top score), generation falls back to the existing random
-tie-break exactly as before -- this is a NEW, EARLIER disambiguation
-step inserted before the coin flip, not a replacement for it.
+for the top score), generation falls back to the deterministic
+bigram-frequency tie-break (see inference.py's _bigram_tie_break) --
+this is a disambiguation step tried BEFORE that fallback, not a
+replacement for it. Never randomness, in either case.
 
 Honesty notes
 --------------
-  - Strict mode is bounded to the literally-seen training corpus, and
-    always will be: trigger evidence (token_to_relationships and the
-    sentences it points to) is built ONLY from the strict Relationship
-    Matrix, in both strict AND open mode, because that's the only
-    place real surrounding context exists -- Experience Matrix triples
-    are inferred by cluster substitution, never observed in an actual
-    sentence, so there's no real context to mine for them even if you
-    wanted to. This does not change between modes; it's a property of
-    where context comes from, not a mode setting.
-  - What DOES change in open mode is which CLUSTERS are eligible for
-    disambiguation in the first place: strict mode only recognizes
-    cluster_ids from the (literal) Bridge Matrix; open mode also
-    recognizes cluster_ids from the Experience Bridge Matrix (see
-    _cluster_axis_any / _all_cluster_ids). A cluster that only exists
-    through inference -- e.g. two tokens that were never literally
-    seen sharing a slot, only inferred to via cluster substitution --
-    is invisible to CTM in strict mode and can be disambiguated in
-    open mode, using triggers built entirely from real sentences that
-    happen to mention its (real, literally-occurring) member tokens
-    elsewhere. Open mode widens which candidates CTM can adjudicate
-    between; it never widens what counts as evidence.
+  - Trigger evidence (token_to_relationships and the sentences it
+    points to) is built ONLY from the Relationship Matrix -- that's
+    the only place real surrounding context exists. There is no
+    separate Experience data source anymore: every cluster CTM can
+    adjudicate between, and every trigger it scores with, comes from
+    the same literal training corpus, in both "strict" and "open"
+    mode -- the two no longer differ for this module. The `mode`
+    parameter accepted by several functions below is kept for
+    call-site compatibility but has no effect.
   - Reserved tokens (<PAD>/<UNK>/<BOS>/<EOS>) are excluded from
     trigger signatures. Including them would inflate every member's
     score roughly equally (they appear in nearly every sentence) while
@@ -114,28 +103,13 @@ def token_to_relationships(model):
 
 def _cluster_axis_any(model, cluster_id, mode):
     """
-    Look up a cluster's axis/members, checking the strict Bridge Matrix
-    first and, only in Open Mode, falling back to the Experience Bridge
-    Matrix. Experience cluster_ids are assigned starting at
-    max(strict_cluster_id) + 1 (see experience.py), so the two id
-    spaces never collide -- a cluster_id unambiguously belongs to one
-    matrix or the other, never both.
-
-    This is the "open mode can use everything else" half of this
-    module's design: which CLUSTERS are eligible for disambiguation
-    widens in Open Mode. It does NOT mean trigger evidence itself
-    stops being bounded to the literally-seen corpus -- see
-    token_to_relationships, which never changes behavior based on mode
-    for exactly that reason.
+    Look up a cluster's axis/members from the (only) Bridge Matrix.
+    `mode` is accepted for call-site compatibility but has no effect
+    -- there is no longer a separate Experience Bridge Matrix to
+    widen eligible clusters in "open" mode; both modes see the same
+    cluster set now.
     """
-    axis, triples = model.bridges.cluster_axis(cluster_id)
-    if triples:
-        return axis, triples
-    if mode == "open" and model.exp_bridges:
-        axis, triples = model.exp_bridges.cluster_axis(cluster_id)
-        if triples:
-            return axis, triples
-    return None, []
+    return model.bridges.cluster_axis(cluster_id)
 
 
 def build_context_triggers(model, cluster_id, mode="strict", token_rels=None):
@@ -145,16 +119,11 @@ def build_context_triggers(model, cluster_id, mode="strict", token_rels=None):
     token_rels), and counts every other token that co-occurs with it
     across those sentences.
 
-    In strict mode, only cluster_ids from the (literal) Bridge Matrix
-    are recognized. In open mode, cluster_ids from the Experience
-    Bridge Matrix are ALSO recognized (see _cluster_axis_any) -- but
-    the trigger evidence itself (token_rels) is always built from the
-    literal training corpus only, in both modes: inferred Experience
-    triples were never part of an actual sentence, so there is no real
-    surrounding context to mine for them. Widening `mode` to "open"
-    means more clusters become eligible for CTM disambiguation, not
-    that fabricated context gets invented for members that only exist
-    through inference.
+    `mode` is accepted for call-site compatibility but has no effect
+    -- there is no longer a separate Experience Bridge Matrix, so
+    "strict" and "open" see the same clusters and the same trigger
+    evidence (token_rels, always built from the literal training
+    corpus only).
 
     Pass a precomputed token_rels (from token_to_relationships) when
     building signatures for many clusters in one pass -- see
@@ -192,22 +161,22 @@ def build_context_triggers(model, cluster_id, mode="strict", token_rels=None):
 
 
 def _all_cluster_ids(model, mode):
-    """Every non-zero cluster_id eligible under this mode -- strict
-    Bridge Matrix always; Experience Bridge Matrix too in open mode."""
+    """Every non-zero cluster_id in the Bridge Matrix. `mode` is
+    accepted for call-site compatibility but has no effect -- both
+    modes see the same cluster set now (no separate Experience Bridge
+    Matrix exists)."""
     seen = set(model.bridges.cluster_id)
     seen.discard(0)
-    if mode == "open" and model.exp_bridges:
-        seen.update(c for c in model.exp_bridges.cluster_id if c != 0)
     return seen
 
 
 def build_context_trigger_matrix(model, min_support=1, mode="strict"):
     """
-    Flat table across every non-zero cluster eligible under `mode`
-    (strict clusters always; Experience clusters too when mode="open"),
-    matching the proposal's schema: one row per (trigger_token,
-    cluster_id, member_token) with its support count. Sorted by
-    support descending.
+    Flat table across every non-zero cluster (see _all_cluster_ids --
+    `mode` is accepted for call-site compatibility but no longer
+    changes which clusters are eligible), matching the proposal's
+    schema: one row per (trigger_token, cluster_id, member_token)
+    with its support count. Sorted by support descending.
     """
     seen = _all_cluster_ids(model, mode)
     token_rels = token_to_relationships(model)
@@ -292,7 +261,7 @@ class ContextTriggerMatrix:
         top = sorted(m for m, s in scores.items() if s == max_score)
         return {"top_members": top, "score": max_score, "all_scores": scores}
 
-    def resolve_tie(self, candidates, bridges, exp_bridges, context_tokens):
+    def resolve_tie(self, candidates, bridges, context_tokens):
         """
         Given a set of tied generation candidates (raw token ids), find
         a cluster_id they all share (via t_index) and use it to pick a
@@ -304,12 +273,7 @@ class ContextTriggerMatrix:
         if not context_tokens:
             return None
         candidates = sorted(candidates)
-        cluster_sets = []
-        for c in candidates:
-            s = set(bridges.t_index.get(c, []))
-            if exp_bridges:
-                s |= set(exp_bridges.t_index.get(c, []))
-            cluster_sets.append(s)
+        cluster_sets = [set(bridges.t_index.get(c, [])) for c in candidates]
         if not cluster_sets or any(not s for s in cluster_sets):
             return None
         shared = set.intersection(*cluster_sets)

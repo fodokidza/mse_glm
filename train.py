@@ -354,7 +354,7 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
     D.update(step=0, total=total_pairs)
     D.item(dim(f"scanning {total_pairs} token pairs across {len(sequences)} sentences…"), force=True)
 
-    seen_e = set(); edges = []; step = 0
+    seen_e = set(); edges = []; edge_counts = {}; step = 0
     for seq in sequences:
         for i in range(len(seq)-1):
             s, d = seq[i], seq[i+1]
@@ -362,6 +362,7 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
             is_new = pair not in seen_e
             if is_new:
                 seen_e.add(pair); edges.append(pair)
+            edge_counts[pair] = edge_counts.get(pair, 0) + 1
             step += 1
             D.update(step=step, total=total_pairs, stats={"edges": len(edges)})
             D.item(
@@ -374,6 +375,7 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
     edge_matrix = EdgeMatrix()
     edge_matrix.src   = array("i", [p[0] for p in edges])
     edge_matrix.dst   = array("i", [p[1] for p in edges])
+    edge_matrix.count = array("i", [edge_counts[p] for p in edges])
     edge_matrix.index = array("i", [0] * (vocab_size_actual + 1))
     for sv in edge_matrix.src: edge_matrix.index[sv+1] += 1
     for i in range(1, len(edge_matrix.index)): edge_matrix.index[i] += edge_matrix.index[i-1]
@@ -612,8 +614,9 @@ def continue_training_cli(args):
         ("Relationship rows", f"{before['relationship_rows']:,} → {after['relationship_rows']:,}"
                                f"  ({before['relationships']} → {after['relationships']} sentences)"),
     ]
-    if summary["experience_invalidated"]:
-        rows.append(("Experience Matrices", amber("invalidated — rebuild with build_experience.py")))
+    if summary["ctm_invalidated"]:
+        rows.append(("Context Trigger Matrix", amber("invalidated — call build_context_triggers() again")))
+    rows.append(("Open Mode", "auto-rebuilt from the merged graphs (no separate step needed)"))
 
     w = max(len(k) for k, _ in rows)
     for k, v in rows:

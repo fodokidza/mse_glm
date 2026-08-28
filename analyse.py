@@ -238,18 +238,98 @@ class Analyser:
         ]
 
     # -------------------------------------------------------------- traces
-    def generation_trace(self, prompt: str, max_tokens: int = 20):
-        text, ids, trace = self.model.generate(prompt, max_tokens=max_tokens)
+    def generation_trace(self, prompt: str, max_tokens: int = 20, mode: str = "strict"):
+        """
+        Step-by-step trace. Both modes are now fully deterministic --
+        no random.choice anywhere in inference.py.
+
+        Strict Mode's rule names are unchanged for the lineage stages
+        (e.g. 'bridge_lineage_unique', 'exact_match_unique'); any tie
+        lineage itself can't resolve now carries a rule name ending in
+        '..._bigram_frequency' instead of a random pick -- see
+        inference.py's _bigram_tie_break.
+
+        Open Mode's rule is almost always 'ctm_weighted_vote' (the
+        V1-V6 primary selection scored the full legal candidate set,
+        with its own internal bigram/global-frequency tie-break
+        cascade if the score itself ties -- see ivm.py's select()).
+        'ctm_unavailable_deterministic_fallback' only appears if no
+        CTM/IVM object was built at all. Stage 1/2 lineage rule names
+        never appear for an Open Mode trace. See inference.py's
+        module docstring.
+        """
+        text, ids, trace = self.model.generate(prompt, max_tokens=max_tokens, mode=mode)
         tok = self.model.tokenizer
         readable = []
         for step in trace:
             chosen = step["chosen"]
-            readable.append({
+            entry = {
                 "stage": step["stage"], "rule": step.get("rule"),
                 "chosen_token": tok.id_to_token.get(chosen, chosen),
                 "active_rels": sorted(step.get("active_rels", [])) if step.get("active_rels") else [],
-            })
+            }
+            if "scores" in step:
+                entry["scores"] = {tok.id_to_token.get(c, c) if c in (0,1,2,3) else tok.decode([c]): v
+                                    for c, v in step["scores"].items()}
+            readable.append(entry)
         return text, readable
+
+    def open_mode_scores(self, prompt: str) -> dict:
+        """
+        Full auditable V1-V6 score breakdown for the NEXT token given
+        `prompt`, under Open Mode's primary selection mechanism (see
+        ivm.py's score_candidates()/select()): which tokens are
+        important, their influence (breadth), what each of the SIX
+        layers (important vote / influence vote / context vote /
+        context-influence vote / bigram-witness vote / adjacency
+        vote) contributed per candidate, the final combined score,
+        and -- critically -- which stage actually decided the winner
+        ("score", "bigram_frequency", "global_frequency", or
+        "lowest_token_id"). The final "score" is the sum of all six
+        layers, including bigram_witness_vote (V5) and adjacency_vote
+        (V6) -- don't add up just the other four expecting it to
+        match; V5/V6 are usually the largest single contributors
+        (V5 when the exact bigram was literally witnessed, V6 when
+        the context token was ever directly, immediately followed by
+        the candidate -- directional, token->candidate only).
+        Requires Open Mode to be available (model trained/loaded).
+        Returns None otherwise.
+
+        Candidates are always the entire vocabulary -- Open Mode has
+        no successor gating at all, so there is no narrower option.
+        """
+        return self.model.open_mode_candidate_scores(prompt)
+
+    def bigram_frequency(self, prev_word: str, curr_word: str, mode: str = "strict") -> dict:
+        """
+        Raw bigram frequency for one pair: how many times `curr_word`
+        literally followed `prev_word` in training. This is the exact
+        count Strict Mode's tie-break (_bigram_tie_break) and Open
+        Mode's first tie-break cascade stage (select()) both use --
+        see inference.py/ivm.py.
+
+        Also reports "witness_sentences": how many literal training
+        sentences actually contained this bigram as a consecutive
+        pair -- this is the evidence set V5's bigram-witness vote
+        checks context tokens against (see ivm.py's
+        bigram_relationships()). Mode-independent -- it is NOT the
+        same number as "training" above whenever the bigram occurred
+        more than once inside the same sentence, or occurs across
+        more than one sentence; "training" counts raw occurrences,
+        "witness_sentences" counts distinct sentences.
+        """
+        tok = self.model.tokenizer
+        prev_id = tok.encode(prev_word)[-1]
+        curr_id = tok.encode(curr_word)[-1]
+        engine = self.model._engine(mode)
+        training = self.model.edges.frequency(prev_id, curr_id)
+        witnesses = self.model.bigram_witness_sentences(prev_id, curr_id)
+        return {
+            "prev": prev_word, "curr": curr_word,
+            "training": training,
+            "total": engine._bigram_frequency(prev_id, curr_id),
+            "witness_sentences": len(witnesses),
+        }
 
     # ----------------------------------------------------------- full report
     def full_report(self, top_n: int = 10) -> dict:
@@ -365,6 +445,29 @@ def main():
     p = sub.add_parser("trace", help="Step-by-step generation trace for a prompt")
     p.add_argument("prompt")
     p.add_argument("--max-tokens", type=int, default=20)
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
+
+    p = sub.add_parser("open-scores",
+                        help="Open Mode only: full V1-V6 weighted-vote breakdown "
+                             "for the next token given a prompt -- important tokens, "
+                             "influence, per-layer contributions (including V5's "
+                             "bigram-witness vote and V6's adjacency vote), the final "
+                             "score, and which tie-break stage (if any) decided the winner. "
+                             "This is Open Mode's PRIMARY selection mechanism, not a "
+                             "tie-breaker; use this to audit why it picked what it picked. "
+                             "Always scores the entire vocabulary -- Open Mode has no "
+                             "successor gating at all.")
+    p.add_argument("prompt")
+
+    p = sub.add_parser("bigram",
+                        help="Raw bigram frequency for one (prev, curr) pair -- the "
+                             "exact count used by Strict Mode's tie-break and Open "
+                             "Mode's first tie-break cascade stage, plus how many "
+                             "distinct training sentences witnessed it (V5's evidence "
+                             "set, see inference.py/ivm.py)")
+    p.add_argument("prev")
+    p.add_argument("curr")
+    p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("report", help="Combined stats + topology + clusters + relationships")
     p.add_argument("--top", type=int, default=10)
@@ -516,7 +619,7 @@ def main():
         ) if r else None)
 
     elif args.command == "trace":
-        text, trace = analyser.generation_trace(args.prompt, max_tokens=args.max_tokens)
+        text, trace = analyser.generation_trace(args.prompt, max_tokens=args.max_tokens, mode=args.mode)
         result = {"output": text, "trace": trace}
         _emit(result, args.json, lambda r: (
             print(f"  output: {r['output']}"),
@@ -524,6 +627,40 @@ def main():
                 [(s["stage"], s["rule"], s["chosen_token"], s["active_rels"]) for s in r["trace"]],
                 ["stage", "rule", "chosen_token", "active_rels"],
             ),
+        ))
+
+    elif args.command == "open-scores":
+        result = analyser.open_mode_scores(args.prompt)
+        if result is None:
+            print("Open Mode isn't ready (model not trained/loaded)", file=sys.stderr)
+            sys.exit(1)
+        _emit(result, args.json, lambda r: (
+            print(f"  important tokens: {r['important_tokens']}"),
+            print(f"  influence:        {r['influence']}"),
+            _print_table(
+                [(c, round(r["important_vote"].get(c, 0), 2),
+                  round(r["influence_vote"].get(c, 0), 2),
+                  round(r["context_vote"].get(c, 0), 2),
+                  round(r["context_influence_vote"].get(c, 0), 2),
+                  round(r["bigram_witness_vote"].get(c, 0), 2),
+                  round(r["adjacency_vote"].get(c, 0), 2),
+                  round(r["scores"][c], 2),
+                  "<- winner" if c == r["winner"] else "")
+                 for c in sorted(r["scores"], key=r["scores"].get, reverse=True)],
+                ["candidate", "V1 (important)", "V2 (influence)", "V3 (context)",
+                 "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)", "score", ""],
+            ),
+            print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']})"),
+        ))
+
+    elif args.command == "bigram":
+        result = analyser.bigram_frequency(args.prev, args.curr, mode=args.mode)
+        _emit(result, args.json, lambda r: (
+            print(f"  '{r['prev']}' -> '{r['curr']}':  training={r['training']}  "
+                  f"total={r['total']}  "
+                  f"witness_sentences={r['witness_sentences']}"),
+            print("  (witness_sentences is the evidence V5's bigram-witness vote "
+                  "checks context tokens against -- see ivm.py)"),
         ))
 
     elif args.command == "report":

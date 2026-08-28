@@ -109,27 +109,19 @@ def _rows_with_triple_id(bridge_matrix, source):
     ]
 
 
-def _has_direct_edge(model, exp_edges, a, b):
-    if b in model.edges.successors(a):
-        return True
-    if exp_edges and b in exp_edges.successors(a):
-        return True
-    return False
+def _has_direct_edge(model, a, b):
+    return b in model.edges.successors(a)
 
 
-def _shared_role_overlap(bridges, exp_bridges, this_cluster_id, members, candidate):
+def _shared_role_overlap(bridges, this_cluster_id, members, candidate):
     """Non-zero cluster_ids the candidate token shares with any member,
     other than the cluster currently being interpreted."""
     member_clusters = set()
     for m in members:
         member_clusters.update(bridges.t_index.get(m, []))
-        if exp_bridges:
-            member_clusters.update(exp_bridges.t_index.get(m, []))
     member_clusters.discard(this_cluster_id)
 
     candidate_clusters = set(bridges.t_index.get(candidate, []))
-    if exp_bridges:
-        candidate_clusters.update(exp_bridges.t_index.get(candidate, []))
     candidate_clusters.discard(this_cluster_id)
 
     return sorted(member_clusters & candidate_clusters)
@@ -139,6 +131,9 @@ def interpret_cluster(model, cluster_id, top_n=5, mode="strict"):
     """
     Propose interpreter token(s) for one cluster_id, with evidence
     gathered from Edge, Bridge, and Relationship matrices.
+
+    `mode` is accepted for call-site compatibility but has no effect
+    -- there is no longer a separate Experience data source.
 
     Returns None if the cluster_id is unknown / has fewer than 2 members.
     Otherwise a dict:
@@ -165,40 +160,28 @@ def interpret_cluster(model, cluster_id, top_n=5, mode="strict"):
     if not members:
         return None
 
-    exp_bridges = model.exp_bridges if (mode == "open" and model.exp_bridges) else None
-    exp_edges   = model.exp_edges   if (mode == "open" and model.exp_edges)   else None
-    exp_rels    = model.exp_rels    if (mode == "open" and model.exp_rels)    else None
-
-    # bt_hits[(bridge, target)] -> {member_token: [(triple_id, "train"|"exp"), ...]}
+    # bt_hits[(bridge, target)] -> {member_token: [(triple_id, "train"), ...]}
     bt_hits = defaultdict(lambda: defaultdict(list))
     for src in members:
         for target, bridge, _cid, tid in _rows_with_triple_id(bridges, src):
             if target in members or bridge in members:
                 continue  # skip self-referential slots -- not an external label
             bt_hits[(bridge, target)][src].append((tid, "train"))
-        if exp_bridges:
-            for target, bridge, _cid, tid in _rows_with_triple_id(exp_bridges, src):
-                if target in members or bridge in members:
-                    continue
-                bt_hits[(bridge, target)][src].append((tid, "exp"))
 
     candidates = []
     for (bridge, target), per_member in bt_hits.items():
         covered = sorted(per_member.keys())
         coverage = len(covered) / len(members)
 
-        edge_corroborated = all(_has_direct_edge(model, exp_edges, m, target) for m in covered)
+        edge_corroborated = all(_has_direct_edge(model, m, target) for m in covered)
 
         shared_role_overlap = _shared_role_overlap(
-            bridges, exp_bridges, cluster_id, members, target)
+            bridges, cluster_id, members, target)
 
         rel_ids = set()
         for m in covered:
             for tid, src_kind in per_member[m]:
-                if src_kind == "train":
-                    rel_ids.update(model.rels.relationships_for_triple(tid))
-                elif exp_rels:
-                    rel_ids.update(exp_rels.training_rels_for_exp_triple(tid))
+                rel_ids.update(model.rels.relationships_for_triple(tid))
 
         evidence_mask = ["bridge_source_axis"]
         if edge_corroborated:
@@ -244,8 +227,6 @@ def interpret_all_clusters(model, min_coverage=0.5, max_per_cluster=3, mode="str
     """
     seen = set(model.bridges.cluster_id)
     seen.discard(0)
-    if mode == "open" and model.exp_bridges:
-        seen.update(c for c in model.exp_bridges.cluster_id if c != 0)
 
     scan_n = max_per_cluster * 4 if max_per_cluster else 50
 
@@ -291,8 +272,6 @@ def build_interpreter_matrix(model, min_coverage=0.5, min_signals=2,
     """
     seen = set(model.bridges.cluster_id)
     seen.discard(0)
-    if mode == "open" and model.exp_bridges:
-        seen.update(c for c in model.exp_bridges.cluster_id if c != 0)
 
     rows = []
     for cid in sorted(seen):
@@ -361,25 +340,19 @@ def discover_zero_cluster_groups(model, min_group_size=2, mode="strict"):
     pattern). `min_group_size` is a floor, not a guarantee of semantic
     relevance -- eyeball the results, same as everywhere else in this
     module.
+
+    `mode` is accepted for call-site compatibility but has no effect
+    -- there is no longer a separate Experience data source.
     """
     bridges = model.bridges
-    exp_bridges = model.exp_bridges if (mode == "open" and model.exp_bridges) else None
-    exp_edges   = model.exp_edges   if (mode == "open" and model.exp_edges)   else None
-    exp_rels    = model.exp_rels    if (mode == "open" and model.exp_rels)    else None
 
-    # groups[(bridge, target)] -> {source: [(triple_id, "train"|"exp"), ...]}
+    # groups[(bridge, target)] -> {source: [(triple_id, "train"), ...]}
     groups = defaultdict(lambda: defaultdict(list))
     for i in range(len(bridges.source)):
         if bridges.cluster_id[i] != 0:
             continue
         s, t, br = bridges.source[i], bridges.target[i], bridges.bridge[i]
         groups[(br, t)][s].append((i, "train"))
-    if exp_bridges:
-        for i in range(len(exp_bridges.source)):
-            if exp_bridges.cluster_id[i] != 0:
-                continue
-            s, t, br = exp_bridges.source[i], exp_bridges.target[i], exp_bridges.bridge[i]
-            groups[(br, t)][s].append((i, "exp"))
 
     results = []
     for (bridge, target), per_source in groups.items():
@@ -389,27 +362,20 @@ def discover_zero_cluster_groups(model, min_group_size=2, mode="strict"):
         if len(members) < min_group_size:
             continue
 
-        edge_corroborated = all(_has_direct_edge(model, exp_edges, m, target) for m in members)
+        edge_corroborated = all(_has_direct_edge(model, m, target) for m in members)
 
         # No pre-existing cluster_id to exclude here -- these members
         # never had one, so nothing to discard from the overlap check.
         member_clusters = set()
         for m in members:
             member_clusters.update(bridges.t_index.get(m, []))
-            if exp_bridges:
-                member_clusters.update(exp_bridges.t_index.get(m, []))
         candidate_clusters = set(bridges.t_index.get(target, []))
-        if exp_bridges:
-            candidate_clusters.update(exp_bridges.t_index.get(target, []))
         shared_role_overlap = sorted(member_clusters & candidate_clusters)
 
         rel_ids = set()
         for m in members:
             for tid, src_kind in per_source[m]:
-                if src_kind == "train":
-                    rel_ids.update(model.rels.relationships_for_triple(tid))
-                elif exp_rels:
-                    rel_ids.update(exp_rels.training_rels_for_exp_triple(tid))
+                rel_ids.update(model.rels.relationships_for_triple(tid))
 
         evidence_mask = ["zero_cluster_source_axis"]
         if edge_corroborated:

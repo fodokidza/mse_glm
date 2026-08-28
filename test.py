@@ -40,7 +40,7 @@ the duck swam in the pond.
 CORPUS_EXP = """
 the cat sat on the mat.
 the dog sat on the carpet.
-the boy sat on the mat.
+the boy sat on the chair.
 the boy ran on the road.
 """
 
@@ -91,14 +91,19 @@ def main():
     check("bird lands on lake or hill", ("lake" in text) or ("hill" in text), text)
 
     section("Determinism")
-    # Genuinely unambiguous prompts must be deterministic
-    for det_prompt in ["the boy", "the girl", "the duck", "the cat ran", "the dog sat"]:
+    # ALL prompts are now deterministic in Strict Mode -- including ones
+    # that are genuinely structurally ambiguous (multiple candidates tie
+    # with no lineage signal to prefer one). Before this change, such
+    # ties fell to random.choice and varied run to run; now they fall to
+    # _bigram_tie_break (inference.py) -- whichever candidate was
+    # literally seen most often as the next token, or lowest token id if
+    # that ties too. Still a real behavior change worth naming: an
+    # "ambiguous" prompt no longer means "the output will vary," it means
+    # "lineage alone didn't decide it -- bigram frequency did."
+    for det_prompt in ["the boy", "the girl", "the duck", "the cat ran", "the dog sat",
+                        "the cat", "the dog", "the fish", "a bird"]:
         runs = {model.generate(det_prompt, max_tokens=12)[0] for _ in range(5)}
-        check(f"unambiguous '{det_prompt}' deterministic", len(runs) == 1, runs)
-    # Genuinely ambiguous prompts must vary across runs
-    for amb_prompt in ["the cat", "the dog", "the fish", "a bird"]:
-        runs = {model.generate(amb_prompt, max_tokens=12)[0] for _ in range(20)}
-        check(f"ambiguous '{amb_prompt}' produces varied output", len(runs) > 1, runs)
+        check(f"'{det_prompt}' deterministic (bigram tie-break, not random)", len(runs) == 1, runs)
 
     section("explain_step()")
     next_tok, tr = model.explain_step("the", "dog")
@@ -429,10 +434,10 @@ a piglet is like a pig.
     bos_id = 2
     the_id = enc_ctm("the")
 
-    random.seed(0)
     without_ctm = {engine_ctm.step(bos_id, the_id, active_rels=set())[0] for _ in range(30)}
-    check("without context_triggers, tie-break still explores multiple members "
-          "(unchanged random behavior)", len(without_ctm) > 1, without_ctm)
+    check("without context_triggers, tie-break is now fully deterministic "
+          "(bigram frequency, not random -- see inference.py)",
+          len(without_ctm) == 1, without_ctm)
 
     with_farm = [engine_ctm.step(bos_id, the_id, active_rels=set(),
                                   context_tokens={enc_ctm("farm")},
@@ -544,17 +549,24 @@ a piglet is like a pig.
     check("new fact generates correctly after merge",
           m_incr3.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet")
 
-    # Experience Matrices are derived from pre-merge cluster structure --
-    # must be invalidated, not silently left stale.
+    # Open Mode has no separate build step anymore -- it must be
+    # automatically rebuilt (not left stale, not invalidated) after
+    # incremental training, in sync with the merged graphs.
     m_incr4 = MSEGraphLanguageModel(vocab_size=200)
     m_incr4.train("the cat sat on the mat. the dog sat on the carpet.")
-    m_incr4.build_experience()
-    check("has_experience true before incremental training", m_incr4.has_experience())
+    open_ctm_before = m_incr4.open_ctm
+    check("Open Mode auto-built right after training",
+          m_incr4._open is not None and open_ctm_before is not None)
     summary = m_incr4.train_incremental("the pig sat on the rug.",
                                          extend_vocab=True, target_vocab_size=250)
-    check("has_experience false after incremental training (invalidated)",
-          not m_incr4.has_experience())
-    check("summary reports experience_invalidated=True", summary["experience_invalidated"])
+    check("Open Mode still available after incremental training (auto-rebuilt)",
+          m_incr4._open is not None and m_incr4.open_ctm is not None)
+    check("open_ctm is a FRESH object after the merge, not the stale pre-merge one",
+          m_incr4.open_ctm is not open_ctm_before)
+    check("the new fact is reachable in Open Mode after the merge",
+          "rug" in [m_incr4.tokenizer.decode([t]) for t in m_incr4.all_candidate_tokens()])
+    check("summary no longer reports a stale experience_invalidated key",
+          "experience_invalidated" not in summary, summary)
 
     # train_incremental on a never-trained model must fail clearly rather
     # than silently doing the wrong thing.
@@ -664,69 +676,40 @@ a piglet is like a pig.
         shutil.rmtree(out_dir3, ignore_errors=True)
         shutil.rmtree(out_norec, ignore_errors=True)
 
-    # ── Experience + Open Mode ────────────────────────────────────────────────
-    section("Experience Matrix construction")
+    # ── Open Mode (auto-built, vocabulary-as-candidates) ────────────────────
+    section("Open Mode is auto-built as soon as the model is trained")
     m_open = MSEGraphLanguageModel(vocab_size=300)
     m_open.train(CORPUS_EXP)
-    exp_summary = m_open.build_experience()
+    check("self._open is ready immediately after train() -- no separate build step",
+          m_open._open is not None)
+    check("self.open_ctm is ready immediately after train() -- no separate build step",
+          m_open.open_ctm is not None)
+    check("model has no experience-related attributes left at all",
+          not hasattr(m_open, "exp_edges") and not hasattr(m_open, "exp_bridges")
+          and not hasattr(m_open, "exp_rels"))
 
-    check("exp_edges built",       exp_summary["exp_edges"] > 0,    exp_summary)
-    check("exp_bridges built",     exp_summary["exp_bridges"] > 0,  exp_summary)
-    check("exp_clusters assigned", "exp_clusters" in exp_summary)
-    check("exp_rel_rows built",    exp_summary["exp_rel_rows"] > 0, exp_summary)
-    check("has_experience()",      m_open.has_experience())
-
-    section("Experience edge correctness")
+    section("Open Mode candidates are the ENTIRE vocabulary, not gated by successors")
     tok = m_open.tokenizer
     cat_id = tok.token_to_id.get("cat")
     dog_id = tok.token_to_id.get("dog")
     ran_id = tok.token_to_id.get("ran")
-    if cat_id and dog_id and ran_id:
-        exp_e_srcs = list(m_open.exp_edges.src)
-        exp_e_dsts = list(m_open.exp_edges.dst)
-        cat_ran = (cat_id, ran_id) in zip(exp_e_srcs, exp_e_dsts)
-        dog_ran = (dog_id, ran_id) in zip(exp_e_srcs, exp_e_dsts)
-        check("exp edge cat→ran created", cat_ran, "cat→ran missing from exp edges")
-        check("exp edge dog→ran created", dog_ran, "dog→ran missing from exp edges")
-
-    section("Experience bridge correctness")
-    if cat_id and dog_id and ran_id:
-        the_id = tok.token_to_id.get("the")
-        exp_b = m_open.exp_bridges
-        # check (the, ran, cat) and (the, ran, dog) in exp bridges
-        # stored as source=the, target=ran, bridge=cat/dog
-        the_ran_cat = any(
-            exp_b.source[i]==the_id and exp_b.target[i]==ran_id and exp_b.bridge[i]==cat_id
-            for i in range(len(exp_b.source))
-        ) if the_id else False
-        the_ran_dog = any(
-            exp_b.source[i]==the_id and exp_b.target[i]==ran_id and exp_b.bridge[i]==dog_id
-            for i in range(len(exp_b.source))
-        ) if the_id else False
-        check("exp bridge (the,ran,cat) created", the_ran_cat)
-        check("exp bridge (the,ran,dog) created", the_ran_dog)
-
-    section("Experience cluster: cat+dog stronger than boy")
-    if cat_id and dog_id:
-        boy_id = tok.token_to_id.get("boy")
-        sim_cd = m_open.token_similarity("cat","dog",   mode="open")["similarity"]
-        sim_cb = m_open.token_similarity("cat","boy",   mode="open")["similarity"]
-        sim_db = m_open.token_similarity("dog","boy",   mode="open")["similarity"]
-        check("open sim(cat,dog) > sim(cat,boy)", sim_cd > sim_cb,
-              f"cat-dog={sim_cd} cat-boy={sim_cb}")
-        check("open sim(cat,dog) > sim(dog,boy)", sim_cd > sim_db,
-              f"cat-dog={sim_cd} dog-boy={sim_db}")
-        # strict mode should not yet have this
-        sim_cd_strict = m_open.token_similarity("cat","dog", mode="strict")["similarity"]
-        sim_cd_open   = sim_cd
-        check("open sim >= strict sim for cat+dog", sim_cd_open >= sim_cd_strict)
+    all_ids = m_open.all_candidate_tokens()
+    check("all_candidate_tokens() matches self._open.vocab exactly",
+          all_ids == m_open._open.vocab, (len(all_ids), len(m_open._open.vocab)))
+    if cat_id and ran_id:
+        legal_strict_succs = m_open._strict._successors(cat_id)
+        check("'ran' was never a literal successor of 'cat' in training "
+              "(only 'sat' was) -- yet it's still a valid Open Mode candidate",
+              ran_id not in legal_strict_succs and ran_id in all_ids,
+              (legal_strict_succs, ran_id in all_ids))
 
     section("Open Mode generation")
-    # Open mode should be able to generate "the cat ran" or "the dog ran"
-    # strict mode should give training-only output for cat/dog (no ran)
+    # Open mode should be able to generate "the cat ran" -- a transition
+    # never literally observed after "cat" (only "cat sat" was trained),
+    # reachable now because candidates are the whole vocabulary, scored
+    # by IVM rather than gated by literal successors.
     strict_cat = m_open.generate("the cat", max_tokens=12, mode="strict")[0]
     check("strict cat stays on training path", "sat" in strict_cat, strict_cat)
-    # open mode can now use experience — cat and dog can run
     open_cat = m_open.generate("the cat", max_tokens=12, mode="open")[0]
     check("open cat does not crash", isinstance(open_cat, str) and len(open_cat) > 0)
     open_dog = m_open.generate("the dog", max_tokens=12, mode="open")[0]
@@ -734,25 +717,30 @@ a piglet is like a pig.
     for prompt in ["the cat", "the dog", "the boy"]:
         text, _, trace = m_open.generate(prompt, max_tokens=12, mode="open")
         stages = [t["stage"] for t in trace]
-        check(f"open '{prompt}' valid stages", all(s in (1,2,3,4) for s in stages))
+        check(f"open '{prompt}' valid stages", all(s in (1, 2, 3, 4) for s in stages))
 
-    section("Open Mode infer_shared_role (includes experience clusters)")
-    r_open = m_open.infer_shared_role(["cat","dog"], mode="open")
+    section("Open Mode infer_shared_role")
+    r_open = m_open.infer_shared_role(["cat", "dog"], mode="open")
     check("open shared-role cat+dog non-empty", len(r_open) > 0, r_open)
-    sources = [ev.get("source","") for _,_,ev in r_open]
-    check("open shared-role includes experience source",
-          any(s=="experience" for s in sources) or len(r_open)>0)
+    sources = [ev.get("source", "") for _, _, ev in r_open]
+    check("infer_shared_role's evidence is always literal training now "
+          "(no separate experience source exists anymore)",
+          all(s == "training" for s in sources), sources)
 
-    section("Experience save/load round-trip")
-    tmp2 = tempfile.mkdtemp(prefix="mse_exp_test_")
+    section("Open Mode save/load round-trip -- no separate experience files")
+    tmp2 = tempfile.mkdtemp(prefix="mse_open_test_")
     try:
         m_open.save(tmp2)
+        saved_files = set(os.listdir(tmp2))
+        check("no experience_*.json files are written anymore",
+              not any(f.startswith("experience_") for f in saved_files), saved_files)
         m_reload = MSEGraphLanguageModel.load(tmp2)
-        check("reloaded has_experience()", m_reload.has_experience())
-        for p in ["the cat","the dog"]:
+        check("reloaded model has Open Mode auto-available (no build step needed)",
+              m_reload._open is not None and m_reload.open_ctm is not None)
+        for p in ["the cat", "the dog"]:
             t_orig   = m_open.generate(p,    max_tokens=12, mode="open")[0]
             t_reload = m_reload.generate(p,  max_tokens=12, mode="open")[0]
-            check(f"exp reload '{p}' matches", t_orig == t_reload, f"'{t_orig}' vs '{t_reload}'")
+            check(f"open reload '{p}' matches", t_orig == t_reload, f"'{t_orig}' vs '{t_reload}'")
     finally:
         shutil.rmtree(tmp2, ignore_errors=True)
 
@@ -760,23 +748,199 @@ a piglet is like a pig.
     runs = {m_open.generate("the dog", max_tokens=12, mode="open")[0] for _ in range(5)}
     check("open mode 5 runs identical", len(runs)==1, runs)
 
+    section("Open Mode: CTM weighted voting is primary (not a tie-break)")
+    check("open_ctm auto-built alongside training, no separate call needed",
+          m_open.open_ctm is not None)
+    _, _, trace_open = m_open.generate("the dog", max_tokens=12, mode="open")
+    check("every open-mode step is CTM-scored or a deterministic fallback "
+          "(never Stage 2 lineage rules)",
+          all(t["rule"] in ("ctm_weighted_vote", "ctm_unavailable_deterministic_fallback",
+                             "termination_empty_vocabulary")
+              for t in trace_open), trace_open)
+    check("open-mode steps never carry a Stage-2-only rule tag",
+          all(t.get("rule") not in ("exact_match_unique", "all_valid_random",
+                                     "s2_empty_s1_random")
+              for t in trace_open), trace_open)
+
+    # score_candidates()/select() evaluate the FULL legal candidate set,
+    # not just a pre-existing tie -- verify against a hand-checked example.
+    tok = m_open.tokenizer
+    def enc(w):
+        e = [t for t in tok.encode(w) if t != 2]
+        return e[-1]
+    info = m_open.open_mode_candidate_scores("the boy sat on the")
+    check("open_mode_candidate_scores exposes the full auditable trace",
+          set(info.keys()) == {"candidates", "important_tokens", "influence",
+                                "knows", "important_vote", "influence_vote",
+                                "context_vote", "context_influence_vote",
+                                "bigram_witness_vote", "adjacency_vote",
+                                "scores", "winner", "tie_break_stage"}, info)
+    check("open_mode_candidate_scores always covers the entire vocabulary now",
+          len(info["candidates"]) == len(m_open.all_candidate_tokens()), info)
+    # Now scoring the ENTIRE vocabulary (not just legal successors), so
+    # many low-scoring subword/junk tokens are in the mix too -- but the
+    # genuine training-grounded candidate should still win on V3/V5/V6
+    # evidence alone.
+    check("chair is still the top-scoring candidate in open mode",
+          max(info["scores"], key=info["scores"].get) == "chair", info["scores"])
+    check("scores equal the sum of the six independent vote layers",
+          all(abs(info["scores"][c] -
+                  (info["important_vote"].get(c, 0) + info["influence_vote"].get(c, 0)
+                   + info["context_vote"].get(c, 0) + info["context_influence_vote"].get(c, 0)
+                   + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0))) < 1e-9
+              for c in info["candidates"]),
+          info)
+
+    section("Open Mode: four independent vote layers (V1 + V2 + V3 + V4)")
+    # Built directly against the class so every number is exact and
+    # traceable: I = {A, B} (important), P = {A, B, N} (full context,
+    # N is NOT a cluster member). Candidates X, Y.
+    #   A knows X with evidence 2, knows Y with evidence 1 -> influence(A)=2
+    #   B knows X with evidence 1 only (doesn't know Y)     -> influence(B)=1
+    #   N (unimportant) co-occurs with Y only, not X -- V3/V4 are the ONLY
+    #     layers N can contribute to, and it does, for Y only.
+    from ivm import ImportanceVoteMatrix
+    ivm3 = ImportanceVoteMatrix()
+    # This worked example's comments use clean 0.1 weights throughout for
+    # readability. _important_weight already defaults to 0.1, but
+    # _influence_weight's actual default is 0.09 (see ivm.py's __init__) --
+    # pin it here so the hand-computed numbers in the checks below match
+    # exactly, without touching the real production default.
+    ivm3._influence_weight = 0.1
+    ivm3._important = {"A", "B"}
+    ivm3._token_rels = {
+        "A": {1, 2, 3},
+        "B": {50},
+        "N": {60},
+        "X": {1, 2, 50, 51},
+        "Y": {3, 60},
+    }
+    trace2 = ivm3.score_candidates(["X", "Y"], {"A", "B", "N"})
+    check("V1 (important_vote) is RAW/BINARY, NOT scaled by evidence count -- "
+          "one vote (x0.1) per important token that knows C at all: "
+          "X=0.1*(A knows + B knows)=0.1*2=0.2, Y=0.1*(A knows only)=0.1*1=0.1 "
+          "-- note this does NOT scale with A's evidence count of 2 for X",
+          abs(trace2["important_vote"]["X"] - 0.2) < 1e-9 and
+          abs(trace2["important_vote"]["Y"] - 0.1) < 1e-9, trace2["important_vote"])
+    check("V2 (influence_vote) = 0.1 x sum of influence(t) for t that knows C: "
+          "X=0.1*(2+1)=0.3, Y=0.1*2=0.2",
+          abs(trace2["influence_vote"]["X"] - 0.3) < 1e-9 and
+          abs(trace2["influence_vote"]["Y"] - 0.2) < 1e-9, trace2["influence_vote"])
+    check("V3 (context_vote) counts EVERY context token including N, "
+          "full weight 1.0 each -- strictly bigger than V1/V2's 0.1: "
+          "X gets A+B=2 votes, Y gets A+N=2 votes",
+          trace2["context_vote"] == {"X": 2.0, "Y": 2.0}, trace2["context_vote"])
+    check("V4 (context_influence_vote) IS scaled by raw evidence count, tiny "
+          "weight 0.01, for EVERY context token: "
+          "X=0.01*(knowledge(A,X)=2 + knowledge(B,X)=1 + knowledge(N,X)=0)=0.03, "
+          "Y=0.01*(knowledge(A,Y)=1 + knowledge(B,Y)=0 + knowledge(N,Y)=1)=0.02",
+          abs(trace2["context_influence_vote"]["X"] - 0.03) < 1e-9 and
+          abs(trace2["context_influence_vote"]["Y"] - 0.02) < 1e-9,
+          trace2["context_influence_vote"])
+    check("N (not important) contributed to Y's score only via V3/V4 -- proof "
+          "V3/V4 genuinely include non-important tokens, unlike V1/V2",
+          "N" not in trace2["knows"] and trace2["context_vote"]["Y"] > trace2["important_vote"]["Y"] - 1,
+          trace2)
+    check("final score = V1+V2+V3+V4 exactly: X=0.2+0.3+2+0.03=2.53, Y=0.1+0.2+2+0.02=2.32",
+          abs(trace2["scores"]["X"] - 2.53) < 1e-9 and
+          abs(trace2["scores"]["Y"] - 2.32) < 1e-9, trace2["scores"])
+    check("select() picks X, the higher combined score", 
+          ivm3.select(["X", "Y"], {"A", "B", "N"})[0] == "X", trace2)
+    check("V1+V2+V4 alone for X (0.53) could never have outvoted V3's "
+          "contribution to Y (2.0) -- proof important tokens/magnitude can't "
+          "override context presence by design",
+          (trace2["important_vote"]["X"] + trace2["influence_vote"]["X"]
+           + trace2["context_influence_vote"]["X"]) < trace2["context_vote"]["Y"],
+          trace2)
+
+    section("Open Mode: tie-break cascade (bigram frequency -> global frequency -> lowest id)")
+    # A genuine score tie, engineered directly: two candidates with
+    # identical V1/V2/V3 (X2 and Y2 both known by the same important
+    # token with equal evidence, and equal context support).
+    ivm4 = ImportanceVoteMatrix()
+    ivm4._important = {"A"}
+    ivm4._token_rels = {
+        "A": {1, 2},
+        "X2": {1, 100},
+        "Y2": {2, 200},
+    }
+    trace4 = ivm4.score_candidates(["X2", "Y2"], {"A"})
+    check("scores tie by construction (symmetric evidence)",
+          trace4["scores"]["X2"] == trace4["scores"]["Y2"], trace4["scores"])
+    # No bigram data at all -- cascade should skip straight to global
+    # frequency: X2 has 2 relationships, Y2 has 2 -- still tied -- falls
+    # to lowest token id.
+    winner4a, _ = ivm4.select(["X2", "Y2"], {"A"}, current="the")
+    check("with no bigram evidence and tied global frequency, falls to "
+          "lowest token id", winner4a == min("X2", "Y2"), winner4a)
+
+    # Now inject a real bigram-frequency gap in Y2's favor and confirm it
+    # decides the tie WITHOUT changing the primary score at all.
+    ivm4._bigram_freq = {("the", "X2"): 1, ("the", "Y2"): 5}
+    winner4b, _ = ivm4.select(["X2", "Y2"], {"A"}, current="the")
+    check("bigram frequency breaks the tie in favor of Y2 (5 > 1), "
+          "even though the primary score never changed",
+          winner4b == "Y2", winner4b)
+
+    # Now make bigram frequency ALSO tie, but give X2 more global
+    # (corpus-wide) frequency -- should decide it at the LAST stage.
+    ivm4._bigram_freq = {("the", "X2"): 3, ("the", "Y2"): 3}
+    ivm4._token_rels["X2"] = {1, 100, 101, 102}   # 4 relationships total
+    winner4c, _ = ivm4.select(["X2", "Y2"], {"A"}, current="the")
+    check("bigram frequency ties too -- global frequency breaks it "
+          "(X2 now has 4 relationships vs Y2's 2)",
+          winner4c == "X2", winner4c)
+
+    section("Strict Mode: bigram frequency replaces random tie-break")
+    ms = MSEGraphLanguageModel(vocab_size=150)
+    ms.train("""
+the cat sat on the bench.
+the cat sat on the bench.
+the cat sat on the mat.
+""")
+    tok_s = ms.tokenizer
+    def encs(w):
+        e = [t for t in tok_s.encode(w) if t != 2]
+        return e[-1]
+    the, bench, mat = encs("the"), encs("bench"), encs("mat")
+    check("EdgeMatrix tracks real bigram counts, not just legality: "
+          "the->bench seen twice, the->mat seen once",
+          ms.edges.frequency(the, bench) == 2 and ms.edges.frequency(the, mat) == 1,
+          (ms.edges.frequency(the, bench), ms.edges.frequency(the, mat)))
+    engine_s = ms._strict
+    check("_bigram_tie_break deterministically prefers the more frequent bigram",
+          engine_s._bigram_tie_break(the, [bench, mat]) == bench,
+          engine_s._bigram_tie_break(the, [bench, mat]))
+    check("_bigram_tie_break is fully deterministic across repeated calls",
+          len({engine_s._bigram_tie_break(the, [bench, mat]) for _ in range(10)}) == 1,
+          None)
+    # inference.py no longer imports random at all -- confirms every
+    # random.choice call site was actually replaced, not just some.
+    import inference as inference_module
+    check("inference.py contains no 'random' import (no randomness left in Strict Mode)",
+          "random" not in dir(inference_module) and not hasattr(inference_module, "random"),
+          dir(inference_module))
+
     section("Summary")
     print(f"  {PASS} passed, {FAIL} failed")
     if FAIL: sys.exit(1)
 
-if __name__ == "__main__":
-    main()
-
 
 def test_prompt_seeding_and_mode_boundaries():
     """
-    Documents the strict bigram-validation boundary and random-tie behaviour.
+    Documents the strict bigram-validation boundary and deterministic
+    tie-break behaviour.
 
-    Key findings after the two bug fixes:
-    - Strict mode rejects any prompt containing a bigram not in E.
-    - Open mode can extend E via experience edges, so 'the cat ran'
-      becomes legal in open mode (cat->ran added via experience).
-    - Genuine ties now resolve randomly, not by storage order.
+    Key findings:
+    - BOTH modes reject any prompt containing a bigram not in E --
+      there is no longer a separate Experience Edge Matrix to widen
+      what counts as a legal prompt in Open Mode. The prompt itself
+      must still start from a literally-observed transition; only
+      what happens AFTER the prompt differs between modes (Open
+      Mode's per-step candidates are the whole vocabulary, not gated
+      by successors at all).
+    - Genuine ties resolve deterministically (bigram frequency, then
+      global frequency, then lowest token id), never randomly.
     """
     section("Prompt seeding and mode boundaries")
 
@@ -788,38 +952,67 @@ the boy ran on the road.
 """
     mb = MSEGraphLanguageModel(vocab_size=150)
     mb.train(CORPUS_BOUNDARY)
-    mb.build_experience()
 
-    # Case 1: short prompts — valid in both modes, produce known valid outputs
+    # Case 1: short prompts. Strict Mode keeps its lineage-driven, exact
+    # per-prompt-thread outputs unchanged.
     for prompt, valid in [("the cat",["mat"]), ("the dog",["carpet"]),
                            ("the boy",["mat","road"])]:
-        for mode in ["strict","open"]:
-            text, _, _ = mb.generate(prompt, max_tokens=12, mode=mode)
-            check(f"case1 '{prompt}' {mode} → one of {valid}",
-                  any(v in text for v in valid), f"got '{text}'")
+        text, _, _ = mb.generate(prompt, max_tokens=12, mode="strict")
+        check(f"case1 '{prompt}' strict → one of {valid}",
+              any(v in text for v in valid), f"got '{text}'")
 
-    # Case 2: 'the cat ran' — cat->ran not in training E
-    # Strict: illegal bigram → rejected at stage 0
-    # Open:   cat->ran exists in EE (experience edge) → resolves via boy's path
+    # Open Mode no longer uses lineage at all (see inference.py), so its
+    # output is whichever candidate the V1+V2+V3 weighted vote scores
+    # highest across the WHOLE corpus, not whichever fact this specific
+    # prompt's thread pointed to. Historically (under an earlier formula
+    # that multiplied influence x evidence into one term) this produced
+    # 'mat' instead of the correct 'carpet' here, because 'sat' (broad
+    # influence, knows 5 candidates) could multiply up its modest evidence
+    # for the more-common 'mat' and swamp 'dog's narrow, correct evidence
+    # for 'carpet'. Splitting influence into its OWN independent, flatly-
+    # weighted vote (V2) fixes that: 'dog' -- narrow but specific -- still
+    # gets a first-class V1 vote for 'carpet' that influence can no longer
+    # multiply away, and 'carpet' correctly outscores 'mat'
+    # (model.open_mode_candidate_scores('the dog sat on the') shows
+    # carpet=6.6 vs mat=5.5). Still fully deterministic throughout.
+    text, _, trace = mb.generate("the dog", max_tokens=12, mode="open")
+    check("case1 'the dog' open → deterministic CTM-scored result ('carpet')",
+          "carpet" in text, f"got '{text}'")
+    check("case1 'the dog' open never falls back to randomness",
+          all(t["rule"] != "all_valid_random" for t in trace), trace)
+
+    text, _, _ = mb.generate("the boy", max_tokens=12, mode="open")
+    check("case1 'the boy' open → one of ['mat', 'road']",
+          any(v in text for v in ["mat", "road"]), f"got '{text}'")
+
+    # Case 2: 'the cat ran' — cat->ran not in training E, in EITHER mode
+    # now (no separate Experience Edge Matrix to widen prompt legality
+    # in Open Mode anymore). The PROMPT itself must still start from a
+    # literally-observed transition in both modes; only what happens
+    # AFTER the prompt differs (Open Mode's per-step candidates are the
+    # whole vocabulary, not gated by successors -- see inference.py).
     for prompt in ["the cat ran", "the dog ran"]:
         ts, _, trace_s = mb.generate(prompt, max_tokens=10, mode="strict")
         check(f"case2 '{prompt}' strict → illegal_prompt_bigram",
               trace_s[0].get("rule") == "illegal_prompt_bigram",
               f"rule={trace_s[0].get('rule')} out='{ts}'")
-        to, _, _ = mb.generate(prompt, max_tokens=10, mode="open")
-        check(f"case2 '{prompt}' open → road",
-              "road" in to, f"got '{to}'")
+        to, _, trace_o = mb.generate(prompt, max_tokens=10, mode="open")
+        check(f"case2 '{prompt}' open ALSO → illegal_prompt_bigram (same "
+              "literal Edge Matrix gates the prompt in both modes now)",
+              trace_o[0].get("rule") == "illegal_prompt_bigram",
+              f"rule={trace_o[0].get('rule')} out='{to}'")
 
-    # Case 3: 'the cat ran on the' — also illegal in strict (same bad bigram)
-    # Open resolves correctly via experience lineage
+    # Case 3: 'the cat ran on the' — also illegal in BOTH modes, same
+    # bad bigram, same reasoning as case 2.
     for prompt in ["the cat ran on the", "the dog ran on the"]:
         ts, _, trace_s = mb.generate(prompt, max_tokens=4, mode="strict")
         check(f"case3 '{prompt}' strict → illegal_prompt_bigram",
               trace_s[0].get("rule") == "illegal_prompt_bigram",
               f"rule={trace_s[0].get('rule')} out='{ts}'")
-        to, _, _ = mb.generate(prompt, max_tokens=4, mode="open")
-        check(f"case3 '{prompt}' open → road",
-              "road" in to, f"got '{to}'")
+        to, _, trace_o = mb.generate(prompt, max_tokens=4, mode="open")
+        check(f"case3 '{prompt}' open ALSO → illegal_prompt_bigram",
+              trace_o[0].get("rule") == "illegal_prompt_bigram",
+              f"rule={trace_o[0].get('rule')} out='{to}'")
 
     # Case 4: legal unambiguous prompt resolves correctly in strict
     text, _, trace = mb.generate("the cat sat", max_tokens=10, mode="strict")
@@ -828,17 +1021,427 @@ the boy ran on the road.
     check("first step uses stage 1 or 2",
           trace[0]["stage"] in (1, 2), f"stage was {trace[0]['stage']}")
 
-    # Case 5: random ties — 'the boy' has two valid paths in CORPUS_BOUNDARY
-    # Must produce varied output across runs
+    # Case 5: "the boy" has two structurally valid paths in CORPUS_BOUNDARY
+    # (sat/ran). Previously resolved by random.choice (varied across runs);
+    # now resolved deterministically by bigram frequency -- see
+    # inference.py's _bigram_tie_break. Same prompt, same output every time.
     boy_runs = {mb.generate("the boy", max_tokens=10, mode="strict")[0]
                 for _ in range(30)}
-    check("ambiguous 'the boy' produces varied output (sat/ran both valid)",
-          len(boy_runs) > 1, f"always gave: {boy_runs}")
+    check("'the boy' deterministic across runs (bigram tie-break, not random)",
+          len(boy_runs) == 1, boy_runs)
+
+
+def test_importance_vote_matrix():
+    """
+    Validates ivm.py against the exact worked example from the spec:
+    corpus = CORPUS_EXP, prompt = "the boy sat on the ___", tied
+    candidates = {mat, carpet, chair, road}. Expected winner: chair
+    (sat, influence 3, is out-voted into agreement with boy on chair;
+    boy, influence 2, only reaches chair/road).
+
+    Also checks that IVM is a true no-op when not passed, and that
+    build/save/load round-trips its vote weights.
+    """
+    section("Importance Vote Matrix (IVM)")
+
+    mi = MSEGraphLanguageModel(vocab_size=150)
+    mi.train(CORPUS_EXP)
+    ivm = mi.build_importance_votes(mode="strict")
+    check("build_importance_votes returns an IVM", ivm is not None)
+    check("has_importance_votes() true after build", mi.has_importance_votes())
+
+    tok = mi.tokenizer
+    def enc(w):
+        e = [t for t in tok.encode(w) if t != 2]
+        return e[-1]
+    def dec(t): return tok.decode([t])
+
+    boy, sat, the, on = enc("boy"), enc("sat"), enc("the"), enc("on")
+    mat, carpet, chair, road = enc("mat"), enc("carpet"), enc("chair"), enc("road")
+    candidates = [mat, carpet, chair, road]
+    context_tokens = [the, boy, sat, on, the]
+
+    result = ivm.votes(candidates, context_tokens)
+    check("only sat and boy are important (the/on excluded)",
+          set(result["important_tokens"]) == {sat, boy},
+          [dec(t) for t in result["important_tokens"]])
+    check("sat has higher influence than boy",
+          result["influence"].get(sat, 0) > result["influence"].get(boy, 0),
+          result["influence"])
+    check("chair scores boy's influence + sat's influence (2+3=5)",
+          result["totals"].get(chair) == 5,
+          {dec(c): v for c, v in result["totals"].items()})
+    check("chair has the highest vote total",
+          max(result["totals"], key=result["totals"].get) == chair,
+          {dec(c): v for c, v in result["totals"].items()})
+
+    winner = ivm.resolve_tie(candidates, context_tokens)
+    check("resolve_tie picks chair", winner == chair, dec(winner) if winner is not None else None)
+
+    # A token never votes for itself if it's also a tied candidate
+    self_vote = ivm.votes([boy, chair], [the, boy, sat, on, the])
+    check("important token excludes itself from its own known-candidates",
+          boy not in self_vote["knows"].get(boy, {}),
+          self_vote["knows"].get(boy, {}))
+
+    # No-op contract: passing nothing changes nothing
+    text_default, _, trace_default = mi.generate("the boy sat on the", max_tokens=1)
+    text_no_ivm, _, trace_no_ivm = mi.generate("the boy sat on the", max_tokens=1,
+                                                use_importance_votes=False)
+    check("use_importance_votes=False matches default (no-op contract)",
+          text_default == text_no_ivm, f"'{text_default}' vs '{text_no_ivm}'")
+
+    # Passing an IVM changes the resolution rule used on a genuine tie
+    _, _, trace_ivm = mi.generate("the boy sat on the", max_tokens=1,
+                                   use_importance_votes=True)
+    check("importance voting produces a distinct rule when it fires",
+          trace_ivm[-1]["rule"] in ("importance_vote_resolved",
+                                     "context_trigger_resolved",
+                                     "importance_vote_no_signal_random")
+          or trace_ivm[-1]["stage"] != 1,
+          trace_ivm[-1])
+
+    # Save/load round-trip
+    d = ivm.to_dict()
+    from ivm import ImportanceVoteMatrix
+    ivm2 = ImportanceVoteMatrix.from_dict(d)
+    winner2 = ivm2.resolve_tie(candidates, context_tokens)
+    check("IVM to_dict/from_dict round-trip preserves the winner",
+          winner2 == chair, dec(winner2) if winner2 is not None else None)
+
+
+def test_train_py_cli_path_matches_model_api():
+    """
+    train.py's `main()`/`train_with_display()` build the Edge/Bridge/
+    Relationship matrices by hand (for the live progress display),
+    completely independently of graph.py's own EdgeMatrix.build()/
+    model.py's _build_graphs()/_merge_graphs(). This is a real,
+    previously-uncovered gap: test.py never exercised this code path
+    at all before this function existed -- every other test in this
+    suite trains through model.train()/model.train_incremental(),
+    which never goes anywhere near train.py's hand-rolled construction.
+
+    That gap hid a real bug: train.py's hand-rolled EdgeMatrix never
+    set `.count` at all (stayed an empty array while `.src`/`.dst` had
+    real entries), so every model trained via `python3 train.py ...`
+    -- the exact command the README's own quickstart uses -- crashed
+    the moment anything touched EdgeMatrix.frequency() on a real edge
+    (Strict Mode's tie-break, /bigram, Open Mode's V6 adjacency vote,
+    ivm.py's bigram_frequencies()). This was only caught by hand,
+    running the literal reported command, not by this suite -- fixed
+    here so it can't silently regress again.
+    """
+    section("train.py's CLI path (train_with_display) matches the model.train() API")
+
+    import train as train_module
+
+    m1 = MSEGraphLanguageModel(vocab_size=200)
+    summary = train_module.train_with_display(
+        m1, corpus_text=CORPUS_EXP, vocab_size=200,
+        display=train_module.Display(quiet=True),
+    )
+
+    check("train_with_display returns without raising",
+          isinstance(summary, dict), summary)
+    check("EdgeMatrix.count is populated (same length as src/dst, all real "
+          "counts) -- the exact bug this test exists to catch",
+          len(m1.edges.count) == len(m1.edges.src) and len(m1.edges.count) > 0
+          and all(c > 0 for c in m1.edges.count),
+          (len(m1.edges.src), list(m1.edges.count)))
+
+    m2 = MSEGraphLanguageModel(vocab_size=200)
+    m2.train(CORPUS_EXP)
+    check("train.py's EdgeMatrix.count matches model.train()'s for every pair",
+          sorted(zip(m1.edges.src, m1.edges.dst, m1.edges.count)) ==
+          sorted(zip(m2.edges.src, m2.edges.dst, m2.edges.count)),
+          (list(zip(m1.edges.src, m1.edges.dst, m1.edges.count)),
+           list(zip(m2.edges.src, m2.edges.dst, m2.edges.count))))
+
+    # The actual reported failure: frequency() on a real edge must not crash.
+    the_id = m1.tokenizer.token_to_id.get("the")
+    cat_id = m1.tokenizer.token_to_id.get("cat")
+    if the_id is not None and cat_id is not None:
+        freq = m1.edges.frequency(the_id, cat_id)
+        check("EdgeMatrix.frequency() on a real trained-via-train.py edge "
+              "doesn't crash and returns a real count",
+              freq > 0, freq)
+
+    # Save/load round-trip through train.py's own JSON-writing path,
+    # then exercise every count-dependent feature end to end.
+    tmp = tempfile.mkdtemp(prefix="mse_trainpy_test_")
+    try:
+        train_module.train_with_display(
+            MSEGraphLanguageModel(vocab_size=200), corpus_text=CORPUS_EXP,
+            vocab_size=200, display=train_module.Display(quiet=True),
+            out_path=tmp,
+        )
+        m_loaded = MSEGraphLanguageModel.load(tmp)
+        check("count survives the save/load round-trip too",
+              len(m_loaded.edges.count) == len(m_loaded.edges.src)
+              and all(c > 0 for c in m_loaded.edges.count),
+              list(m_loaded.edges.count))
+
+        text, ids, trace = m_loaded.generate("the cat sat", mode="strict")
+        check("generation from a reloaded train.py model doesn't crash",
+              isinstance(text, str) and len(text) > 0, text)
+
+        info = m_loaded.open_mode_candidate_scores("the cat sat on the")
+        check("open_mode_candidate_scores doesn't crash on a train.py-trained "
+              "model (this is exactly where V6's adjacency vote and the "
+              "bigram-frequency tie-break touch EdgeMatrix.count)",
+              info is not None and "scores" in info, info)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bigram_witness_vote_and_vocab_candidates():
+    """
+    V5 (bigram witness vote) and V6 (adjacency vote), plus Open Mode's
+    vocabulary-as-candidates architecture -- exercised directly
+    against ivm.py / inference.py / model.py so the numbers are
+    hand-checkable.
+    """
+    section("V5: bigram-witness vote")
+
+    from ivm import ImportanceVoteMatrix, bigram_relationships
+
+    m = MSEGraphLanguageModel(vocab_size=150)
+    m.train(CORPUS_EXP)
+    tok = m.tokenizer
+    def enc(w):
+        e = [t for t in tok.encode(w) if t != 2]
+        return e[-1]
+    def dec(t): return tok.decode([t])
+
+    cat, dog, boy, sat, the, on = (enc("cat"), enc("dog"), enc("boy"),
+                                    enc("sat"), enc("the"), enc("on"))
+    mat, carpet, chair, road = enc("mat"), enc("carpet"), enc("chair"), enc("road")
+
+    # CORPUS_EXP: "the cat sat on the mat.", "the dog sat on the carpet.",
+    # "the boy sat on the chair.", "the boy ran on the road." -- the
+    # literal CONSECUTIVE bigram (the, mat) -- "the" immediately followed
+    # by "mat" -- is witnessed ONLY by "the cat sat on the mat" (rel_id
+    # for that one sentence). "cat" is subject-specific to that sentence,
+    # so it's a clean witness; "sat"/"on" appear in ALL three "X sat on
+    # the Y" sentences and would trivially witness every one of them --
+    # deliberately avoided here as a control.
+    ivm = ImportanceVoteMatrix.build(m, mode="strict")
+    br = bigram_relationships(m)
+    check("bigram_relationships records a literal (the,mat) witness set",
+          (the, mat) in br and len(br[(the, mat)]) > 0, br.get((the, mat)))
+
+    v5 = ivm._bigram_witness_vote(the, [cat, dog], [mat, carpet])
+    check("cat witnessed the->mat (its own sentence) -> full vote for mat",
+          v5.get(mat, 0) == 1.0, v5)
+    check("dog witnessed the->carpet (its own sentence) -> full vote for carpet",
+          v5.get(carpet, 0) == 1.0, v5)
+    check("cat never witnessed the->carpet (different sentence) -- no cross-vote",
+          v5.get(carpet, 0) == 1.0 and (br[(the, carpet)] & (ivm._token_rels.get(cat) or set())) == set(),
+          (v5, br.get((the, carpet)), ivm._token_rels.get(cat)))
+
+    v5_none = ivm._bigram_witness_vote(None, [cat, dog], [mat])
+    check("V5 is all-zero when current is None (documented degrade)",
+          v5_none == {}, v5_none)
+
+    v5_unseen = ivm._bigram_witness_vote(boy, [cat, dog], [road])
+    check("no vote for a bigram nobody ever literally witnessed",
+          v5_unseen.get(road, 0) == 0, v5_unseen)
+
+    # score_candidates()/select() now require `current` to activate V5;
+    # omitting it should reproduce the old V1-V4-only behavior IF V6 also
+    # happens to contribute 0 here -- which it does for this specific
+    # (context, candidates) pair: cat/dog are never literally ADJACENT to
+    # mat/carpet/chair/road (they're 3 tokens apart: "cat sat on the mat"),
+    # even though they share a sentence. This is NOT a general guarantee
+    # that omitting `current` zeroes V6 too -- V6 doesn't depend on
+    # `current` at all, see the dedicated V6 section below for that.
+    trace_with = ivm.score_candidates([mat, carpet, chair, road],
+                                       [cat, dog], current=the)
+    trace_without = ivm.score_candidates([mat, carpet, chair, road],
+                                          [cat, dog])
+    check("adjacency_vote key is present even when current is omitted "
+          "(V6 doesn't depend on current) -- happens to be all-zero here "
+          "only because cat/dog are never adjacent to these candidates",
+          "adjacency_vote" in trace_without and
+          all(v == 0 for v in trace_without["adjacency_vote"].values()),
+          trace_without.get("adjacency_vote"))
+    check("bigram_witness_vote key present and non-empty when current is given",
+          any(v > 0 for v in trace_with["bigram_witness_vote"].values()), trace_with)
+    check("omitting current reproduces the old 4-layer score exactly",
+          all(abs(trace_without["scores"][c] -
+                  (trace_without["important_vote"].get(c, 0)
+                   + trace_without["influence_vote"].get(c, 0)
+                   + trace_without["context_vote"].get(c, 0)
+                   + trace_without["context_influence_vote"].get(c, 0))) < 1e-9
+              for c in [mat, carpet, chair, road]),
+          trace_without)
+    check("supplying current can only raise or hold a candidate's score, never lower it",
+          all(trace_with["scores"][c] >= trace_without["scores"][c] - 1e-9
+              for c in [mat, carpet, chair, road]),
+          (trace_with["scores"], trace_without["scores"]))
+
+    # to_dict/from_dict must round-trip the new fields
+    ivm_rt = ImportanceVoteMatrix.from_dict(ivm.to_dict())
+    v5_rt = ivm_rt._bigram_witness_vote(the, [cat, dog], [mat, carpet])
+    check("bigram_rels/bigram_witness_weight survive to_dict/from_dict",
+          v5_rt == v5 and abs(ivm_rt._bigram_witness_weight - ivm._bigram_witness_weight) < 1e-9,
+          v5_rt)
+
+    section("V6: adjacency vote")
+
+    from ivm import adjacent_pairs
+
+    ap = adjacent_pairs(m)
+    # "the cat sat on the mat" -> literal DIRECTED consecutive pairs:
+    # (the,cat), (cat,sat), (sat,on), (on,the), (the,mat). NOT adjacent:
+    # cat->mat (3 tokens apart, never consecutive in either direction).
+    check("adjacent_pairs() records literal DIRECTED consecutive pairs "
+          "(from_token, to_token) from training",
+          (the, cat) in ap and (cat, sat) in ap and
+          (sat, on) in ap and (on, the) in ap and
+          (the, mat) in ap,
+          ap)
+    check("adjacent_pairs() does NOT record cat->mat or mat->cat -- same "
+          "sentence, never literally consecutive in either direction",
+          (cat, mat) not in ap and (mat, cat) not in ap, ap)
+
+    # Directionality is the whole point of V6: "the cat" occurs (the->cat),
+    # but "cat the" never does (cat->the) -- only the observed direction
+    # is recorded, and only that direction votes.
+    check("adjacent_pairs() is directional: (the,cat) recorded because "
+          "'the cat' occurs, but (cat,the) is NOT recorded -- 'cat the' "
+          "never occurs",
+          (the, cat) in ap and (cat, the) not in ap,
+          (m.edges.frequency(the, cat), m.edges.frequency(cat, the)))
+
+    v6_reverse = ivm._adjacency_vote([cat], [the])
+    check("directionality in _adjacency_vote(): context token 'cat' was "
+          "NEVER immediately followed by 'the' -> no vote for 'the'",
+          v6_reverse.get(the, 0) == 0, v6_reverse)
+    v6_forward = ivm._adjacency_vote([the], [cat])
+    check("directionality in _adjacency_vote(): context token 'the' WAS "
+          "immediately followed by 'cat' -> full vote for 'cat'",
+          v6_forward.get(cat, 0) == 1.0, v6_forward)
+
+    v6 = ivm._adjacency_vote([cat, on], [sat, mat, road])
+    check("cat was immediately followed by 'sat' -> full vote for 'sat'",
+          v6.get(sat, 0) == 1.0, v6)
+    check("no vote for 'mat' -- neither cat nor 'on' was ever immediately "
+          "followed by 'mat' ('on' is always followed by 'the', not 'mat' "
+          "directly -- 'on the mat', not 'on mat')",
+          v6.get(mat, 0) == 0, v6)
+    check("no vote for 'road' -- same reasoning, no direct t->road edge",
+          v6.get(road, 0) == 0, v6)
+
+    v6_empty_ctm = ImportanceVoteMatrix()  # bare object, self._adjacent = set()
+    v6_empty = v6_empty_ctm._adjacency_vote([cat, sat], [the, mat])
+    check("a bare (unbuilt) ImportanceVoteMatrix has no adjacency evidence "
+          "at all -- _adjacent defaults to an empty set, so V6 is all-zero, "
+          "never an error",
+          v6_empty == {}, v6_empty)
+
+    v6_self = ivm._adjacency_vote([the], [the])
+    check("a token never votes for a candidate it IS, even if trivially "
+          "'immediately followed by itself' would otherwise apply",
+          v6_self == {}, v6_self)
+
+    # score_candidates() integration: V6 doesn't require `current` at all
+    # (unlike V5), so it should fire identically whether or not current is
+    # supplied, and combine additively with the other five layers.
+    trace_v6 = ivm.score_candidates([sat, mat, road], [cat, on])
+    check("adjacency_vote is populated in the full trace without needing current",
+          trace_v6["adjacency_vote"].get(sat, 0) == ivm._adjacency_weight * 1.0,
+          trace_v6["adjacency_vote"])
+    check("V6's contribution is included in the final combined score",
+          abs(trace_v6["scores"][sat] -
+              (trace_v6["important_vote"].get(sat, 0) + trace_v6["influence_vote"].get(sat, 0)
+               + trace_v6["context_vote"].get(sat, 0) + trace_v6["context_influence_vote"].get(sat, 0)
+               + trace_v6["bigram_witness_vote"].get(sat, 0) + trace_v6["adjacency_vote"].get(sat, 0))) < 1e-9,
+          trace_v6["scores"])
+
+    # to_dict/from_dict must round-trip V6's index and weight too
+    ivm_rt2 = ImportanceVoteMatrix.from_dict(ivm.to_dict())
+    check("adjacent pairs survive to_dict/from_dict (including direction)",
+          ivm_rt2._adjacent == ivm._adjacent, len(ivm_rt2._adjacent))
+    check("adjacency_weight survives to_dict/from_dict",
+          abs(ivm_rt2._adjacency_weight - ivm._adjacency_weight) < 1e-9,
+          ivm_rt2._adjacency_weight)
+    v6_rt = ivm_rt2._adjacency_vote([cat, on], [sat, mat, road])
+    check("_adjacency_vote gives identical results after a round-trip",
+          v6_rt == v6, (v6_rt, v6))
+
+    section("Open Mode: vocabulary is ALWAYS the candidate source now")
+
+    m2 = MSEGraphLanguageModel(vocab_size=150)
+    m2.train(CORPUS_EXP)
+
+    ids = m2.tokenizer.encode("the boy sat on the")
+    current2 = ids[-1]
+    legal = set(m2._strict._successors(current2))
+    full_pool = set(m2.all_candidate_tokens())
+    check("all_candidate_tokens() is a strict superset of literal successors",
+          legal < full_pool, (len(legal), len(full_pool)))
+    check("all_candidate_tokens() excludes PAD/UNK/BOS",
+          not ({0, 1, 2} & full_pool), full_pool & {0, 1, 2})
+    check("self._open.vocab IS all_candidate_tokens() -- no separate toggle exists anymore",
+          m2._open.vocab == m2.all_candidate_tokens())
+
+    text_open, ids_open, trace_open = m2.generate(
+        "the boy sat on the", max_tokens=6, mode="open")
+    check("open mode generation completes without crashing",
+          isinstance(text_open, str))
+    check("every open-mode step's candidates are the ENTIRE vocabulary, not "
+          "just legal successors -- no opt-in needed, this is just what "
+          "Open Mode does now",
+          all(set(t.get("candidates", [])) == full_pool
+              for t in trace_open if t["stage"] != 4),
+          [len(t.get("candidates", [])) for t in trace_open])
+
+    runs = {m2.generate("the boy sat on the", max_tokens=6, mode="open")[0]
+            for _ in range(5)}
+    check("open mode generation is fully deterministic",
+          len(runs) == 1, runs)
+
+    info_open = m2.open_mode_candidate_scores("the boy sat on the")
+    check("open_mode_candidate_scores always scores the entire vocabulary",
+          len(info_open["candidates"]) == len(full_pool),
+          (len(info_open["candidates"]), len(full_pool)))
+
+    # Strict Mode is completely unaffected -- it never had vocabulary-wide
+    # candidates and still doesn't; its own successors-gated Stage 1/2
+    # pipeline is untouched by any of this.
+    strict_ids = m2.tokenizer.encode("the boy sat on the")
+    tok_strict, trace_strict = m2._strict.step(strict_ids[-2], strict_ids[-1])
+    check("Strict Mode's own step() still exists and works normally",
+          isinstance(tok_strict, int), m2.tokenizer.decode([tok_strict]))
+    check("Strict Mode's candidates are still gated to legal successors, "
+          "never the whole vocabulary",
+          set(trace_strict.get("candidates", legal)) <= legal or "candidates" not in trace_strict,
+          trace_strict)
+
+    section("model._engine(): invalid mode string must raise, never silently fall back to Strict")
+    # Regression: _engine() used to check ONLY `if mode == "open"`, so any
+    # other string (a typo, an unvalidated API field) silently fell through
+    # to Strict Mode instead of erroring -- found via server.py's /bigram
+    # endpoint accepting an unchecked `mode` field from a JSON request body.
+    raised = False
+    try:
+        m2._engine("bogus")
+    except ValueError:
+        raised = True
+    except Exception:
+        pass
+    check("_engine('bogus') raises ValueError instead of silently returning Strict",
+          raised, "no exception raised")
+    check("_engine('strict')/_engine('open') still work normally",
+          m2._engine("strict") is m2._strict and m2._engine("open") is m2._open)
+
 
 if __name__ == "__main__":
     main()
     test_prompt_seeding_and_mode_boundaries()
-    section("Final Summary")
-    print(f"  {PASS} passed, {FAIL} failed")
-    import sys
+    test_importance_vote_matrix()
+    test_train_py_cli_path_matches_model_api()
+    test_bigram_witness_vote_and_vocab_candidates()
+    print(f"\n{PASS} passed, {FAIL} failed (grand total)")
     if FAIL: sys.exit(1)

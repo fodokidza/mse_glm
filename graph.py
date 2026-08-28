@@ -12,28 +12,39 @@ from collections import defaultdict
 
 
 class EdgeMatrix:
-    """Deduplicated bigram edge list, CSR-indexed by source token."""
+    """
+    Deduplicated bigram edge list, CSR-indexed by source token. Also
+    tracks `count` -- how many times each (src, dst) pair literally
+    occurred consecutively across training sequences ("bigram
+    frequency") -- kept parallel to src/dst, one count per unique
+    pair (not per occurrence): the src/dst rows themselves stay
+    deduplicated for legality lookups (successors()); count is purely
+    additional weight for tie-breaking (see frequency()).
+    """
 
     def __init__(self):
         self.src = array("i")
         self.dst = array("i")
+        self.count = array("i")
         self.index = array("i")  # size vocab+1
         self._vocab_size = 0
 
     def build(self, sequences, vocab_size: int):
         self._vocab_size = vocab_size
-        seen = set()
-        pairs = []
+        counts = {}
+        order = []
         for seq in sequences:
             for i in range(len(seq) - 1):
                 pair = (seq[i], seq[i + 1])
-                if pair not in seen:
-                    seen.add(pair)
-                    pairs.append(pair)
-        pairs.sort(key=lambda p: p[0])
+                if pair not in counts:
+                    counts[pair] = 0
+                    order.append(pair)
+                counts[pair] += 1
+        order.sort(key=lambda p: p[0])
 
-        self.src = array("i", [p[0] for p in pairs])
-        self.dst = array("i", [p[1] for p in pairs])
+        self.src = array("i", [p[0] for p in order])
+        self.dst = array("i", [p[1] for p in order])
+        self.count = array("i", [counts[p] for p in order])
         self.index = array("i", [0] * (vocab_size + 1))
         for s in self.src:
             self.index[s + 1] += 1
@@ -46,9 +57,24 @@ class EdgeMatrix:
         start, end = self.index[token], self.index[token + 1]
         return list(self.dst[start:end])
 
+    def frequency(self, token: int, candidate: int):
+        """
+        Bigram frequency: how many times `candidate` literally
+        followed `token` consecutively across training sequences.
+        0 if the pair never occurred (including illegal pairs).
+        """
+        if token < 0 or token + 1 >= len(self.index):
+            return 0
+        start, end = self.index[token], self.index[token + 1]
+        for i in range(start, end):
+            if self.dst[i] == candidate:
+                return self.count[i]
+        return 0
+
     def to_dict(self):
         return {
             "src": list(self.src), "dst": list(self.dst),
+            "count": list(self.count),
             "index": list(self.index), "vocab_size": self._vocab_size,
         }
 
@@ -57,6 +83,10 @@ class EdgeMatrix:
         m = cls()
         m.src = array("i", d["src"])
         m.dst = array("i", d["dst"])
+        # Older saved models were written before bigram counts existed;
+        # default every pair to a count of 1 so frequency() degrades to
+        # "did this pair ever occur" rather than crashing on load.
+        m.count = array("i", d.get("count", [1] * len(d["src"])))
         m.index = array("i", d["index"])
         m._vocab_size = d["vocab_size"]
         return m

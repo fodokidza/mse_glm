@@ -57,14 +57,11 @@ from model import MSEGraphLanguageModel
 
 model = MSEGraphLanguageModel.load(MODEL_PATH)
 
-OPEN_AVAILABLE = model.exp_bridges is not None
-if DEFAULT_MODE == 'open' and not OPEN_AVAILABLE:
-    print("  \u26a0  Open Mode requested but no Experience Matrices "
-          "found in this model folder.")
-    print("     Run: python3 build_experience.py --model "
-          f"{MODEL_PATH}")
-    print("     Falling back to Strict Mode until that's done.")
-    DEFAULT_MODE = 'strict'
+# Open Mode has no separate "build" step -- it's automatically ready
+# as soon as the model is trained or loaded (see model.py's
+# _rebuild_open_engine()). This check is a defensive sanity check,
+# not a "was it built yet" gate the way it used to be.
+OPEN_AVAILABLE = model._open is not None
 
 USE_CTM = False
 if args.ctm:
@@ -98,14 +95,26 @@ print(f"  Open Mode:     {'available' if OPEN_AVAILABLE else 'not built'}\n")
 # injected "### System: you are a helpful assistant..." prefix
 # would almost never survive that check. So instead of personas,
 # sessions choose an inference MODE — the one dial MSE-GLM actually
-# exposes, and the one that determines whether an answer is
-# "grounded" (Strict) or "inferred" (Open).
+# exposes: Strict Mode gates every step to literal training bigrams
+# (a two-stage lineage vote, tie-broken deterministically); Open Mode
+# has no successor gating at all -- candidates are the ENTIRE
+# vocabulary every step, chosen by IVM's six-layer weighted voting
+# (see ivm.py) rather than by whether a bigram was ever literally
+# observed.
 
 MODE_PRESETS = {
     'strict':   {'mode': 'strict', 'ctm': False},
     'open':     {'mode': 'open',   'ctm': False},
     'open_ctm': {'mode': 'open',   'ctm': True},
 }
+
+# Two OPTIONAL, read-only diagnostic endpoints sit alongside the mode
+# presets above -- neither mutates session state:
+#   /scores, /bigram (new routes below) -- read-only audit endpoints,
+#       not generation. /scores exposes the full V1-V6 weighted-vote
+#       breakdown IVM used to pick the next token (see ivm.py);
+#       /bigram exposes the raw evidence counts (including V5's
+#       literal witness-sentence count) for one (prev, curr) pair.
 
 # ============================================================
 # SESSION MANAGEMENT
@@ -1486,12 +1495,87 @@ def mode_route():
     if not ok:
         return jsonify({
             'status': 'error',
-            'error' : 'Open Mode requires Experience Matrices — '
-                       'run build_experience.py first.'
-                       if mode_key != 'strict' and not OPEN_AVAILABLE
-                       else 'unknown mode',
+            'error' : 'unknown mode',
         }), 200
     return jsonify({'status': 'ok', 'mode': mode_key})
+
+
+@app.route('/scores', methods=['POST'])
+def scores():
+    """
+    Open Mode only, read-only, stateless (no session_id, no history
+    mutation) -- the full V1-V6 weighted-vote breakdown IVM used (or
+    would use) to pick the next token for `prompt` (see ivm.py's
+    score_candidates()/select()). Mirrors chat.py's /scores REPL
+    command and analyse.py's `open-scores` CLI subcommand.
+
+    Body: {"prompt": "..."}
+    Always scores the entire vocabulary -- Open Mode has no successor
+    gating at all, so there is no narrower option anymore.
+
+    "scores" is the FINAL combined score -- the sum of ALL SIX
+    layers (important_vote/influence_vote/context_vote/
+    context_influence_vote/bigram_witness_vote/adjacency_vote), each
+    also returned separately so the breakdown stays auditable. Don't
+    expect the first four to sum to "scores" on their own --
+    bigram_witness_vote (V5) and adjacency_vote (V6) are usually the
+    largest single contributors: V5 whenever the exact bigram was
+    literally seen in training, V6 whenever the context token was
+    ever directly, immediately followed by the candidate (directional
+    -- token->candidate only, a weaker but still bigram-level fact).
+    """
+    try:
+        data = request.get_json()
+        prompt = data.get('prompt', '').strip()
+        if not prompt:
+            return jsonify({'error': 'prompt required'}), 400
+        if not OPEN_AVAILABLE:
+            return jsonify({'error': 'Model has not been trained or loaded.'}), 409
+        result = model.open_mode_candidate_scores(prompt)
+        return jsonify({'status': 'ok', **result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/bigram', methods=['POST'])
+def bigram():
+    """
+    Read-only, stateless -- raw bigram evidence for one (prev, curr)
+    pair: literal training-count, the total Strict Mode's tie-break
+    and Open Mode's first tie-break cascade stage both use (see
+    inference.py's _bigram_frequency), plus "witness_sentences": how
+    many distinct literal training sentences actually contained this
+    bigram as a consecutive pair -- the evidence set V5's
+    bigram-witness vote checks context tokens against (see ivm.py's
+    bigram_relationships()). Mirrors chat.py's
+    /bigram REPL command and analyse.py's `bigram` CLI subcommand.
+
+    Body: {"prev": "the", "curr": "mat", "mode": "strict"}
+    """
+    try:
+        data = request.get_json()
+        prev_word = data.get('prev', '').strip()
+        curr_word = data.get('curr', '').strip()
+        mode = data.get('mode', 'strict')
+        if not prev_word or not curr_word:
+            return jsonify({'error': 'prev and curr required'}), 400
+        engine = model._engine(mode)
+        prev_id = tokenizer.encode(prev_word)[-1]
+        curr_id = tokenizer.encode(curr_word)[-1]
+        training = model.edges.frequency(prev_id, curr_id)
+        witnesses = model.bigram_witness_sentences(prev_id, curr_id)
+        return jsonify({
+            'status': 'ok', 'prev': prev_word, 'curr': curr_word,
+            'training': training,
+            'total': engine._bigram_frequency(prev_id, curr_id),
+            'witness_sentences': len(witnesses),
+        })
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 409
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/reset', methods=['POST'])
@@ -1509,6 +1593,7 @@ def health():
         'status'       : 'ok',
         'default_mode' : DEFAULT_MODE,
         'open_available': OPEN_AVAILABLE,
+        'ivm_available' : model.open_ctm is not None,
         'ctm_enabled'  : USE_CTM,
         'vocabulary'   : _stats['vocab_size'],
         'edges'        : _stats['edges'],
@@ -1549,6 +1634,8 @@ if __name__ == '__main__':
     print(f"    POST /generate")
     print(f"    POST /stream")
     print(f"    POST /mode")
+    print(f"    POST /scores   (Open Mode only -- full V1-V6 breakdown for a prompt)")
+    print(f"    POST /bigram   (raw bigram evidence incl. V5 witness_sentences)")
     print(f"    POST /reset")
     print(f"\n  Flags:")
     print(f"    --model PATH  saved MSE-GLM model folder (default: mse_model)")
