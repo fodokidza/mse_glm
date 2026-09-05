@@ -70,7 +70,7 @@ Honesty notes
 
 from collections import Counter, defaultdict
 
-RESERVED = {0, 1, 2, 3}  # <PAD>, <UNK>, <BOS>, <EOS>
+from config import RESERVED, CTMConfig
 
 
 def token_to_relationships(model):
@@ -170,7 +170,7 @@ def _all_cluster_ids(model, mode):
     return seen
 
 
-def build_context_trigger_matrix(model, min_support=1, mode="strict"):
+def build_context_trigger_matrix(model, min_support=CTMConfig.MIN_SUPPORT, mode="strict"):
     """
     Flat table across every non-zero cluster (see _all_cluster_ids --
     `mode` is accepted for call-site compatibility but no longer
@@ -213,7 +213,7 @@ class ContextTriggerMatrix:
         self._axis = {}       # cluster_id -> "bridge"|"target"
 
     @classmethod
-    def build(cls, model, mode="strict", min_support=1):
+    def build(cls, model, mode="strict", min_support=CTMConfig.MIN_SUPPORT):
         ctm = cls()
         seen = _all_cluster_ids(model, mode)
         token_rels = token_to_relationships(model)

@@ -22,6 +22,7 @@ from collections import Counter
 
 from model import MSEGraphLanguageModel
 from tokenizer import normalize, split_sentences
+from config import InterpretConfig, CTMConfig
 
 
 # =============================================================================
@@ -178,7 +179,7 @@ class Analyser:
         }
 
     # ------------------------------------------------------- interpretation
-    def cluster_interpretation(self, cluster_id: int, top_n: int = 5, mode: str = "strict") -> dict:
+    def cluster_interpretation(self, cluster_id: int, top_n: int = InterpretConfig.TOP_N, mode: str = "strict") -> dict:
         """
         Propose a human-readable label for a cluster (e.g. {cat, dog, pig}
         -> "animal"), derived purely from structure already in the trained
@@ -189,13 +190,13 @@ class Analyser:
         """
         return self.model.interpret_cluster(cluster_id, top_n=top_n, mode=mode)
 
-    def interpretation_report(self, min_coverage: float = 0.5, max_per_cluster: int = 3,
+    def interpretation_report(self, min_coverage: float = InterpretConfig.MIN_COVERAGE, max_per_cluster: int = InterpretConfig.MAX_PER_CLUSTER,
                                mode: str = "strict") -> list:
         """Every candidate clearing min_coverage per cluster (not just one)."""
         return self.model.interpret_all_clusters(
             min_coverage=min_coverage, max_per_cluster=max_per_cluster, mode=mode)
 
-    def interpreter_matrix(self, min_coverage: float = 0.5, min_signals: int = 2,
+    def interpreter_matrix(self, min_coverage: float = InterpretConfig.MIN_COVERAGE, min_signals: int = InterpretConfig.MIN_SIGNALS,
                             max_per_cluster: int = None, mode: str = "strict") -> list:
         """
         The filtered Cluster Interpreter Matrix -- coverage AND a minimum
@@ -210,7 +211,7 @@ class Analyser:
             min_coverage=min_coverage, min_signals=min_signals,
             max_per_cluster=max_per_cluster, mode=mode)
 
-    def zero_cluster_groups(self, min_group_size: int = 2, mode: str = "strict") -> list:
+    def zero_cluster_groups(self, min_group_size: int = InterpretConfig.MIN_GROUP_SIZE, mode: str = "strict") -> list:
         """
         Mine cluster_id==0 for the "third axis" the standard dual-axis
         rule never implements (fix bridge+target, source varies). Finds
@@ -221,7 +222,7 @@ class Analyser:
         return self.model.discover_zero_cluster_groups(
             min_group_size=min_group_size, mode=mode)
 
-    def context_trigger_matrix(self, min_support: int = 1, mode: str = "strict") -> list:
+    def context_trigger_matrix(self, min_support: int = CTMConfig.MIN_SUPPORT, mode: str = "strict") -> list:
         """
         Flat Context Trigger Matrix table: which surrounding tokens
         (from whole-sentence co-occurrence) support which cluster
@@ -250,7 +251,7 @@ class Analyser:
         inference.py's _bigram_tie_break.
 
         Open Mode's rule is almost always 'ctm_weighted_vote' (the
-        V1-V6 primary selection scored the full legal candidate set,
+        V1-V7 primary selection scored the full legal candidate set,
         with its own internal bigram/global-frequency tie-break
         cascade if the score itself ties -- see ivm.py's select()).
         'ctm_unavailable_deterministic_fallback' only appears if no
@@ -276,22 +277,26 @@ class Analyser:
 
     def open_mode_scores(self, prompt: str) -> dict:
         """
-        Full auditable V1-V6 score breakdown for the NEXT token given
+        Full auditable V1-V7 score breakdown for the NEXT token given
         `prompt`, under Open Mode's primary selection mechanism (see
         ivm.py's score_candidates()/select()): which tokens are
-        important, their influence (breadth), what each of the SIX
+        important, their influence (breadth), what each of the SEVEN
         layers (important vote / influence vote / context vote /
         context-influence vote / bigram-witness vote / adjacency
-        vote) contributed per candidate, the final combined score,
-        and -- critically -- which stage actually decided the winner
-        ("score", "bigram_frequency", "global_frequency", or
-        "lowest_token_id"). The final "score" is the sum of all six
-        layers, including bigram_witness_vote (V5) and adjacency_vote
-        (V6) -- don't add up just the other four expecting it to
-        match; V5/V6 are usually the largest single contributors
-        (V5 when the exact bigram was literally witnessed, V6 when
-        the context token was ever directly, immediately followed by
-        the candidate -- directional, token->candidate only).
+        vote / prev+current co-occurrence vote) contributed per
+        candidate, the final combined score, and -- critically --
+        which stage actually decided the winner ("score",
+        "bigram_frequency", "global_frequency", or "lowest_token_id").
+        The final "score" is the sum of all seven layers, including
+        bigram_witness_vote (V5), adjacency_vote (V6), and
+        prev_current_vote (V7) -- don't add up just the other four
+        expecting it to match; V5/V6/V7 are usually the largest single
+        contributors (V5 when the exact bigram was literally
+        witnessed, V6 when the context token was ever directly,
+        immediately followed by the candidate -- directional,
+        token->candidate only -- V7 when the prompt's last two tokens
+        and the candidate ever all three shared one training sentence
+        together).
         Requires Open Mode to be available (model trained/loaded).
         Returns None otherwise.
 
@@ -299,6 +304,38 @@ class Analyser:
         no successor gating at all, so there is no narrower option.
         """
         return self.model.open_mode_candidate_scores(prompt)
+
+    def cache_control(self, action: str = "status") -> dict:
+        """
+        Toggle or inspect model.open_ctm's opt-in sparse per-token
+        score cache (V1/V2/V3/V4/V6 only -- V5/V7 always stay live,
+        see ivm.py's build_cache()). `action`:
+          "on"     -- (re)build the cache for the full vocabulary
+                      (model.all_candidate_tokens()) and enable it
+          "off"    -- disable it (built data is kept, so "on" again
+                      later doesn't have to rebuild)
+          "status" -- just report the current state (default)
+        Returns {"enabled": bool, "token_rows": int, "entries": int}.
+        Requires Open Mode to be available; raises RuntimeError
+        otherwise (this is a mutating/inspection call, not a report --
+        unlike the read-only methods above, silently returning None
+        would hide a real usage error).
+        """
+        if self.model.open_ctm is None:
+            raise RuntimeError("Open Mode isn't ready (model not trained/loaded)")
+        ivm = self.model.open_ctm
+        if action == "on":
+            ivm.enable_cache(self.model.all_candidate_tokens())
+        elif action == "off":
+            ivm.disable_cache()
+        elif action != "status":
+            raise ValueError(f"cache_control: unknown action {action!r} "
+                              "(expected 'on', 'off', or 'status')")
+        return {
+            "enabled": ivm._use_cache,
+            "token_rows": len(ivm._token_cache),
+            "entries": sum(len(row) for row in ivm._token_cache.values()),
+        }
 
     def bigram_frequency(self, prev_word: str, curr_word: str, mode: str = "strict") -> dict:
         """
@@ -410,27 +447,27 @@ def main():
 
     p = sub.add_parser("interpret", help="Propose a human-readable label for one cluster_id")
     p.add_argument("cluster_id", type=int)
-    p.add_argument("--top", type=int, default=5)
+    p.add_argument("--top", type=int, default=InterpretConfig.TOP_N)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("interpretations", help="Every qualifying label per cluster (unfiltered)")
-    p.add_argument("--min-coverage", type=float, default=0.5)
-    p.add_argument("--max-per-cluster", type=int, default=3)
+    p.add_argument("--min-coverage", type=float, default=InterpretConfig.MIN_COVERAGE)
+    p.add_argument("--max-per-cluster", type=int, default=InterpretConfig.MAX_PER_CLUSTER)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("interpreter-matrix",
                         help="Filtered CI Matrix (coverage + corroborating evidence required); "
                              "a cluster may carry multiple labels. "
                              "Pipe with --json > interpreter_matrix.json to persist it.")
-    p.add_argument("--min-coverage", type=float, default=0.5)
-    p.add_argument("--min-signals", type=int, default=2)
+    p.add_argument("--min-coverage", type=float, default=InterpretConfig.MIN_COVERAGE)
+    p.add_argument("--min-signals", type=int, default=InterpretConfig.MIN_SIGNALS)
     p.add_argument("--max-per-cluster", type=int, default=None)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("zero-cluster",
                         help="Mine cluster_id==0 for groups the standard dual-axis rule "
                              "never assigns a cluster_id to (fix bridge+target, source varies)")
-    p.add_argument("--min-group-size", type=int, default=2)
+    p.add_argument("--min-group-size", type=int, default=InterpretConfig.MIN_GROUP_SIZE)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("context-triggers",
@@ -439,7 +476,7 @@ def main():
                              "disambiguation. Display/analysis only -- does not build/cache "
                              "model.ctm (needed for generate(use_context_triggers=True)); "
                              "that's a Python-API-only call: model.build_context_triggers().")
-    p.add_argument("--min-support", type=int, default=1)
+    p.add_argument("--min-support", type=int, default=CTMConfig.MIN_SUPPORT)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("trace", help="Step-by-step generation trace for a prompt")
@@ -448,16 +485,31 @@ def main():
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("open-scores",
-                        help="Open Mode only: full V1-V6 weighted-vote breakdown "
+                        help="Open Mode only: full V1-V7 weighted-vote breakdown "
                              "for the next token given a prompt -- important tokens, "
                              "influence, per-layer contributions (including V5's "
-                             "bigram-witness vote and V6's adjacency vote), the final "
+                             "bigram-witness vote, V6's adjacency vote, and V7's "
+                             "prev+current co-occurrence vote), the final "
                              "score, and which tie-break stage (if any) decided the winner. "
                              "This is Open Mode's PRIMARY selection mechanism, not a "
                              "tie-breaker; use this to audit why it picked what it picked. "
                              "Always scores the entire vocabulary -- Open Mode has no "
                              "successor gating at all.")
     p.add_argument("prompt")
+    p.add_argument("--cache", action="store_true",
+                    help="Enable the sparse V1/V2/V3/V4/V6 score cache "
+                         "(model.open_ctm) before scoring -- same numbers "
+                         "either way, this just times/labels which path ran "
+                         "(see the printed 'cache: on/off' line and the "
+                         "cache_used field in --json output).")
+
+    p = sub.add_parser("cache",
+                        help="Toggle or inspect model.open_ctm's opt-in sparse "
+                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7 "
+                             "always stay live). Same scores either way; this is "
+                             "purely a speed optimization -- see benchmark_cache.py "
+                             "to actually measure the difference.")
+    p.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
 
     p = sub.add_parser("bigram",
                         help="Raw bigram frequency for one (prev, curr) pair -- the "
@@ -630,6 +682,8 @@ def main():
         ))
 
     elif args.command == "open-scores":
+        if args.cache:
+            analyser.cache_control("on")
         result = analyser.open_mode_scores(args.prompt)
         if result is None:
             print("Open Mode isn't ready (model not trained/loaded)", file=sys.stderr)
@@ -644,13 +698,28 @@ def main():
                   round(r["context_influence_vote"].get(c, 0), 2),
                   round(r["bigram_witness_vote"].get(c, 0), 2),
                   round(r["adjacency_vote"].get(c, 0), 2),
+                  round(r["prev_current_vote"].get(c, 0), 2),
                   round(r["scores"][c], 2),
                   "<- winner" if c == r["winner"] else "")
                  for c in sorted(r["scores"], key=r["scores"].get, reverse=True)],
                 ["candidate", "V1 (important)", "V2 (influence)", "V3 (context)",
-                 "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)", "score", ""],
+                 "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)",
+                 "V7 (prev+curr)", "score", ""],
             ),
-            print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']})"),
+            print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']}"
+                  f"  ·  cache: {'on' if r['cache_used'] else 'off'})"),
+        ))
+
+    elif args.command == "cache":
+        try:
+            result = analyser.cache_control(args.action)
+        except RuntimeError as e:
+            print(e, file=sys.stderr)
+            sys.exit(1)
+        _emit(result, args.json, lambda r: print(
+            f"  cache: {'ON' if r['enabled'] else 'OFF'}  "
+            f"({r['token_rows']} token rows, {r['entries']} (t,c) entries"
+            f"{' -- none built yet' if not r['token_rows'] else ''})"
         ))
 
     elif args.command == "bigram":

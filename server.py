@@ -5,6 +5,7 @@ import time
 import argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config import ServerConfig, GenerationConfig
 from flask import (
     Flask, request, jsonify,
     render_template_string,
@@ -17,8 +18,10 @@ from flask import (
 # MSE-GLM has no checkpoints to select between (no --finetuned /
 # --rlhf here — there are no learned weights of any kind). The only
 # real choices are: which saved model folder to load, which
-# inference mode to default to, and whether to build the (optional,
-# opt-in) Context Trigger Matrix for tie-break disambiguation.
+# inference mode to default to, whether to build the (optional,
+# opt-in) Context Trigger Matrix for tie-break disambiguation, and
+# whether to build+enable Open Mode's (also optional, opt-in) sparse
+# per-token score cache.
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='mse_model',
@@ -29,7 +32,12 @@ parser.add_argument('--mode',  default='strict',
 parser.add_argument('--ctm',   action='store_true',
                      help='Build the Context Trigger Matrix at startup '
                           'and use it for tie-break disambiguation')
-parser.add_argument('--port',  type=int, default=5000)
+parser.add_argument('--cache', action='store_true',
+                     help='Build and enable Open Mode\'s sparse '
+                          'V1/V2/V3/V4/V6 score cache at startup '
+                          '(see ivm.py) -- same scores either way, '
+                          'purely a speed optimization')
+parser.add_argument('--port',  type=int, default=ServerConfig.DEFAULT_PORT)
 args = parser.parse_args()
 
 MODEL_PATH    = args.model
@@ -70,6 +78,15 @@ if args.ctm:
     USE_CTM = True
     print("  Context Trigger Matrix ready.")
 
+if args.cache:
+    if OPEN_AVAILABLE:
+        print("  Building Open Mode's sparse score cache ...")
+        model.open_ctm.enable_cache(model.all_candidate_tokens())
+        print(f"  Cache ready ({len(model.open_ctm._token_cache)} token rows, "
+              f"{sum(len(r) for r in model.open_ctm._token_cache.values())} entries).")
+    else:
+        print("  --cache requested but Open Mode isn't available -- skipped.")
+
 tokenizer = model.tokenizer
 vocab_words = [
     w for w in tokenizer.token_to_id.keys()
@@ -98,7 +115,7 @@ print(f"  Open Mode:     {'available' if OPEN_AVAILABLE else 'not built'}\n")
 # exposes: Strict Mode gates every step to literal training bigrams
 # (a two-stage lineage vote, tie-broken deterministically); Open Mode
 # has no successor gating at all -- candidates are the ENTIRE
-# vocabulary every step, chosen by IVM's six-layer weighted voting
+# vocabulary every step, chosen by IVM's seven-layer weighted voting
 # (see ivm.py) rather than by whether a bigram was ever literally
 # observed.
 
@@ -111,10 +128,15 @@ MODE_PRESETS = {
 # Two OPTIONAL, read-only diagnostic endpoints sit alongside the mode
 # presets above -- neither mutates session state:
 #   /scores, /bigram (new routes below) -- read-only audit endpoints,
-#       not generation. /scores exposes the full V1-V6 weighted-vote
+#       not generation. /scores exposes the full V1-V7 weighted-vote
 #       breakdown IVM used to pick the next token (see ivm.py);
 #       /bigram exposes the raw evidence counts (including V5's
 #       literal witness-sentence count) for one (prev, curr) pair.
+# /cache is different from those two -- it's server-wide MUTATING
+# state (there's only one shared model.open_ctm, not one per
+# session), toggling whether V1/V2/V3/V4/V6 come from a precomputed
+# cache or are recomputed live. Same scores either way; purely a
+# speed optimization an operator opts into, not a session preference.
 
 # ============================================================
 # SESSION MANAGEMENT
@@ -235,7 +257,7 @@ def stream_tokens(prompt, max_new=100, mode='strict', use_ctm=False):
 # ============================================================
 
 _req_counts = {}
-RATE_LIMIT  = 30
+RATE_LIMIT  = ServerConfig.RATE_LIMIT_PER_MINUTE
 
 
 def check_rate_limit(ip):
@@ -1402,7 +1424,7 @@ def generate():
         data       = request.get_json()
         user_msg   = data.get('prompt', '').strip()
         session_id = data.get('session_id', 'default')
-        max_tokens = int(data.get('max_tokens', 80))
+        max_tokens = int(data.get('max_tokens', GenerationConfig.SERVER_DEFAULT_MAX_TOKENS))
 
         if not user_msg:
             return jsonify({'error': 'prompt required'}), 400
@@ -1438,7 +1460,7 @@ def stream():
         data       = request.get_json()
         user_msg   = data.get('prompt', '').strip()
         session_id = data.get('session_id', 'default')
-        max_tokens = int(data.get('max_tokens', 80))
+        max_tokens = int(data.get('max_tokens', GenerationConfig.SERVER_DEFAULT_MAX_TOKENS))
 
         if not user_msg:
             return jsonify({'error': 'prompt required'}), 400
@@ -1504,7 +1526,7 @@ def mode_route():
 def scores():
     """
     Open Mode only, read-only, stateless (no session_id, no history
-    mutation) -- the full V1-V6 weighted-vote breakdown IVM used (or
+    mutation) -- the full V1-V7 weighted-vote breakdown IVM used (or
     would use) to pick the next token for `prompt` (see ivm.py's
     score_candidates()/select()). Mirrors chat.py's /scores REPL
     command and analyse.py's `open-scores` CLI subcommand.
@@ -1513,16 +1535,25 @@ def scores():
     Always scores the entire vocabulary -- Open Mode has no successor
     gating at all, so there is no narrower option anymore.
 
-    "scores" is the FINAL combined score -- the sum of ALL SIX
+    "scores" is the FINAL combined score -- the sum of ALL SEVEN
     layers (important_vote/influence_vote/context_vote/
-    context_influence_vote/bigram_witness_vote/adjacency_vote), each
-    also returned separately so the breakdown stays auditable. Don't
-    expect the first four to sum to "scores" on their own --
-    bigram_witness_vote (V5) and adjacency_vote (V6) are usually the
-    largest single contributors: V5 whenever the exact bigram was
-    literally seen in training, V6 whenever the context token was
-    ever directly, immediately followed by the candidate (directional
-    -- token->candidate only, a weaker but still bigram-level fact).
+    context_influence_vote/bigram_witness_vote/adjacency_vote/
+    prev_current_vote), each also returned separately so the
+    breakdown stays auditable. Don't expect the first four to sum to
+    "scores" on their own -- bigram_witness_vote (V5), adjacency_vote
+    (V6), and prev_current_vote (V7) are usually the largest single
+    contributors: V5 whenever the exact bigram was literally seen in
+    training, V6 whenever the context token was ever directly,
+    immediately followed by the candidate (directional -- token->
+    candidate only), V7 whenever the prompt's last two tokens and the
+    candidate ever all three shared one training sentence together
+    (no adjacency required, but requires BOTH of the last two tokens,
+    not just one).
+
+    "cache_used" reports whether this breakdown was actually served
+    from Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see
+    ivm.py's build_cache()) or computed live -- same numbers either
+    way, see /cache below to toggle it server-wide.
     """
     try:
         data = request.get_json()
@@ -1578,6 +1609,44 @@ def bigram():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/cache', methods=['POST'])
+def cache_route():
+    """
+    Toggle or inspect Open Mode's opt-in sparse per-token score cache
+    (V1/V2/V3/V4/V6 only -- V5/V7 always stay live, see ivm.py's
+    build_cache()). Server-wide, not per-session -- there is only one
+    `model.open_ctm`, shared across every session. Read-only for
+    "status"; "on"/"off" mutate server-wide state, so this is a
+    deliberate operator action, not something a session switches on
+    its own. Mirrors chat.py's /cache and analyse.py's `cache`
+    subcommand.
+
+    Body: {"action": "on" | "off" | "status"}  (default "status")
+    Returns {"status": "ok", "enabled": bool, "token_rows": int,
+             "entries": int}.
+    """
+    try:
+        if not OPEN_AVAILABLE:
+            return jsonify({'error': 'Model has not been trained or loaded.'}), 409
+        data = request.get_json(silent=True) or {}
+        action = data.get('action', 'status')
+        if action == 'on':
+            model.open_ctm.enable_cache(model.all_candidate_tokens())
+        elif action == 'off':
+            model.open_ctm.disable_cache()
+        elif action != 'status':
+            return jsonify({'error': f"unknown action {action!r} "
+                                      "(expected 'on', 'off', or 'status')"}), 400
+        return jsonify({
+            'status'    : 'ok',
+            'enabled'   : model.open_ctm._use_cache,
+            'token_rows': len(model.open_ctm._token_cache),
+            'entries'   : sum(len(r) for r in model.open_ctm._token_cache.values()),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/reset', methods=['POST'])
 def reset():
     data       = request.get_json()
@@ -1595,6 +1664,7 @@ def health():
         'open_available': OPEN_AVAILABLE,
         'ivm_available' : model.open_ctm is not None,
         'ctm_enabled'  : USE_CTM,
+        'cache_enabled': model.open_ctm._use_cache if OPEN_AVAILABLE else False,
         'vocabulary'   : _stats['vocab_size'],
         'edges'        : _stats['edges'],
         'bridges'      : _stats['bridges'],
@@ -1634,13 +1704,15 @@ if __name__ == '__main__':
     print(f"    POST /generate")
     print(f"    POST /stream")
     print(f"    POST /mode")
-    print(f"    POST /scores   (Open Mode only -- full V1-V6 breakdown for a prompt)")
+    print(f"    POST /scores   (Open Mode only -- full V1-V7 breakdown for a prompt)")
     print(f"    POST /bigram   (raw bigram evidence incl. V5 witness_sentences)")
+    print(f"    POST /cache    (toggle/inspect the sparse V1/V2/V3/V4/V6 score cache)")
     print(f"    POST /reset")
     print(f"\n  Flags:")
     print(f"    --model PATH  saved MSE-GLM model folder (default: mse_model)")
     print(f"    --mode  M     default inference mode: strict | open")
     print(f"    --ctm         build the Context Trigger Matrix at startup")
+    print(f"    --cache       build + enable the sparse score cache at startup")
     print(f"    --port N      custom port")
     print(f"\n  CTRL+C to stop")
     print(f"{'='*60}\n")

@@ -48,7 +48,7 @@ narrowed by whether a bigram was ever literally observed. EVERY
 candidate is scored — via `importance_votes.select()` (ivm.py's
 PRIMARY, not legacy, API) — using cluster-membership-derived
 "important" context tokens plus five other independent vote layers
-(V1-V6, see ivm.py), and the highest scorer wins. This is deterministic
+(V1-V7, see ivm.py), and the highest scorer wins. This is deterministic
 by construction (ties broken by lowest token id inside select()); if no
 importance_votes object is supplied, or `self.vocab` is empty, the
 fallback is ALSO deterministic — lowest token id in `self.vocab` — never
@@ -58,6 +58,7 @@ rationale.
 
 from collections import Counter
 from tokenizer import EOS
+from config import GenerationConfig
 
 class InferenceEngine:
     """
@@ -218,19 +219,21 @@ class InferenceEngine:
             return None
         return importance_votes.resolve_tie(tied_candidates, context_tokens)
 
-    def _open_mode_step(self, current, candidates, context_tokens, importance_votes, active_rels):
+    def _open_mode_step(self, previous, current, candidates, context_tokens, importance_votes, active_rels):
         """
         OPEN MODE primary candidate selection. `candidates` is
         `self.vocab` — the ENTIRE vocabulary, not gated by whether a
         bigram was ever literally observed — every one of them is
         scored here, this is not a tie-break inserted after some
         other mechanism narrows things down. See ivm.py's
-        select()/score_candidates() for the six-layer weighted-voting
-        formula (V1-V6; V1/V2/V4 deliberately weighted small so they
-        can only nudge a tie V3 left open, never override it; V5/V6
-        peer-weighted with V3) and for the bigram-frequency →
+        select()/score_candidates() for the seven-layer weighted-
+        voting formula (V1-V7; V1/V2/V4 deliberately weighted small
+        so they can only nudge a tie V3 left open, never override it;
+        V5/V6/V7 peer-weighted with V3) and for the bigram-frequency →
         global-frequency → lowest-token-id tie-break cascade `current`
-        feeds into.
+        feeds into. `previous` is forwarded too now, purely for V7
+        (the previous+current co-occurrence vote) -- it plays no role
+        in the tie-break cascade itself, only `current` does.
 
         Deterministic, always: select() itself resolves any residual
         tie all the way down to lowest token id internally, so this
@@ -251,7 +254,8 @@ class InferenceEngine:
         Open Mode's decision.
         """
         if importance_votes is not None:
-            winner, trace = importance_votes.select(candidates, context_tokens, current=current)
+            winner, trace = importance_votes.select(candidates, context_tokens,
+                                                      current=current, previous=previous)
             if winner is not None:
                 return winner, {"stage": 1, "rule": "ctm_weighted_vote",
                                  "chosen": winner, "active_rels": active_rels,
@@ -277,7 +281,7 @@ class InferenceEngine:
         # ── OPEN MODE: candidates are ALWAYS the full vocabulary ───────────
         # No successor gating at all -- self.vocab (set once at construction,
         # see model.all_candidate_tokens()) is the entire candidate universe
-        # every step, scored by IVM's V1-V6 weighted voting (ivm.py). Not an
+        # every step, scored by IVM's V1-V7 weighted voting (ivm.py). Not an
         # opt-in: any engine constructed with mode="open" behaves this way
         # unconditionally. Strict Mode engines never reach this branch.
         if self.mode == "open":
@@ -285,7 +289,7 @@ class InferenceEngine:
             if not candidates:
                 return EOS, {"stage": 4, "rule": "termination_empty_vocabulary",
                              "chosen": EOS, "active_rels": active_rels}
-            return self._open_mode_step(current, candidates, context_tokens,
+            return self._open_mode_step(previous, current, candidates, context_tokens,
                                          importance_votes, active_rels)
 
         # ── STRICT MODE ────────────────────────────────────────────────────
@@ -405,7 +409,7 @@ class InferenceEngine:
                        "chosen": token, "active_rels": new_rels,
                        "candidates": list(s1_pass)}
 
-    def generate(self, prompt_ids, max_tokens=40, context_triggers=None,
+    def generate(self, prompt_ids, max_tokens=GenerationConfig.MAX_TOKENS, context_triggers=None,
                  importance_votes=None):
         ids = list(prompt_ids)
 

@@ -54,6 +54,7 @@ from collections import Counter
 
 from tokenizer import BPETokenizer, split_sentences, stream_word_freq
 from model import MSEGraphLanguageModel
+from config import TokenizerConfig, TrainCorpusConfig
 
 
 def discover_txt_files(folder, recursive=True):
@@ -80,7 +81,8 @@ def _bold(t):  return f"\033[1m{t}\033[0m"
 def _amber(t): return f"\033[33m{t}\033[0m"
 
 
-def train_from_folder(folder, out_path, vocab_size=2000, batch_size=1,
+def train_from_folder(folder, out_path, vocab_size=TokenizerConfig.DEFAULT_VOCAB_SIZE,
+                       batch_size=TrainCorpusConfig.DEFAULT_BATCH_SIZE,
                        recursive=True, quiet=False):
     """
     Run the full two-pass pipeline and save the resulting model to
@@ -185,8 +187,8 @@ def main():
         description="Train an MSE Graph Language Model from a folder of .txt files")
     p.add_argument("--corpus-dir",  required=True, help="Folder containing .txt files")
     p.add_argument("--out",         required=True, help="Output folder")
-    p.add_argument("--vocab-size",  type=int, default=2000)
-    p.add_argument("--batch-size",  type=int, default=1,
+    p.add_argument("--vocab-size",  type=int, default=TokenizerConfig.DEFAULT_VOCAB_SIZE)
+    p.add_argument("--batch-size",  type=int, default=TrainCorpusConfig.DEFAULT_BATCH_SIZE,
                     help="Files merged into the graph per step (default 1 -- "
                          "safest memory profile; raise for fewer, faster merge passes)")
     p.add_argument("--no-recursive", action="store_true",

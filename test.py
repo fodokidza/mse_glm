@@ -57,8 +57,8 @@ def main():
         check(f"no EOS in prompt '{phrase}'", 3 not in ids)
     train_ids = model.tokenizer.encode_for_training("the cat sat on the mat")
     check("encode_for_training appends EOS", train_ids[-1] == 3)
-    check("normalize", normalize("The Cat... SAT!!") == "the cat sat", normalize("The Cat... SAT!!"))
-    check("sentence split", split_sentences("One. Two! Three") == ["One", "Two", "Three"])
+    check("normalize", normalize("The Cat... SAT!!") == "the cat . . . sat ! !", normalize("The Cat... SAT!!"))
+    check("sentence split", split_sentences("One. Two! Three") == ["One .", "Two !", "Three"], split_sentences("One. Two! Three"))
 
     section("Graph construction")
     s = model.stats()
@@ -299,7 +299,7 @@ the pig sat on the rug.
     seq0 = sequence_for_relationship(m_imp, 0)
     check("sequence_for_relationship reconstructs rel_id=0 exactly",
           [dec_imp(t) for t in seq0] ==
-          ["<BOS>", "the", "cat", "sat", "on", "the", "mat", "<EOS>"], seq0)
+          ["<BOS>", "the", "cat", "sat", "on", "the", "mat", ".", "<EOS>"], seq0)
 
     # A rel_id beyond range must return [] rather than raise.
     check("sequence_for_relationship on out-of-range rel_id returns []",
@@ -545,9 +545,9 @@ a piglet is like a pig.
     m_incr3.train_incremental("the dog sat on the carpet.",
                                extend_vocab=True, target_vocab_size=200)
     check("old fact still generates correctly after merge",
-          m_incr3.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat")
+          m_incr3.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat.")
     check("new fact generates correctly after merge",
-          m_incr3.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet")
+          m_incr3.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet.")
 
     # Open Mode has no separate build step anymore -- it must be
     # automatically rebuilt (not left stale, not invalidated) after
@@ -633,9 +633,9 @@ a piglet is like a pig.
         check("pipeline gives every animal a clean (non-UNK) token",
               all(1 not in m1.tokenizer.encode(w) for w in ("cat", "dog", "pig")))
         check("pipeline generation correct for each file's fact",
-              m1.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat" and
-              m1.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet" and
-              m1.generate("the pig", max_tokens=6)[0] == "the pig sat on the rug")
+              m1.generate("the cat", max_tokens=6)[0] == "the cat sat on the mat." and
+              m1.generate("the dog", max_tokens=6)[0] == "the dog sat on the carpet." and
+              m1.generate("the pig", max_tokens=6)[0] == "the pig sat on the rug.")
 
         # batch_size is a memory/speed knob only -- final structure must
         # be identical regardless of how files are grouped into batches.
@@ -774,20 +774,23 @@ a piglet is like a pig.
                                 "knows", "important_vote", "influence_vote",
                                 "context_vote", "context_influence_vote",
                                 "bigram_witness_vote", "adjacency_vote",
-                                "scores", "winner", "tie_break_stage"}, info)
+                                "prev_current_vote",
+                                "scores", "winner", "tie_break_stage",
+                                "cache_used"}, info)
     check("open_mode_candidate_scores always covers the entire vocabulary now",
           len(info["candidates"]) == len(m_open.all_candidate_tokens()), info)
     # Now scoring the ENTIRE vocabulary (not just legal successors), so
     # many low-scoring subword/junk tokens are in the mix too -- but the
-    # genuine training-grounded candidate should still win on V3/V5/V6
+    # genuine training-grounded candidate should still win on V3/V5/V6/V7
     # evidence alone.
     check("chair is still the top-scoring candidate in open mode",
           max(info["scores"], key=info["scores"].get) == "chair", info["scores"])
-    check("scores equal the sum of the six independent vote layers",
+    check("scores equal the sum of the seven independent vote layers",
           all(abs(info["scores"][c] -
                   (info["important_vote"].get(c, 0) + info["influence_vote"].get(c, 0)
                    + info["context_vote"].get(c, 0) + info["context_influence_vote"].get(c, 0)
-                   + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0))) < 1e-9
+                   + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0)
+                   + info["prev_current_vote"].get(c, 0))) < 1e-9
               for c in info["candidates"]),
           info)
 
@@ -1437,11 +1440,384 @@ def test_bigram_witness_vote_and_vocab_candidates():
           m2._engine("strict") is m2._strict and m2._engine("open") is m2._open)
 
 
+def test_prev_current_co_occurrence_vote():
+    """
+    V7 (previous+current co-occurrence vote) -- exercised directly
+    against ivm.py / inference.py / model.py, same hand-checkable
+    style as the V5/V6 section above.
+    """
+    section("V7: previous+current co-occurrence vote")
+
+    from ivm import ImportanceVoteMatrix
+
+    m = MSEGraphLanguageModel(vocab_size=150)
+    m.train(CORPUS_EXP)
+    tok = m.tokenizer
+    def enc(w):
+        e = [t for t in tok.encode(w) if t != 2]
+        return e[-1]
+
+    cat, dog, boy, sat, ran, the, on = (enc("cat"), enc("dog"), enc("boy"),
+                                          enc("sat"), enc("ran"), enc("the"), enc("on"))
+    mat, carpet, chair, road = enc("mat"), enc("carpet"), enc("chair"), enc("road")
+
+    # CORPUS_EXP: rel 1 "the cat sat on the mat.", rel 2 "the dog sat on
+    # the carpet.", rel 3 "the boy sat on the chair.", rel 4 "the boy ran
+    # on the road." -- "sat" only occurs in rels {1,2,3} (NOT 4, which has
+    # "ran" instead), so (sat, on) is a fixed pair whose shared sentences
+    # are exactly {1,2,3} -- a clean way to demonstrate V7 votes for
+    # mat/carpet/chair but not road, without relying on adjacency at all.
+    ivm = ImportanceVoteMatrix.build(m, mode="strict")
+
+    v7 = ivm._prev_current_vote(sat, on, [mat, carpet, chair, road])
+    check("previous='sat' current='on' -> full vote for 'mat' (rel 1, "
+          "shared by sat/on/mat)",
+          v7.get(mat, 0) == 1.0, v7)
+    check("previous='sat' current='on' -> full vote for 'carpet' (rel 2)",
+          v7.get(carpet, 0) == 1.0, v7)
+    check("previous='sat' current='on' -> full vote for 'chair' (rel 3)",
+          v7.get(chair, 0) == 1.0, v7)
+    check("previous='sat' current='on' -> NO vote for 'road' -- 'sat' "
+          "never occurs in rel 4 at all ('ran' does instead), so sat/on "
+          "never share a sentence with road even though on/road do",
+          v7.get(road, 0) == 0, v7)
+
+    # Narrower than V3: 'boy' co-occurs with 'chair' (rel 3) on its own,
+    # but the specific PAIR (boy, ran) only ever shares a sentence with
+    # 'road' (rel 4), never with 'chair' -- V7 should reflect the pair,
+    # not just boy's own broader co-occurrence.
+    v7b = ivm._prev_current_vote(boy, ran, [chair, road])
+    check("previous='boy' current='ran' -> vote for 'road' (rel 4, the "
+          "only sentence containing both boy and ran)",
+          v7b.get(road, 0) == 1.0, v7b)
+    check("previous='boy' current='ran' -> NO vote for 'chair', even "
+          "though 'boy' alone co-occurs with 'chair' in rel 3 -- 'ran' "
+          "does not, so the pair never shares a sentence with chair "
+          "(this is what makes V7 narrower than V3's single-token test)",
+          v7b.get(chair, 0) == 0, v7b)
+
+    v7_none1 = ivm._prev_current_vote(None, on, [mat])
+    v7_none2 = ivm._prev_current_vote(sat, None, [mat])
+    check("V7 is all-zero when previous is None (documented degrade)",
+          v7_none1 == {}, v7_none1)
+    check("V7 is all-zero when current is None (documented degrade)",
+          v7_none2 == {}, v7_none2)
+
+    v7_self = ivm._prev_current_vote(sat, on, [sat, on, mat])
+    check("a candidate never votes via being previous or current itself "
+          "-- only 'mat' should appear, not 'sat' or 'on'",
+          v7_self == {mat: 1.0}, v7_self)
+
+    v7_empty_ctm = ImportanceVoteMatrix()  # bare object, no token_rels built
+    v7_empty = v7_empty_ctm._prev_current_vote(sat, on, [mat])
+    check("a bare (unbuilt) ImportanceVoteMatrix has no relationship "
+          "evidence at all -- V7 is all-zero, never an error",
+          v7_empty == {}, v7_empty)
+
+    # score_candidates()/select() integration -- V7 requires BOTH
+    # `previous` and `current`; combines additively with V1-V6.
+    trace_v7 = ivm.score_candidates([mat, carpet, chair, road], [cat, dog],
+                                     current=on, previous=sat)
+    check("prev_current_vote key is present and matches _prev_current_vote, "
+          "scaled by prev_current_weight",
+          trace_v7["prev_current_vote"].get(mat, 0) == ivm._prev_current_weight * 1.0,
+          trace_v7["prev_current_vote"])
+    check("V7's contribution is included in the final combined score",
+          abs(trace_v7["scores"][mat] -
+              (trace_v7["important_vote"].get(mat, 0) + trace_v7["influence_vote"].get(mat, 0)
+               + trace_v7["context_vote"].get(mat, 0) + trace_v7["context_influence_vote"].get(mat, 0)
+               + trace_v7["bigram_witness_vote"].get(mat, 0) + trace_v7["adjacency_vote"].get(mat, 0)
+               + trace_v7["prev_current_vote"].get(mat, 0))) < 1e-9,
+          trace_v7["scores"])
+
+    trace_no_prev = ivm.score_candidates([mat, carpet, chair, road], [cat, dog], current=on)
+    check("omitting `previous` zeroes V7 specifically, without affecting "
+          "that omission being visible as an empty prev_current_vote key",
+          trace_no_prev.get("prev_current_vote", {}).get(mat, 0) == 0,
+          trace_no_prev.get("prev_current_vote"))
+
+    winner7, _ = ivm.select([mat, carpet, chair, road], [cat, dog],
+                             current=on, previous=sat)
+    check("select() runs end-to-end with `previous` supplied and returns "
+          "a deterministic winner",
+          winner7 is not None, winner7)
+
+    # to_dict/from_dict must round-trip prev_current_weight (V7 itself
+    # needs no separate precomputed index -- it reuses _token_rels,
+    # which is already covered by the existing round-trip tests).
+    ivm_rt = ImportanceVoteMatrix.from_dict(ivm.to_dict())
+    check("prev_current_weight survives to_dict/from_dict",
+          abs(ivm_rt._prev_current_weight - ivm._prev_current_weight) < 1e-9,
+          ivm_rt._prev_current_weight)
+    v7_rt = ivm_rt._prev_current_vote(sat, on, [mat, carpet, chair, road])
+    check("_prev_current_vote gives identical results after a round-trip",
+          v7_rt == v7, (v7_rt, v7))
+
+    # inference.py / model.py integration: Open Mode's real step()/
+    # open_mode_candidate_scores() must thread `previous` all the way
+    # through to V7 without crashing.
+    info = m.open_mode_candidate_scores("the cat sat on the")
+    check("open_mode_candidate_scores() exposes prev_current_vote in "
+          "its public breakdown",
+          "prev_current_vote" in info, info.keys())
+
+    token, trace_step = m._open.step(sat, on, importance_votes=ivm)
+    check("Open Mode's step() accepts `previous` and returns a token "
+          "without error (V7 now wired through inference.py)",
+          isinstance(token, int), trace_step)
+
+
+def test_sparse_token_score_cache():
+    """
+    Sparse per-token score cache for V1/V2/V3/V4/V6 (see build_cache()/
+    enable_cache()/disable_cache() and the "cache" branch of
+    score_candidates() in ivm.py). V5 and V7 are always live -- this
+    section exists to prove the cache is a pure optimization: identical
+    numbers whether it's on or off, never a shortcut that changes the
+    answer, plus the toggle and fallback behavior around it.
+    """
+    section("Sparse per-token score cache (V1/V2/V3/V4/V6, opt-in)")
+
+    from ivm import ImportanceVoteMatrix
+    import random as _random
+
+    m = MSEGraphLanguageModel(vocab_size=200)
+    m.train(CORPUS)
+    candidates = m.all_candidate_tokens()
+
+    ivm_live = ImportanceVoteMatrix.build(m, mode="strict", use_cache=False)
+    ivm_cached = ImportanceVoteMatrix.build(m, mode="strict", use_cache=True)
+
+    check("use_cache=False (default) leaves the cache empty and off",
+          ivm_live._use_cache is False and ivm_live._token_cache == {},
+          (ivm_live._use_cache, len(ivm_live._token_cache)))
+    check("use_cache=True builds a nonempty cache and turns it on",
+          ivm_cached._use_cache is True and len(ivm_cached._token_cache) > 0,
+          (ivm_cached._use_cache, len(ivm_cached._token_cache)))
+    check("cache is built for exactly the full-vocabulary candidate set "
+          "(model.all_candidate_tokens()) -- the one set Open Mode "
+          "actually calls score_candidates() with",
+          ivm_cached._cache_candidates == frozenset(candidates),
+          (len(ivm_cached._cache_candidates), len(candidates)))
+
+    # Cache is SPARSE -- only nonzero (token, candidate) rows/entries are
+    # stored, never a dense |vocab| x |vocab| table.
+    dense_size = len(candidates) * len(candidates)
+    sparse_size = sum(len(row) for row in ivm_cached._token_cache.values())
+    check("sparse cache stores far fewer (t,c) entries than a dense "
+          "|vocab| x |vocab| table would",
+          0 < sparse_size < dense_size, (sparse_size, dense_size))
+
+    # Correctness: cached and live paths must agree on EVERY score, across
+    # many random contexts -- not just one hand-picked example.
+    _random.seed(0)
+    mismatches = 0
+    trials = 0
+    for _ in range(60):
+        ctx = set(_random.sample(candidates, k=min(5, len(candidates))))
+        current = _random.choice(list(ctx))
+        previous = _random.choice(list(ctx))
+        trace_live = ivm_live.score_candidates(candidates, ctx, current=current, previous=previous)
+        trace_cached = ivm_cached.score_candidates(candidates, ctx, current=current, previous=previous)
+        for c in candidates:
+            trials += 1
+            if abs(trace_live["scores"][c] - trace_cached["scores"][c]) > 1e-9:
+                mismatches += 1
+    check("cached and live score_candidates() agree exactly across many "
+          f"random contexts ({trials} candidate-scores compared)",
+          mismatches == 0, mismatches)
+
+    # cache_used trace field reports which path actually ran
+    ctx = set(candidates[:4])
+    trace_c = ivm_cached.score_candidates(candidates, ctx, current=candidates[0])
+    trace_l = ivm_live.score_candidates(candidates, ctx, current=candidates[0])
+    check("trace exposes cache_used=True when the cache path ran",
+          trace_c["cache_used"] is True, trace_c["cache_used"])
+    check("trace exposes cache_used=False when the live path ran",
+          trace_l["cache_used"] is False, trace_l["cache_used"])
+
+    # Candidate-set mismatch -- e.g. a narrower successor set -- must fall
+    # back to the live path silently, never use a stale/wrong cache.
+    narrower = candidates[:3]
+    trace_mismatch = ivm_cached.score_candidates(narrower, set(narrower), current=narrower[0])
+    check("a candidate set different from the one the cache was built "
+          "for falls back to the live path (never a wrong answer)",
+          trace_mismatch["cache_used"] is False, trace_mismatch["cache_used"])
+
+    # disable_cache()/enable_cache() toggle without losing the build
+    ivm_cached.disable_cache()
+    trace_off = ivm_cached.score_candidates(candidates, ctx, current=candidates[0])
+    check("disable_cache() turns the cache off",
+          trace_off["cache_used"] is False, trace_off["cache_used"])
+    ivm_cached.enable_cache()  # no candidates -- reuse the prior build
+    trace_on = ivm_cached.score_candidates(candidates, ctx, current=candidates[0])
+    check("enable_cache() with no arguments reuses the previous build "
+          "instantly (no rebuild needed)",
+          trace_on["cache_used"] is True, trace_on["cache_used"])
+
+    fresh = ImportanceVoteMatrix()
+    raised = False
+    try:
+        fresh.enable_cache()
+    except ValueError:
+        raised = True
+    check("enable_cache() with nothing ever built and no candidates "
+          "given raises, rather than silently scoring against an "
+          "empty/nonexistent cache", raised)
+
+    # Weight changes are re-applied at score time, not baked into the
+    # cache -- changing a weight after build_cache() must NOT stale it.
+    ivm_w = ImportanceVoteMatrix.build(m, mode="strict", use_cache=True)
+    before = ivm_w.score_candidates(candidates, ctx, current=candidates[0])["scores"]
+    ivm_w._context_weight = 5.0
+    after = ivm_w.score_candidates(candidates, ctx, current=candidates[0])["scores"]
+    check("changing a weight after the cache is built still changes the "
+          "score -- the cache stores raw evidence, not pre-weighted "
+          "votes, so it can't go stale when a weight changes",
+          any(abs(before[c] - after[c]) > 1e-9 for c in candidates),
+          (before, after))
+
+    # to_dict/from_dict: the cache itself is NOT serialized (fully
+    # re-derivable from state that IS serialized) -- restored objects
+    # always start with the cache off, even if the original had it on.
+    d = ivm_cached.to_dict()
+    check("to_dict() does not serialize the cache itself",
+          "token_cache" not in d and "cache_candidates" not in d, sorted(d.keys()))
+    ivm_rt = ImportanceVoteMatrix.from_dict(d)
+    check("from_dict() always restores with the cache off, even though "
+          "the original had it enabled -- must be rebuilt explicitly",
+          ivm_rt._use_cache is False and ivm_rt._cache_candidates is None,
+          (ivm_rt._use_cache, ivm_rt._cache_candidates))
+
+    # select() and inference.py/model.py integration
+    winner_c, _ = ivm_cached.select(candidates, ctx, current=candidates[0])
+    winner_l, _ = ivm_live.select(candidates, ctx, current=candidates[0])
+    check("select() returns the same winner whether the cache is on or off",
+          winner_c == winner_l, (winner_c, winner_l))
+
+    m2 = MSEGraphLanguageModel(vocab_size=200)
+    m2.train(CORPUS)
+    m2.open_ctm.enable_cache(m2.all_candidate_tokens())
+    info = m2.open_mode_candidate_scores("the cat sat on the")
+    check("open_mode_candidate_scores() works end-to-end with the cache "
+          "enabled on the model's own open_ctm",
+          info is not None and "scores" in info, info)
+    check("open_mode_candidate_scores() surfaces cache_used=True in its "
+          "public breakdown when the model's open_ctm has caching on",
+          info["cache_used"] is True, info["cache_used"])
+
+
+def test_cluster_axis_indexed_lookup():
+    """
+    BridgeMatrix.cluster_axis() used to scan EVERY triple in the graph
+    on every call -- fine in isolation, but importance.py's
+    _trigger_for_triple() calls it once per CLUSTERED triple (via
+    ivm.py's important_member_tokens(), which every train()/
+    train_incremental() call rebuilds automatically), which made the
+    whole training pipeline effectively O(triples^2). Fixed with a
+    lazy cluster_id -> [triple_idx] index + a memoized per-cluster
+    result (see graph.py's _ensure_cluster_index()). This section
+    proves the fix changed nothing observable except speed: same
+    results as the old brute-force scan, for every real cluster_id in
+    a real trained model, plus the specific behaviors the fix
+    introduces (index built lazily, invalidated on rebuild).
+    """
+    section("BridgeMatrix.cluster_axis() indexed lookup (was O(triples) per call)")
+
+    m = MSEGraphLanguageModel(vocab_size=400)
+    m.train(CORPUS)
+    b = m.bridges
+
+    def brute_force_cluster_axis(cid):
+        members = [(s, t, br) for s, t, br, c in
+                   zip(b.source, b.target, b.bridge, b.cluster_id) if c == cid]
+        if len(members) < 2:
+            return None, members
+        s0, t0, _b0 = members[0]
+        if all(t == t0 for _, t, _ in members):
+            return "bridge", members
+        if all(br == members[0][2] for _, _, br in members):
+            return "target", members
+        return None, members
+
+    check("cluster_axis() is already populated right after train() -- "
+          "open_ctm's own build() (important_member_tokens(), auto-run by "
+          "every train()/train_incremental()) queries every clustered "
+          "triple's cluster_axis() internally, which is exactly the call "
+          "pattern the O(triples^2) bug came from",
+          b._cluster_members is not None, b._cluster_members)
+
+    real_cluster_ids = sorted(set(c for c in b.cluster_id if c))
+    check("this model actually has clustered triples to test against",
+          len(real_cluster_ids) > 0, len(real_cluster_ids))
+
+    mismatches = 0
+    for cid in real_cluster_ids:
+        fast = b.cluster_axis(cid)
+        slow = brute_force_cluster_axis(cid)
+        if fast != slow:
+            mismatches += 1
+    check(f"indexed cluster_axis() matches the old brute-force scan exactly "
+          f"for every real cluster_id ({len(real_cluster_ids)} checked)",
+          mismatches == 0, mismatches)
+
+    check("cluster_id=0 (never a real cluster) returns (None, []), matching "
+          "interpret.py's documented \"unknown cluster_id\" contract",
+          b.cluster_axis(0) == (None, []), b.cluster_axis(0))
+    check("a real cluster_id is memoized after its first lookup",
+          real_cluster_ids[0] in b._cluster_axis_cache,
+          b._cluster_axis_cache.get(real_cluster_ids[0]))
+
+    # Laziness itself is only observable one level down, on a BridgeMatrix
+    # used directly (nothing has queried cluster_axis() yet) -- the full
+    # model pipeline above always triggers it internally via open_ctm.
+    from graph import BridgeMatrix
+    from tokenizer import BPETokenizer
+    tok = BPETokenizer(vocab_size=400)
+    tok.train(CORPUS)
+    from tokenizer import split_sentences
+    seqs = [tok.encode_for_training(s) for s in split_sentences(CORPUS)]
+    bm = BridgeMatrix()
+    bm.build(seqs, tok.vocab_size_actual)
+    check("a BridgeMatrix used directly (no IVM/model wrapping it) starts "
+          "with its cluster index unbuilt -- genuinely lazy, not eager",
+          bm._cluster_members is None, bm._cluster_members)
+    some_cid = next(c for c in bm.cluster_id if c)
+    bm.cluster_axis(some_cid)
+    check("first cluster_axis() call on it builds the index",
+          bm._cluster_members is not None)
+    bm.build(seqs, tok.vocab_size_actual)  # rebuild -- e.g. retrained in place
+    check("calling build() again invalidates the index/cache -- no stale "
+          "answers left over from the previous build",
+          bm._cluster_members is None, bm._cluster_members)
+
+    # train_incremental() constructs a brand-new BridgeMatrix for the
+    # merged graph (see model.py's _merge_graphs) -- its cluster index
+    # should reflect ONLY the merged clustering, never anything left
+    # over from the pre-merge BridgeMatrix instance it replaced.
+    m2 = MSEGraphLanguageModel(vocab_size=400)
+    m2.train(CORPUS)
+    pre_merge_bridges = m2.bridges
+    m2.train_incremental("the pig sat on the log. the pig sat on the rug.")
+    check("train_incremental() replaces bridges with a genuinely new object",
+          m2.bridges is not pre_merge_bridges)
+    post_merge_ids = set(c for c in m2.bridges.cluster_id if c)
+    indexed_ids = set(m2.bridges._cluster_members.keys()) if m2.bridges._cluster_members else set()
+    check("the merged model's cluster index (already populated by its own "
+          "open_ctm rebuild) covers exactly the post-merge cluster ids, "
+          "nothing stale from before the merge",
+          indexed_ids == post_merge_ids, (indexed_ids, post_merge_ids))
+
+
 if __name__ == "__main__":
     main()
     test_prompt_seeding_and_mode_boundaries()
     test_importance_vote_matrix()
     test_train_py_cli_path_matches_model_api()
     test_bigram_witness_vote_and_vocab_candidates()
+    test_prev_current_co_occurrence_vote()
+    test_sparse_token_score_cache()
+    test_cluster_axis_indexed_lookup()
     print(f"\n{PASS} passed, {FAIL} failed (grand total)")
     if FAIL: sys.exit(1)
+

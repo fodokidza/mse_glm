@@ -20,6 +20,8 @@ import time
 import shutil
 from collections import Counter, defaultdict
 
+from config import TokenizerConfig, GenerationConfig
+
 # ─── terminal helpers ─────────────────────────────────────────────────────────
 
 def _tw():  return shutil.get_terminal_size((100, 24)).columns
@@ -252,7 +254,7 @@ class Display:
 # ─── Training pipeline ────────────────────────────────────────────────────────
 
 def train_with_display(model, corpus_text=None, corpus_file=None,
-                       vocab_size=1000, display=None, out_path="runs/model"):
+                       vocab_size=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE, display=None, out_path="runs/model"):
     from tokenizer import BPETokenizer, split_sentences, normalize
     from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
     from inference import InferenceEngine
@@ -275,7 +277,7 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
         wf = Counter(); sentences = []; buf = ""
         with open(corpus_file, "r", encoding="utf-8", errors="ignore") as f:
             while True:
-                chunk = f.read(1 << 20)
+                chunk = f.read(TokenizerConfig.STREAM_CHUNK_SIZE)
                 if not chunk: break
                 buf += chunk
                 parts = _sp.split(buf); buf = parts.pop()
@@ -307,39 +309,31 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
     D.update(stats={"vocab": len(tok.token_to_id)})
     D.item(dim(f"initialized {len(chars)} base characters"))
 
-    # BPE merges
+    # BPE merges -- delegates to BPETokenizer's own (incremental, not
+    # full-rescan-per-merge) merge loop instead of hand-rolling a second
+    # copy of the algorithm here. This used to be a standalone reimplementation
+    # of tokenizer.py's BPE loop, kept in sync by hand -- exactly the kind of
+    # duplication that once let train.py's EdgeMatrix.count go unset for a
+    # whole release (see test.py's test_train_py_cli_path_matches_model_api).
+    # A callback drives the live display without needing its own copy of the
+    # merge algorithm, so this path gets tokenizer.py's incremental pair-count
+    # maintenance for free and can never again drift from it.
     word_syms     = {w: list(w) for w in wf}
     total_merges  = max(vocab_size - len(tok.token_to_id), 0)
     merge_done    = 0
-    while len(tok.token_to_id) < vocab_size:
-        pc = Counter()
-        for w, freq in wf.items():
-            syms = word_syms[w]
-            for i in range(len(syms)-1):
-                pc[(syms[i], syms[i+1])] += freq
-        if not pc: break
-        (a, b), cnt = pc.most_common(1)[0]
-        merged = a + b
-        if merged not in tok.token_to_id:
-            nid = max(tok.token_to_id.values()) + 1
-            tok.token_to_id[merged] = nid; tok.id_to_token[nid] = merged
-        tok.merges.append((a, b))
-        for w in word_syms:
-            syms = word_syms[w]; ns = []; i = 0
-            while i < len(syms):
-                if i < len(syms)-1 and syms[i]==a and syms[i+1]==b:
-                    ns.append(merged); i += 2
-                else:
-                    ns.append(syms[i]); i += 1
-            word_syms[w] = ns
+    next_id       = max(tok.token_to_id.values()) + 1
+
+    def _on_merge(a, b, merged, cnt, vocab_len):
+        nonlocal merge_done
         merge_done += 1
-        D.update(step=merge_done, total=total_merges,
-                 stats={"vocab": len(tok.token_to_id)})
+        D.update(step=merge_done, total=total_merges, stats={"vocab": vocab_len})
         D.item(
             f"{amber('merge')}  {teal(repr(a))} + {teal(repr(b))}"
             f"  →  {white(repr(merged))}"
-            f"  {dim(f'(freq {cnt}  vocab {len(tok.token_to_id)})')}"
+            f"  {dim(f'(freq {cnt}  vocab {vocab_len})')}"
         )
+
+    tok._run_bpe_merges(wf, word_syms, next_id, vocab_size, on_merge=_on_merge)
 
     D.phase_done(PHASES[0][1], f"{len(tok.token_to_id):,} tokens  ·  {len(tok.merges):,} merges")
 
@@ -634,7 +628,7 @@ def main():
     p.add_argument("--text",       help="Inline corpus string")
     p.add_argument("--out",        help="Output folder (required for fresh training; "
                                          "defaults to --continue-from's folder otherwise)")
-    p.add_argument("--vocab-size", type=int, default=1000)
+    p.add_argument("--vocab-size", type=int, default=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE)
     p.add_argument("--quiet",      action="store_true")
     p.add_argument("--continue-from", metavar="FOLDER",
                     help="Add this corpus to an already-trained model instead of "

@@ -20,11 +20,12 @@ import os
 from tokenizer import BPETokenizer, split_sentences
 from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
 from inference import InferenceEngine
+from config import TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfig
 
 
 class MSEGraphLanguageModel:
 
-    def __init__(self, vocab_size=2000):
+    def __init__(self, vocab_size=TokenizerConfig.DEFAULT_VOCAB_SIZE):
         self.tokenizer   = BPETokenizer(vocab_size=vocab_size)
         self.edges       = EdgeMatrix()
         self.bridges     = BridgeMatrix()
@@ -270,7 +271,7 @@ class MSEGraphLanguageModel:
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
         self._rebuild_open_engine()
 
-    def build_context_triggers(self, mode="strict", min_support=1):
+    def build_context_triggers(self, mode="strict", min_support=CTMConfig.MIN_SUPPORT):
         """
         Build and cache a Context Trigger Matrix -- per-cluster,
         per-member trigger signatures from whole-sentence co-occurrence
@@ -344,7 +345,7 @@ class MSEGraphLanguageModel:
         return sorted(t for t in self.tokenizer.token_to_id.values()
                       if t not in (PAD, UNK, BOS))
 
-    def generate(self, prompt, max_tokens=40, mode="strict",
+    def generate(self, prompt, max_tokens=GenerationConfig.MAX_TOKENS, mode="strict",
                  use_context_triggers=False, use_importance_votes=False):
         engine = self._engine(mode)
         if mode == "open":
@@ -395,12 +396,18 @@ class MSEGraphLanguageModel:
         "scores" is the FINAL combined score: V1 ("important_vote") +
         V2 ("influence_vote") + V3 ("context_vote") + V4
         ("context_influence_vote") + V5 ("bigram_witness_vote") + V6
-        ("adjacency_vote") -- six independent vote layers, summed,
-        each exposed separately so all six stay independently
-        auditable. "winner" and "tie_break_stage" report what
-        select() actually returned and which stage of the cascade
-        decided it (score / bigram_frequency / global_frequency /
-        lowest_token_id) -- see ivm.py's select().
+        ("adjacency_vote") + V7 ("prev_current_vote") -- seven
+        independent vote layers, summed, each exposed separately so
+        all seven stay independently auditable. "winner" and
+        "tie_break_stage" report what select() actually returned and
+        which stage of the cascade decided it (score /
+        bigram_frequency / global_frequency / lowest_token_id) -- see
+        ivm.py's select(). "cache_used" reports whether open_ctm's
+        opt-in sparse per-token cache (V1/V2/V3/V4/V6 -- see
+        ivm.py's build_cache()/enable_cache()) actually served this
+        breakdown, or whether it was computed live -- off by default,
+        call model.open_ctm.enable_cache(model.all_candidate_tokens())
+        to turn it on.
 
         Candidates are always the entire vocabulary (self._open.vocab)
         -- there is no narrower option anymore, since Open Mode is no
@@ -412,10 +419,11 @@ class MSEGraphLanguageModel:
             return None
         ids = self.tokenizer.encode(prompt)
         current = ids[-1]
+        previous = ids[-2] if len(ids) >= 2 else None
         candidates = self._open.vocab
         context_tokens = set(ids)
-        trace = self.open_ctm.score_candidates(candidates, context_tokens, current=current)
-        winner, _ = self.open_ctm.select(candidates, context_tokens, current=current)
+        trace = self.open_ctm.score_candidates(candidates, context_tokens, current=current, previous=previous)
+        winner, _ = self.open_ctm.select(candidates, context_tokens, current=current, previous=previous)
         dec = self._dec_tok
 
         max_score = max(trace["scores"].values()) if trace["scores"] else None
@@ -442,9 +450,11 @@ class MSEGraphLanguageModel:
             "context_influence_vote": {dec(c): v for c, v in trace["context_influence_vote"].items()},
             "bigram_witness_vote": {dec(c): v for c, v in trace["bigram_witness_vote"].items()},
             "adjacency_vote": {dec(c): v for c, v in trace["adjacency_vote"].items()},
+            "prev_current_vote": {dec(c): v for c, v in trace["prev_current_vote"].items()},
             "scores": {dec(c): v for c, v in trace["scores"].items()},
             "winner": dec(winner) if winner is not None else None,
             "tie_break_stage": tie_break_stage,
+            "cache_used": trace.get("cache_used", False),
         }
 
     def infer_shared_role(self, words, mode="strict"):
@@ -496,7 +506,7 @@ class MSEGraphLanguageModel:
             "members_covered": [dec(m) for m in row["members_covered"]],
         }
 
-    def interpret_cluster(self, cluster_id, top_n=5, mode="strict"):
+    def interpret_cluster(self, cluster_id, top_n=InterpretConfig.TOP_N, mode="strict"):
         """
         Propose a human-readable interpreter token for one cluster_id,
         with evidence gathered from Edge, Bridge, and Relationship
@@ -510,7 +520,7 @@ class MSEGraphLanguageModel:
         result = _interpret_cluster(self, cluster_id, top_n=top_n, mode=mode)
         return self._decode_interpretation(result)
 
-    def interpret_all_clusters(self, min_coverage=0.5, max_per_cluster=3, mode="strict"):
+    def interpret_all_clusters(self, min_coverage=InterpretConfig.MIN_COVERAGE, max_per_cluster=InterpretConfig.MAX_PER_CLUSTER, mode="strict"):
         """
         Every candidate that clears min_coverage for each cluster (up to
         max_per_cluster, best first) -- not just one label per cluster.
@@ -521,7 +531,7 @@ class MSEGraphLanguageModel:
                               max_per_cluster=max_per_cluster, mode=mode)
         return [self._decode_interpretation(r) for r in raw]
 
-    def build_interpreter_matrix(self, min_coverage=0.5, min_signals=2,
+    def build_interpreter_matrix(self, min_coverage=InterpretConfig.MIN_COVERAGE, min_signals=InterpretConfig.MIN_SIGNALS,
                                   max_per_cluster=None, mode="strict"):
         """
         The filtered Cluster Interpreter Matrix: one row per (cluster_id,
@@ -546,7 +556,7 @@ class MSEGraphLanguageModel:
             "via_bridge_token": dec(row["via_bridge_token"]),
         }
 
-    def discover_zero_cluster_groups(self, min_group_size=2, mode="strict"):
+    def discover_zero_cluster_groups(self, min_group_size=InterpretConfig.MIN_GROUP_SIZE, mode="strict"):
         """
         Mine cluster_id==0 for source-axis groups the standard dual-axis
         rule never assigns a cluster_id to at all (fix bridge+target,

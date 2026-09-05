@@ -114,6 +114,39 @@ class BridgeMatrix:
         self._vocab_size = 0
         # token -> sorted list of non-zero cluster_ids (built alongside)
         self.t_index = {}
+        # cluster_id -> [triple_idx, ...], lazily built on first
+        # cluster_axis() call -- see _ensure_cluster_index(). Always
+        # None right after __init__/build()/from_dict(), so it can
+        # never go stale silently: every path that (re)populates
+        # cluster_id constructs a fresh BridgeMatrix (or otherwise
+        # leaves this None), and the next cluster_axis() call rebuilds
+        # it from whatever cluster_id currently holds.
+        self._cluster_members = None
+        self._cluster_axis_cache = None  # cluster_id -> (axis, members), same lifetime
+
+    def _ensure_cluster_index(self):
+        """
+        Build (once) a cluster_id -> [triple_idx, ...] index, so
+        cluster_axis() below can look up one cluster's members without
+        scanning every triple in the graph. cluster_axis() used to do
+        exactly that full scan on EVERY call -- fine for one call, but
+        it's invoked once per CLUSTERED TRIPLE from
+        importance.py's _trigger_for_triple() (via
+        ivm.py's important_member_tokens(), rebuilt automatically by
+        every train()/train_incremental() call) -- O(triples) work,
+        repeated once per clustered triple, made the whole training
+        pipeline effectively O(triples^2). This mirrors
+        RelationshipMatrix._ensure_triple_index()'s same fix for the
+        same class of bug (see that method's comment).
+        """
+        if self._cluster_members is not None:
+            return
+        idx = defaultdict(list)
+        for i, c in enumerate(self.cluster_id):
+            if c:
+                idx[c].append(i)
+        self._cluster_members = idx
+        self._cluster_axis_cache = {}
 
     def build(self, sequences, vocab_size: int):
         self._vocab_size = vocab_size
@@ -153,6 +186,8 @@ class BridgeMatrix:
         self.target = array("i", [t[1] for t in triples])
         self.bridge = array("i", [t[2] for t in triples])
         self.cluster_id = array("i", cluster_id)
+        self._cluster_members = None    # stale after repopulating cluster_id --
+        self._cluster_axis_cache = None  # rebuilt lazily on next cluster_axis() call
 
         self.index = array("i", [0] * (vocab_size + 1))
         for s in self.source:
@@ -176,17 +211,24 @@ class BridgeMatrix:
 
     def cluster_axis(self, cluster_id: int):
         """Return ('bridge'|'target', list of triple tuples) for a cluster_id."""
-        members = [(s, t, b) for s, t, b, c in
-                   zip(self.source, self.target, self.bridge, self.cluster_id)
-                   if c == cluster_id]
+        self._ensure_cluster_index()
+        cached = self._cluster_axis_cache.get(cluster_id)
+        if cached is not None:
+            return cached
+        idxs = self._cluster_members.get(cluster_id, [])
+        members = [(self.source[i], self.target[i], self.bridge[i]) for i in idxs]
         if len(members) < 2:
-            return None, members
-        s0, t0, b0 = members[0]
-        if all(t == t0 for _, t, _ in members):
-            return "bridge", members  # source+target fixed, bridge varies
-        if all(b == b0 for _, _, b in members):
-            return "target", members  # source+bridge fixed, target varies
-        return None, members
+            result = (None, members)
+        else:
+            s0, t0, b0 = members[0]
+            if all(t == t0 for _, t, _ in members):
+                result = ("bridge", members)  # source+target fixed, bridge varies
+            elif all(b == b0 for _, _, b in members):
+                result = ("target", members)  # source+bridge fixed, target varies
+            else:
+                result = (None, members)
+        self._cluster_axis_cache[cluster_id] = result
+        return result
 
     def to_dict(self):
         return {

@@ -77,6 +77,8 @@ Honesty notes (do not remove when editing this file)
 
 from collections import defaultdict
 
+from config import InterpretConfig
+
 
 def find_cluster_members(bridge_matrix, cluster_id):
     """
@@ -127,7 +129,7 @@ def _shared_role_overlap(bridges, this_cluster_id, members, candidate):
     return sorted(member_clusters & candidate_clusters)
 
 
-def interpret_cluster(model, cluster_id, top_n=5, mode="strict"):
+def interpret_cluster(model, cluster_id, top_n=InterpretConfig.TOP_N, mode="strict"):
     """
     Propose interpreter token(s) for one cluster_id, with evidence
     gathered from Edge, Bridge, and Relationship matrices.
@@ -212,7 +214,7 @@ def interpret_cluster(model, cluster_id, top_n=5, mode="strict"):
     }
 
 
-def interpret_all_clusters(model, min_coverage=0.5, max_per_cluster=3, mode="strict"):
+def interpret_all_clusters(model, min_coverage=InterpretConfig.MIN_COVERAGE, max_per_cluster=InterpretConfig.MAX_PER_CLUSTER, mode="strict"):
     """
     Scan every non-zero cluster_id and return every candidate that clears
     `min_coverage` for it (up to `max_per_cluster`, sorted best-first),
@@ -244,7 +246,7 @@ def interpret_all_clusters(model, min_coverage=0.5, max_per_cluster=3, mode="str
     return results
 
 
-def build_interpreter_matrix(model, min_coverage=0.5, min_signals=2,
+def build_interpreter_matrix(model, min_coverage=InterpretConfig.MIN_COVERAGE, min_signals=InterpretConfig.MIN_SIGNALS,
                               max_per_cluster=None, mode="strict"):
     """
     The filtered "final" CI Matrix: one row per (cluster_id, interpreter)
@@ -275,7 +277,7 @@ def build_interpreter_matrix(model, min_coverage=0.5, min_signals=2,
 
     rows = []
     for cid in sorted(seen):
-        r = interpret_cluster(model, cid, top_n=50, mode=mode)
+        r = interpret_cluster(model, cid, top_n=InterpretConfig.BUILD_MATRIX_TOP_N, mode=mode)
         if not r or not r["candidates"]:
             continue
         qualifying = [
@@ -303,7 +305,7 @@ def build_interpreter_matrix(model, min_coverage=0.5, min_signals=2,
     return rows
 
 
-def discover_zero_cluster_groups(model, min_group_size=2, mode="strict"):
+def discover_zero_cluster_groups(model, min_group_size=InterpretConfig.MIN_GROUP_SIZE, mode="strict"):
     """
     Mine cluster_id==0 -- the standard dual-axis rule's "unclustered"
     bucket -- for source-axis groups the current architecture never
