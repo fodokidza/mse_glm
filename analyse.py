@@ -22,7 +22,7 @@ from collections import Counter
 
 from model import MSEGraphLanguageModel
 from tokenizer import normalize, split_sentences
-from config import InterpretConfig, CTMConfig
+from config import InterpretConfig, CTMConfig, ScoresDisplayConfig
 
 
 # =============================================================================
@@ -368,7 +368,7 @@ class Analyser:
         inference.py's _bigram_tie_break.
 
         Open Mode's rule is almost always 'ctm_weighted_vote' (the
-        V1-V7 primary selection scored the full legal candidate set,
+        V1-V8 primary selection scored the full legal candidate set,
         with its own internal bigram/global-frequency tie-break
         cascade if the score itself ties -- see ivm.py's select()).
         'ctm_unavailable_deterministic_fallback' only appears if no
@@ -394,26 +394,28 @@ class Analyser:
 
     def open_mode_scores(self, prompt: str) -> dict:
         """
-        Full auditable V1-V7 score breakdown for the NEXT token given
+        Full auditable V1-V8 score breakdown for the NEXT token given
         `prompt`, under Open Mode's primary selection mechanism (see
         ivm.py's score_candidates()/select()): which tokens are
-        important, their influence (breadth), what each of the SEVEN
+        important, their influence (breadth), what each of the EIGHT
         layers (important vote / influence vote / context vote /
         context-influence vote / bigram-witness vote / adjacency
-        vote / prev+current co-occurrence vote) contributed per
-        candidate, the final combined score, and -- critically --
-        which stage actually decided the winner ("score",
-        "bigram_frequency", "global_frequency", or "lowest_token_id").
-        The final "score" is the sum of all seven layers, including
-        bigram_witness_vote (V5), adjacency_vote (V6), and
-        prev_current_vote (V7) -- don't add up just the other four
-        expecting it to match; V5/V6/V7 are usually the largest single
-        contributors (V5 when the exact bigram was literally
-        witnessed, V6 when the context token was ever directly,
-        immediately followed by the candidate -- directional,
-        token->candidate only -- V7 when the prompt's last two tokens
-        and the candidate ever all three shared one training sentence
-        together).
+        vote / prev+current co-occurrence vote / triple witness vote)
+        contributed per candidate, the final combined score, and --
+        critically -- which stage actually decided the winner
+        ("score", "bigram_frequency", "global_frequency", or
+        "lowest_token_id"). The final "score" is the sum of all eight
+        layers, including bigram_witness_vote (V5), adjacency_vote
+        (V6), prev_current_vote (V7), and triple_vote (V8) -- don't
+        add up just the other four expecting it to match; V5/V6/V7/V8
+        are usually the largest single contributors (V5 when the
+        exact bigram was literally witnessed, V6 when the context
+        token was ever directly, immediately followed by the
+        candidate -- directional, token->candidate only -- V7 when
+        the prompt's last two tokens and the candidate ever all three
+        shared one training sentence together, V8 when the prompt's
+        last two tokens were ever literally, immediately followed by
+        the candidate as one exact trained triple).
         Requires Open Mode to be available (model trained/loaded).
         Returns None otherwise.
 
@@ -425,7 +427,7 @@ class Analyser:
     def cache_control(self, action: str = "status") -> dict:
         """
         Toggle or inspect model.open_ctm's opt-in sparse per-token
-        score cache (V1/V2/V3/V4/V6 only -- V5/V7 always stay live,
+        score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8 always stay live,
         see ivm.py's build_cache()). `action`:
           "on"     -- (re)build the cache for the full vocabulary
                       (model.all_candidate_tokens()) and enable it
@@ -627,11 +629,12 @@ def main():
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("open-scores",
-                        help="Open Mode only: full V1-V7 weighted-vote breakdown "
+                        help="Open Mode only: full V1-V8 weighted-vote breakdown "
                              "for the next token given a prompt -- important tokens, "
                              "influence, per-layer contributions (including V5's "
-                             "bigram-witness vote, V6's adjacency vote, and V7's "
-                             "prev+current co-occurrence vote), the final "
+                             "bigram-witness vote, V6's adjacency vote, V7's "
+                             "prev+current co-occurrence vote, and V8's triple "
+                             "witness vote), the final "
                              "score, and which tie-break stage (if any) decided the winner. "
                              "This is Open Mode's PRIMARY selection mechanism, not a "
                              "tie-breaker; use this to audit why it picked what it picked. "
@@ -644,10 +647,20 @@ def main():
                          "either way, this just times/labels which path ran "
                          "(see the printed 'cache: on/off' line and the "
                          "cache_used field in --json output).")
+    p.add_argument("--top-n", type=int, default=ScoresDisplayConfig.TOP_N,
+                    help="How many top-scored candidates to print to the "
+                         "screen (default: config.py's "
+                         "ScoresDisplayConfig.TOP_N). Scoring itself always "
+                         "covers the entire vocabulary -- this only limits "
+                         "the printed table, since a big vocab can't fit on "
+                         "screen. Pass 0 to print every candidate. The "
+                         "winner is always printed even if it falls outside "
+                         "the top N. Ignored with --json, which always "
+                         "returns every candidate's score.")
 
     p = sub.add_parser("cache",
                         help="Toggle or inspect model.open_ctm's opt-in sparse "
-                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7 "
+                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8 "
                              "always stay live). Same scores either way; this is "
                              "purely a speed optimization -- see benchmark_cache.py "
                              "to actually measure the difference.")
@@ -858,27 +871,60 @@ def main():
         if result is None:
             print("Open Mode isn't ready (model not trained/loaded)", file=sys.stderr)
             sys.exit(1)
-        _emit(result, args.json, lambda r: (
-            print(f"  important tokens: {r['important_tokens']}"),
-            print(f"  influence:        {r['influence']}"),
+
+        def _print_open_scores(r):
+            print(f"  important tokens: {r['important_tokens']}")
+            print(f"  influence:        {r['influence']}")
+
+            # --top-n only limits what gets PRINTED -- the scores dict
+            # (and therefore the winner/tie-break decision) always
+            # covers the entire vocabulary. 0 (or a value >= the vocab
+            # size) means print everything.
+            ranked = sorted(r["scores"], key=r["scores"].get, reverse=True)
+            total = len(ranked)
+            top_n = args.top_n
+            shown = ranked if not top_n or top_n >= total else ranked[:top_n]
+            truncated = len(shown) < total
+            if truncated:
+                print(f"  (scoring the entire vocabulary -- {total} candidates; "
+                      f"showing top {len(shown)} by score -- "
+                      f"--top-n <n> or --top-n 0 to change)")
+
+            rows = [(c, round(r["important_vote"].get(c, 0), 2),
+                     round(r["influence_vote"].get(c, 0), 2),
+                     round(r["context_vote"].get(c, 0), 2),
+                     round(r["context_influence_vote"].get(c, 0), 2),
+                     round(r["bigram_witness_vote"].get(c, 0), 2),
+                     round(r["adjacency_vote"].get(c, 0), 2),
+                     round(r["prev_current_vote"].get(c, 0), 2),
+                     round(r["triple_vote"].get(c, 0), 2),
+                     round(r["scores"][c], 2),
+                     "<- winner" if c == r["winner"] else "")
+                    for c in shown]
+            if truncated and r["winner"] not in shown:
+                c = r["winner"]
+                rows.append((c, round(r["important_vote"].get(c, 0), 2),
+                             round(r["influence_vote"].get(c, 0), 2),
+                             round(r["context_vote"].get(c, 0), 2),
+                             round(r["context_influence_vote"].get(c, 0), 2),
+                             round(r["bigram_witness_vote"].get(c, 0), 2),
+                             round(r["adjacency_vote"].get(c, 0), 2),
+                             round(r["prev_current_vote"].get(c, 0), 2),
+                             round(r["triple_vote"].get(c, 0), 2),
+                             round(r["scores"][c], 2),
+                             "<- winner (outside top N)"))
             _print_table(
-                [(c, round(r["important_vote"].get(c, 0), 2),
-                  round(r["influence_vote"].get(c, 0), 2),
-                  round(r["context_vote"].get(c, 0), 2),
-                  round(r["context_influence_vote"].get(c, 0), 2),
-                  round(r["bigram_witness_vote"].get(c, 0), 2),
-                  round(r["adjacency_vote"].get(c, 0), 2),
-                  round(r["prev_current_vote"].get(c, 0), 2),
-                  round(r["scores"][c], 2),
-                  "<- winner" if c == r["winner"] else "")
-                 for c in sorted(r["scores"], key=r["scores"].get, reverse=True)],
+                rows,
                 ["candidate", "V1 (important)", "V2 (influence)", "V3 (context)",
                  "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)",
-                 "V7 (prev+curr)", "score", ""],
-            ),
+                 "V7 (prev+curr)", "V8 (triple)", "score", ""],
+            )
             print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']}"
-                  f"  ·  cache: {'on' if r['cache_used'] else 'off'})"),
-        ))
+                  f"  ·  cache: {'on' if r['cache_used'] else 'off'})")
+
+        # --json always returns every candidate's score, untruncated --
+        # top-n is a screen-display concern only.
+        _emit(result, args.json, _print_open_scores)
 
     elif args.command == "cache":
         try:

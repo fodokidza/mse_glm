@@ -26,7 +26,7 @@ they don't.
 # `RESERVED = {0, 1, 2, 3}` in sync by hand.
 PAD, UNK, BOS, EOS = 0, 1, 2, 3
 SPECIAL_TOKENS = {"<PAD>": PAD, "<UNK>": UNK, "<BOS>": BOS, "<EOS>": EOS}
-RESERVED = frozenset({PAD, UNK, BOS, EOS})
+RESERVED = frozenset({PAD, UNK, BOS})
 
 
 class TokenizerConfig:
@@ -59,19 +59,55 @@ class TokenizerConfig:
 
 
 class IVMConfig:
-    """Default weights for ivm.py's seven vote layers (V1-V7) -- see
+    """Default weights for ivm.py's eight vote layers (V1-V8) -- see
     ivm.py's module docstring for what each one means. important_weight,
     influence_weight, and context_influence_weight are deliberately
     smaller than context_weight BY DESIGN (see that docstring); if you
     retune these, that ratio is a property you need to preserve
     yourself, not something enforced automatically."""
     IMPORTANT_WEIGHT = 0.4            # V1
-    INFLUENCE_WEIGHT = 0.0           # V2
+    INFLUENCE_WEIGHT = 0.0003           # V2
     CONTEXT_WEIGHT = 1.0              # V3
-    CONTEXT_INFLUENCE_WEIGHT = 0.0   # V4
-    BIGRAM_WITNESS_WEIGHT = 1.8       # V5
-    ADJACENCY_WEIGHT = 1.0            # V6
+    CONTEXT_INFLUENCE_WEIGHT = 0.0003   # V4
+    BIGRAM_WITNESS_WEIGHT = 0.7       # V5
+    ADJACENCY_WEIGHT = 0.6            # V6
     PREV_CURRENT_WEIGHT = 1.7         # V7
+    TRIPLE_WEIGHT = 2.0                # V8 -- see ivm.py; peer-weighted
+                                        # with V5/V6/V7 (independently
+                                        # strong, literal evidence), set
+                                        # a notch above them since it is
+                                        # the single strictest, most
+                                        # literal check of the eight:
+                                        # an exact trained (previous,
+                                        # current, candidate) triple.
+
+
+class ScoresDisplayConfig:
+    """
+    How many candidates chat.py's `/scores <prompt>` and analyse.py's
+    `open-scores <prompt>` print to the screen by default.
+
+    Open Mode always SCORES the entire vocabulary -- that's the whole
+    point of full-vocab candidates (see ivm.py/model.py's
+    open_mode_candidate_scores() docstring) and this setting never
+    changes that: the winner and every tie-break decision are still
+    computed from every single candidate's score, exactly as before.
+    This only limits what gets rendered afterward, because a vocab of
+    a few thousand tokens turns into a few thousand unreadable rows on
+    a terminal or REPL screen.
+
+    The winner is always shown even when it doesn't land in the top N
+    by score -- callers should never let truncation silently hide which
+    token was actually picked.
+
+    Both call sites accept a per-call override (chat.py's `/scores
+    --top <n> <prompt>` / `--all`, analyse.py's `open-scores --top-n
+    <n>` / `--top-n 0`); this is only the default when no override is
+    given. `--json` output (analyse.py) is never truncated, since a
+    piped/persisted result is exactly the case where you DO want every
+    candidate.
+    """
+    TOP_N = 25
 
 
 class CTMConfig:
@@ -114,7 +150,7 @@ class TrainCorpusConfig:
     # into the graph per train_incremental() step. 1 is the safest
     # default (smallest per-step memory footprint), not the fastest --
     # see train_corpus.py's own module docstring for the cost tradeoff.
-    DEFAULT_BATCH_SIZE = 1
+    DEFAULT_BATCH_SIZE = 10
 
 
 class ServerConfig:

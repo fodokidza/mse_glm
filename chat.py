@@ -10,7 +10,7 @@ of a random pick -- see inference.py's _bigram_tie_break.
 
 Open Mode's candidates are the ENTIRE vocabulary, every step -- no
 successor gating at all. Selection is CTM/IVM weighted voting over
-that full candidate set -- SEVEN independent, summed vote layers:
+that full candidate set -- EIGHT independent, summed vote layers:
   V1 important + V2 influence   -- both deliberately small, ride on
                                     top of V3, can only ever nudge a
                                     tie V3 left open, never override it
@@ -40,6 +40,14 @@ that full candidate set -- SEVEN independent, summed vote layers:
                                     training sentence together, no
                                     adjacency required between any of
                                     them? Also PEER-weighted with V3.
+  V8 triple witness vote        -- a single fixed-pair check, stricter
+                                    than V7: was (previous, current,
+                                    candidate) ever literally ONE
+                                    consecutive trained triple, in
+                                    that exact order? Weighted a notch
+                                    ABOVE V3/V5/V6/V7 -- the single
+                                    strictest, most literal evidence
+                                    of all eight layers.
 then a deterministic cascade if the score itself still ties: bigram
 frequency, then global frequency, then lowest token id. See ivm.py's
 module docstring for the full formula. /scores below exposes the
@@ -48,7 +56,7 @@ were important, what each layer contributed, and which stage of the
 tie-break cascade (if any) actually decided it -- since an
 unexplained score is not something this project wants to hand back.
 
-V1/V2/V3/V4/V6 (not V5/V7 -- see ivm.py's build_cache()) can
+V1/V2/V3/V4/V6 (not V5/V7/V8 -- see ivm.py's build_cache()) can
 optionally be served from a sparse precomputed per-token cache
 instead of recomputed from scratch every step -- off by default,
 same answer either way, purely a speed optimization. /cache below
@@ -61,9 +69,16 @@ Commands:
                              vocabulary, CTM/IVM weighted voting as
                              primary mechanism)
   /explain <prev> | <curr>  explain a single inference step
-  /scores <prompt>          Open Mode only: full V1-V7 score breakdown for
+  /scores <prompt>          Open Mode only: full V1-V8 score breakdown for
                              the next token, plus which tie-break stage (if
-                             any) decided the winner
+                             any) decided the winner. Always SCORES the
+                             entire vocabulary -- only DISPLAYS the top N
+                             by score (config.py's ScoresDisplayConfig.TOP_N,
+                             25 by default), since a big vocab can't fit on
+                             screen. `/scores --top <n> <prompt>` shows a
+                             different number, `/scores --all <prompt>` shows
+                             every candidate. The winner is always shown even
+                             if it falls outside the shown set.
   /bigram <prev> <curr>     bigram frequency for a pair (used for Strict
                              Mode's tie-break and Open Mode's first
                              tie-break stage) -- also shows how many
@@ -95,7 +110,7 @@ text and reports illegal_prompt_bigram).
 import argparse
 from model import MSEGraphLanguageModel
 from analyse import Analyser
-from config import GenerationConfig
+from config import GenerationConfig, ScoresDisplayConfig
 
 
 def _match_command(line, cmd):
@@ -122,6 +137,34 @@ def _unquote(token):
     return token.strip("\"'")
 
 
+def _parse_top_n_flag(arg):
+    """
+    Parse an optional leading `--top <n>` or `--all` flag off a
+    /scores-style argument string (e.g. "/scores --top 50 the cat").
+    Returns (top_n, rest):
+      top_n = "all"  -- --all was given, show every candidate
+      top_n = <int>  -- --top <n> was given, show that many
+      top_n = None   -- no flag given, caller applies its own default
+    `rest` is the remaining text (the actual prompt) with the flag
+    and its value stripped off. A malformed `--top` (missing or
+    non-numeric value) is left in `rest` untouched and top_n is None,
+    so it surfaces as part of a normal "prompt not found" complaint
+    rather than being silently swallowed.
+    """
+    if arg.startswith("--all"):
+        return "all", arg[len("--all"):].strip()
+    if arg.startswith("--top"):
+        parts = arg.split(None, 2)
+        if len(parts) >= 2:
+            try:
+                n = int(parts[1])
+                rest = parts[2] if len(parts) > 2 else ""
+                return n, rest
+            except ValueError:
+                pass
+    return None, arg
+
+
 def main():
     parser = argparse.ArgumentParser(description="Chat with a trained MSE-GLM model")
     parser.add_argument("--model",      required=True, help="Saved model folder")
@@ -137,8 +180,8 @@ def main():
     print(f"  Stats: {model.stats()}")
     print(f"  Mode:  {mode.upper()}")
     print("  (fully deterministic -- no randomness anywhere in generation)")
-    print("\n  Commands: /mode strict|open  /explain  /scores  /bigram  /cache  /shared  "
-          "/similarity  /stats  /clusters  /quit\n")
+    print("\n  Commands: /mode strict|open  /explain  /scores [--top n|--all]  /bigram  "
+          "/cache  /shared  /similarity  /stats  /clusters  /quit\n")
 
     while True:
         try:
@@ -219,21 +262,39 @@ def main():
             if mode != "open":
                 print("  /scores only applies in Open Mode (/mode open first)")
                 continue
-            prompt = _unquote(arg)
+            top_n_flag, rest = _parse_top_n_flag(arg)
+            prompt = _unquote(rest)
             if not prompt:
-                print("  Usage: /scores <prompt>")
+                print("  Usage: /scores [--top <n> | --all] <prompt>")
                 continue
             info = model.open_mode_candidate_scores(prompt)
             if info is None:
                 print("  Open Mode isn't ready (model not trained/loaded).")
                 continue
+
+            # Scoring always covers the entire vocabulary (that's what
+            # decides the real winner/tie-break) -- top_n_flag / the
+            # config default only limit what gets PRINTED below.
+            ranked = sorted(info["scores"], key=info["scores"].get, reverse=True)
+            total = len(ranked)
+            if top_n_flag == "all":
+                shown = ranked
+            elif top_n_flag is not None:
+                shown = ranked[:top_n_flag]
+            else:
+                shown = ranked[:ScoresDisplayConfig.TOP_N]
+            truncated = len(shown) < total
+
             print(f"  important tokens: {info['important_tokens']}")
             print(f"  influence:        {info['influence']}")
-            print(f"  (scoring the entire vocabulary -- {len(info['scores'])} candidates)")
-            print(f"  {'candidate':15s} {'V1 (important)':>15s} {'V2 (influence)':>15s} "
-                  f"{'V3 (context)':>13s} {'V4 (ctx.infl.)':>15s} {'V5 (big.witness)':>17s} "
-                  f"{'V6 (adjacent)':>14s} {'V7 (prev+curr)':>15s} {'score':>8s}")
-            for c in sorted(info["scores"], key=info["scores"].get, reverse=True):
+            if truncated:
+                print(f"  (scoring the entire vocabulary -- {total} candidates; "
+                      f"showing top {len(shown)} by score -- "
+                      f"`/scores --top <n> ...` or `/scores --all ...` to change)")
+            else:
+                print(f"  (scoring the entire vocabulary -- {total} candidates)")
+
+            def _print_score_row(c, tag=""):
                 v1 = info["important_vote"].get(c, 0)
                 v2 = info["influence_vote"].get(c, 0)
                 v3 = info["context_vote"].get(c, 0)
@@ -241,9 +302,22 @@ def main():
                 v5 = info["bigram_witness_vote"].get(c, 0)
                 v6 = info["adjacency_vote"].get(c, 0)
                 v7 = info["prev_current_vote"].get(c, 0)
-                marker = "  <- winner" if c == info["winner"] else ""
+                v8 = info["triple_vote"].get(c, 0)
+                marker = tag if tag else ("  <- winner" if c == info["winner"] else "")
                 print(f"    {c:13s} {v1:15.2f} {v2:15.2f} {v3:13.2f} {v4:15.2f} {v5:17.2f} "
-                      f"{v6:14.2f} {v7:15.2f} {info['scores'][c]:8.2f}{marker}")
+                      f"{v6:14.2f} {v7:15.2f} {v8:13.2f} {info['scores'][c]:8.2f}{marker}")
+
+            print(f"  {'candidate':15s} {'V1 (important)':>15s} {'V2 (influence)':>15s} "
+                  f"{'V3 (context)':>13s} {'V4 (ctx.infl.)':>15s} {'V5 (big.witness)':>17s} "
+                  f"{'V6 (adjacent)':>14s} {'V7 (prev+curr)':>15s} {'V8 (triple)':>13s} {'score':>8s}")
+            for c in shown:
+                _print_score_row(c)
+            # The winner is never allowed to silently fall off-screen --
+            # if truncation cut it out of the shown set, print it separately.
+            if truncated and info["winner"] not in shown:
+                print("    ...")
+                _print_score_row(info["winner"], tag="  <- winner (outside top N)")
+
             print(f"  winner: {info['winner']}  (decided by: {info['tie_break_stage']}"
                   f"  ·  cache: {'on' if info['cache_used'] else 'off'})")
             continue
@@ -280,7 +354,7 @@ def main():
                 model.open_ctm.enable_cache(model.all_candidate_tokens())
                 entries = sum(len(row) for row in model.open_ctm._token_cache.values())
                 print(f"  cache: ON  ({len(model.open_ctm._token_cache)} token rows, "
-                      f"{entries} (t,c) entries -- V1/V2/V3/V4/V6 only, V5/V7 stay live)")
+                      f"{entries} (t,c) entries -- V1/V2/V3/V4/V6 only, V5/V7/V8 stay live)")
             elif sub == "off":
                 model.open_ctm.disable_cache()
                 print("  cache: OFF  (back to live scoring every step)")

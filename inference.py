@@ -47,8 +47,8 @@ once at construction (see model.py's all_candidate_tokens()) — not
 narrowed by whether a bigram was ever literally observed. EVERY
 candidate is scored — via `importance_votes.select()` (ivm.py's
 PRIMARY, not legacy, API) — using cluster-membership-derived
-"important" context tokens plus five other independent vote layers
-(V1-V7, see ivm.py), and the highest scorer wins. This is deterministic
+"important" context tokens plus seven other independent vote layers
+(V1-V8, see ivm.py), and the highest scorer wins. This is deterministic
 by construction (ties broken by lowest token id inside select()); if no
 importance_votes object is supplied, or `self.vocab` is empty, the
 fallback is ALSO deterministic — lowest token id in `self.vocab` — never
@@ -226,13 +226,15 @@ class InferenceEngine:
         bigram was ever literally observed — every one of them is
         scored here, this is not a tie-break inserted after some
         other mechanism narrows things down. See ivm.py's
-        select()/score_candidates() for the seven-layer weighted-
-        voting formula (V1-V7; V1/V2/V4 deliberately weighted small
+        select()/score_candidates() for the eight-layer weighted-
+        voting formula (V1-V8; V1/V2/V4 deliberately weighted small
         so they can only nudge a tie V3 left open, never override it;
-        V5/V6/V7 peer-weighted with V3) and for the bigram-frequency →
+        V5/V6/V7/V8 peer-weighted with V3, V8 a notch above) and for
+        the bigram-frequency →
         global-frequency → lowest-token-id tie-break cascade `current`
         feeds into. `previous` is forwarded too now, purely for V7
-        (the previous+current co-occurrence vote) -- it plays no role
+        (the previous+current co-occurrence vote) and V8 (the triple
+        witness vote) -- it plays no role
         in the tie-break cascade itself, only `current` does.
 
         Deterministic, always: select() itself resolves any residual
@@ -281,7 +283,7 @@ class InferenceEngine:
         # ── OPEN MODE: candidates are ALWAYS the full vocabulary ───────────
         # No successor gating at all -- self.vocab (set once at construction,
         # see model.all_candidate_tokens()) is the entire candidate universe
-        # every step, scored by IVM's V1-V7 weighted voting (ivm.py). Not an
+        # every step, scored by IVM's V1-V8 weighted voting (ivm.py). Not an
         # opt-in: any engine constructed with mode="open" behaves this way
         # unconditionally. Strict Mode engines never reach this branch.
         if self.mode == "open":

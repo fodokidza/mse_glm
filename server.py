@@ -115,7 +115,7 @@ print(f"  Open Mode:     {'available' if OPEN_AVAILABLE else 'not built'}\n")
 # exposes: Strict Mode gates every step to literal training bigrams
 # (a two-stage lineage vote, tie-broken deterministically); Open Mode
 # has no successor gating at all -- candidates are the ENTIRE
-# vocabulary every step, chosen by IVM's seven-layer weighted voting
+# vocabulary every step, chosen by IVM's eight-layer weighted voting
 # (see ivm.py) rather than by whether a bigram was ever literally
 # observed.
 
@@ -128,7 +128,7 @@ MODE_PRESETS = {
 # Two OPTIONAL, read-only diagnostic endpoints sit alongside the mode
 # presets above -- neither mutates session state:
 #   /scores, /bigram (new routes below) -- read-only audit endpoints,
-#       not generation. /scores exposes the full V1-V7 weighted-vote
+#       not generation. /scores exposes the full V1-V8 weighted-vote
 #       breakdown IVM used to pick the next token (see ivm.py);
 #       /bigram exposes the raw evidence counts (including V5's
 #       literal witness-sentence count) for one (prev, curr) pair.
@@ -1526,7 +1526,7 @@ def mode_route():
 def scores():
     """
     Open Mode only, read-only, stateless (no session_id, no history
-    mutation) -- the full V1-V7 weighted-vote breakdown IVM used (or
+    mutation) -- the full V1-V8 weighted-vote breakdown IVM used (or
     would use) to pick the next token for `prompt` (see ivm.py's
     score_candidates()/select()). Mirrors chat.py's /scores REPL
     command and analyse.py's `open-scores` CLI subcommand.
@@ -1535,20 +1535,24 @@ def scores():
     Always scores the entire vocabulary -- Open Mode has no successor
     gating at all, so there is no narrower option anymore.
 
-    "scores" is the FINAL combined score -- the sum of ALL SEVEN
+    "scores" is the FINAL combined score -- the sum of ALL EIGHT
     layers (important_vote/influence_vote/context_vote/
     context_influence_vote/bigram_witness_vote/adjacency_vote/
-    prev_current_vote), each also returned separately so the
+    prev_current_vote/triple_vote), each also returned separately so the
     breakdown stays auditable. Don't expect the first four to sum to
     "scores" on their own -- bigram_witness_vote (V5), adjacency_vote
-    (V6), and prev_current_vote (V7) are usually the largest single
+    (V6), prev_current_vote (V7), and triple_vote (V8) are usually the
+    largest single
     contributors: V5 whenever the exact bigram was literally seen in
     training, V6 whenever the context token was ever directly,
     immediately followed by the candidate (directional -- token->
     candidate only), V7 whenever the prompt's last two tokens and the
     candidate ever all three shared one training sentence together
     (no adjacency required, but requires BOTH of the last two tokens,
-    not just one).
+    not just one), V8 whenever the prompt's last two tokens were ever
+    literally, immediately followed by the candidate as one exact
+    trained triple (stricter than V7 -- requires that exact order and
+    adjacency, not just shared presence in a sentence).
 
     "cache_used" reports whether this breakdown was actually served
     from Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see
@@ -1613,7 +1617,7 @@ def bigram():
 def cache_route():
     """
     Toggle or inspect Open Mode's opt-in sparse per-token score cache
-    (V1/V2/V3/V4/V6 only -- V5/V7 always stay live, see ivm.py's
+    (V1/V2/V3/V4/V6 only -- V5/V7/V8 always stay live, see ivm.py's
     build_cache()). Server-wide, not per-session -- there is only one
     `model.open_ctm`, shared across every session. Read-only for
     "status"; "on"/"off" mutate server-wide state, so this is a
@@ -1704,7 +1708,7 @@ if __name__ == '__main__':
     print(f"    POST /generate")
     print(f"    POST /stream")
     print(f"    POST /mode")
-    print(f"    POST /scores   (Open Mode only -- full V1-V7 breakdown for a prompt)")
+    print(f"    POST /scores   (Open Mode only -- full V1-V8 breakdown for a prompt)")
     print(f"    POST /bigram   (raw bigram evidence incl. V5 witness_sentences)")
     print(f"    POST /cache    (toggle/inspect the sparse V1/V2/V3/V4/V6 score cache)")
     print(f"    POST /reset")

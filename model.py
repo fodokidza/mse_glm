@@ -396,9 +396,10 @@ class MSEGraphLanguageModel:
         "scores" is the FINAL combined score: V1 ("important_vote") +
         V2 ("influence_vote") + V3 ("context_vote") + V4
         ("context_influence_vote") + V5 ("bigram_witness_vote") + V6
-        ("adjacency_vote") + V7 ("prev_current_vote") -- seven
-        independent vote layers, summed, each exposed separately so
-        all seven stay independently auditable. "winner" and
+        ("adjacency_vote") + V7 ("prev_current_vote") + V8
+        ("triple_vote") -- eight independent vote layers, summed, each
+        exposed separately so all eight stay independently auditable.
+        "winner" and
         "tie_break_stage" report what select() actually returned and
         which stage of the cascade decided it (score /
         bigram_frequency / global_frequency / lowest_token_id) -- see
@@ -451,6 +452,7 @@ class MSEGraphLanguageModel:
             "bigram_witness_vote": {dec(c): v for c, v in trace["bigram_witness_vote"].items()},
             "adjacency_vote": {dec(c): v for c, v in trace["adjacency_vote"].items()},
             "prev_current_vote": {dec(c): v for c, v in trace["prev_current_vote"].items()},
+            "triple_vote": {dec(c): v for c, v in trace["triple_vote"].items()},
             "scores": {dec(c): v for c, v in trace["scores"].items()},
             "winner": dec(winner) if winner is not None else None,
             "tie_break_stage": tie_break_stage,

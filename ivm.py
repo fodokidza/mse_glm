@@ -13,21 +13,22 @@ Two entry points, two different roles:
       PRIMARY Open Mode mechanism. Called on the FULL legal candidate
       set every step, not just on ties -- this is what decides Open
       Mode generation now, replacing Stage 2's lineage tie-break
-      entirely (see inference.py). SEVEN INDEPENDENT vote layers,
+      entirely (see inference.py). EIGHT INDEPENDENT vote layers,
       summed -- not one formula where a factor multiplies another.
       An important token is ALSO a context token (I ⊆ P), so it casts
-      up to six of the seven votes: V1 and V2 because it's important,
+      up to six of the eight votes: V1 and V2 because it's important,
       PLUS its own V3, V4, V5, and V6 votes as an ordinary context
       member -- it never loses those for being important, V1/V2 are
-      additive bonuses. V7 is different from all six -- it is not
-      "every context token votes," it is a single fixed-pair check on
-      `previous` and `current` specifically (see below).
+      additive bonuses. V7 and V8 are different from all six -- neither
+      is "every context token votes," each is a single fixed-pair (V7)
+      or fixed-triple (V8) check on `previous`/`current` specifically
+      (see below).
 
   build_cache(candidates) / enable_cache(candidates=None) / disable_cache()
       Opt-in sparse per-token cache for V1/V2/V3/V4/V6 -- each is a sum
       over context tokens of a (t, c)-only contribution, so it's
       precomputable once and reused every step instead of recomputed
-      from scratch. V5/V7 stay live always (see build_cache()'s own
+      from scratch. V5/V7/V8 stay live always (see build_cache()'s own
       comment for why). Stores only nonzero (t, c) entries, never a
       dense |vocab| x |vocab| table. Off by default; NOT serialized by
       to_dict/from_dict (fully re-derivable from state that is). See
@@ -96,7 +97,7 @@ Two entry points, two different roles:
             literal Bridge + Relationship Matrix only, same honesty
             constraint as _token_rels (see notes below).
 
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C)
+        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
 
       important_weight, influence_weight, and context_influence_weight
       all default strictly SMALLER than context_weight (0.1, 0.1, 0.01
@@ -158,7 +159,39 @@ Two entry points, two different roles:
             itself. Literal Relationship Matrix only (via
             token_to_relationships, same source as every other layer).
 
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C)
+        V8(C) = triple_weight × 1[(previous, current, C) was ever a
+                                    literal, consecutive Bridge Matrix
+                                    triple in training]
+            "Triple witness" vote -- the single STRICTEST, most
+            literal question of all eight layers: not "did these three
+            tokens ever share a sentence" (V7), not "was C ever
+            immediately preceded by current, in some sentence, for
+            some reason" (V5's bigram_relationships key is (source,
+            bridge), i.e. current->C as the first two slots of SOME
+            triple) -- V8 asks whether `previous`, `current`, and C
+            were ever literally seen back-to-back-to-back as ONE
+            EXACT trained triple: source=previous, bridge=current,
+            target=C. This is precisely the same literal-triple test
+            Strict Mode's Stage 2 already uses to decide legality
+            (see inference.py) -- V8 exposes it as a vote instead of a
+            hard filter, so Open Mode (whose candidates span the
+            whole vocabulary, not just literal successors) can reward
+            a candidate for being the EXACT literal continuation
+            without that candidate being the ONLY thing allowed to
+            win. One flat binary vote per candidate, not summed over
+            context -- same shape as V7, but a three-way EXACT MATCH
+            instead of a three-way SHARED-SENTENCE check. No vote for
+            C if `previous` or `current` is None or reserved, or if C
+            is `previous` or `current` itself. Literal Bridge Matrix
+            only (see literal_triples()) -- every triple there already
+            occurred at least once in training, same honesty
+            guarantee as every other layer. Default weight 2.0 --
+            PEER-weighted with V5/V6/V7 (independently strong, literal
+            evidence, not a structural nudge), set a notch above them
+            since an exact triple match is strictly more specific
+            evidence than any of V5/V6/V7 individually.
+
+        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
 
       This deliberately reopens the door rule 24 shut ("unclustered
       tokens contribute 0 votes") -- V3/V4 are a considered exception,
@@ -369,6 +402,29 @@ def adjacent_pairs(model):
     return {(a, b) for a, b in zip(e.src, e.dst)}
 
 
+def literal_triples(model):
+    """
+    {(source, bridge, target), ...} -- every literal, deduplicated
+    Bridge Matrix triple: three tokens that were seen consecutively,
+    in exactly that order, at least once in training. This is the
+    evidence V8's triple-witness vote checks (previous, current, C)
+    against: an exact match here means previous->current->C happened
+    as one literal trained continuation, not merely that the three
+    tokens shared a sentence somewhere (that weaker question is V7's
+    job, via token_to_relationships/rels intersection).
+
+    Built ONLY from the literal Bridge Matrix -- every triple there
+    already occurred at least once in training (BridgeMatrix.build()
+    only ever records triples it actually saw), so no additional
+    relationship-existence check is needed here, unlike
+    bigram_relationships() (which layers relationship_ids on top of
+    the Bridge Matrix for V5's narrower per-sentence question). Same
+    literal-only reasoning as every other helper in this module.
+    """
+    b = model.bridges
+    return {(b.source[i], b.bridge[i], b.target[i]) for i in range(len(b.source))}
+
+
 class ImportanceVoteMatrix:
     """
     Precomputed, once-built support for importance voting: which
@@ -388,9 +444,11 @@ class ImportanceVoteMatrix:
         self._bigram_witness_weight = IVMConfig.BIGRAM_WITNESS_WEIGHT  # V5's per-token weight -- see score_candidates()
         self._adjacency_weight = IVMConfig.ADJACENCY_WEIGHT  # V6's per-token weight -- see score_candidates()
         self._prev_current_weight = IVMConfig.PREV_CURRENT_WEIGHT  # V7's flat weight -- see score_candidates()
+        self._triple_weight = IVMConfig.TRIPLE_WEIGHT  # V8's flat weight -- see score_candidates()
         self._bigram_freq = {}  # (token, candidate) -> count, from bigram_frequencies()
         self._bigram_rels = {}  # (token, candidate) -> set(rel_id), from bigram_relationships()
         self._adjacent = set()  # {frozenset({a,b}), ...}, from adjacent_pairs()
+        self._triples = set()   # {(source, bridge, target), ...}, from literal_triples()
         # Sparse per-token score cache for V1/V2/V3/V4/V6 -- see build_cache()
         # and the "cache" branch of score_candidates(). NOT serialized by
         # to_dict/from_dict (it's fully re-derivable from _token_rels,
@@ -407,7 +465,8 @@ class ImportanceVoteMatrix:
               context_influence_weight=IVMConfig.CONTEXT_INFLUENCE_WEIGHT,
               bigram_witness_weight=IVMConfig.BIGRAM_WITNESS_WEIGHT,
               adjacency_weight=IVMConfig.ADJACENCY_WEIGHT,
-              prev_current_weight=IVMConfig.PREV_CURRENT_WEIGHT, use_cache=False):
+              prev_current_weight=IVMConfig.PREV_CURRENT_WEIGHT,
+              triple_weight=IVMConfig.TRIPLE_WEIGHT, use_cache=False):
         ivm = cls()
         ivm._token_rels = token_to_relationships(model)
         ivm._important = important_member_tokens(model, mode=mode)
@@ -418,9 +477,11 @@ class ImportanceVoteMatrix:
         ivm._bigram_witness_weight = bigram_witness_weight
         ivm._adjacency_weight = adjacency_weight
         ivm._prev_current_weight = prev_current_weight
+        ivm._triple_weight = triple_weight
         ivm._bigram_freq = bigram_frequencies(model, mode=mode)
         ivm._bigram_rels = bigram_relationships(model)
         ivm._adjacent = adjacent_pairs(model)
+        ivm._triples = literal_triples(model)
         if use_cache:
             # Open Mode always scores the FULL vocabulary as candidates
             # (see model.all_candidate_tokens()/model.py's
@@ -442,14 +503,16 @@ class ImportanceVoteMatrix:
     # _adjacency_vote -- plus _knows_rels' own O(|important present| x
     # |candidates|) loop) on every single call.
     #
-    # V5 and V7 are deliberately NOT part of this cache: V5's vote for
-    # (t, c) also depends on `current` (a different `current` means a
-    # different witness set for the same t/c), and V7 isn't a per-token
-    # contribution at all -- it's a single fixed-pair check on
-    # (previous, current). Both are already cheap, sparse set-intersection
-    # lookups (over _bigram_rels / _token_rels), not the dense-looking
-    # nested loops V1-V4/V6 use live -- so they're computed live in
-    # score_candidates() whether or not the cache is enabled.
+    # V5, V7, and V8 are deliberately NOT part of this cache: V5's vote
+    # for (t, c) also depends on `current` (a different `current` means
+    # a different witness set for the same t/c), and V7/V8 aren't a
+    # per-token contribution at all -- each is a single fixed-pair
+    # (V7) or fixed-triple (V8) check on (previous, current), not a
+    # sum over context tokens. All three are already cheap, sparse
+    # set/tuple lookups (over _bigram_rels / _token_rels / _triples),
+    # not the dense-looking nested loops V1-V4/V6 use live -- so
+    # they're computed live in score_candidates() whether or not the
+    # cache is enabled.
     #
     # Only ONE raw quantity actually varies per (t, c) pair here:
     # shared = len(rels(t) & rels(c)). V1 (a token knows C at all) and V3
@@ -786,6 +849,39 @@ class ImportanceVoteMatrix:
                 votes[c] += 1.0
         return dict(votes)
 
+    def _triple_vote(self, previous, current, candidates):
+        """
+        V8: for each candidate C, cast one full binary vote iff
+        (previous, current, C) was ever literally a single, consecutive
+        Bridge Matrix triple in training -- source=previous,
+        bridge=current, target=C, all three in that exact order,
+        checked against self._triples (see literal_triples()). Same
+        fixed-pair SHAPE as V7 (one flat vote per candidate, not
+        summed over context), but a strictly EXACT-MATCH question
+        instead of V7's "did all three merely share a sentence"
+        question -- (previous, current, C) can share a sentence
+        without ever having occurred as this literal triple (V7 fires,
+        V8 doesn't), but it can never occur as this literal triple
+        without also sharing a sentence (V8 firing implies V7 would
+        too, for the same candidate).
+
+        Returns {} if `previous` or `current` is None or reserved. A
+        candidate never votes via being `previous` or `current`
+        itself, same "a token never votes for itself" rule as every
+        other layer.
+        """
+        votes = Counter()
+        if previous is None or current is None:
+            return dict(votes)
+        if previous in RESERVED or current in RESERVED:
+            return dict(votes)
+        for c in candidates:
+            if c in RESERVED or c == previous or c == current:
+                continue
+            if (previous, current, c) in self._triples:
+                votes[c] += 1.0
+        return dict(votes)
+
     def votes(self, candidates, context_tokens):
         """
         Full working, exposed for inspection/tracing (not just the
@@ -940,7 +1036,23 @@ class ImportanceVoteMatrix:
                 V3/V5/V6: independently strong, specific, sentence-
                 level evidence, not a structural nudge.
 
-            score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C)
+            V8(C) = triple_weight × 1[(previous, current, C) was ever
+                        a literal, consecutive Bridge Matrix triple]
+                "Triple witness" vote -- the strictest of all eight:
+                not "did these three share a sentence" (V7), but "was
+                source=previous, bridge=current, target=C ever the
+                EXACT trained triple." Same fixed-pair shape as V7
+                (one flat vote per candidate, not summed over
+                context; all zeros if `previous` or `current` is
+                None), but an exact three-way match instead of a
+                three-way shared-sentence check -- the same literal
+                test Strict Mode's Stage 2 already uses for legality,
+                exposed here as a vote instead of a hard filter.
+                Default weight 2.0 -- a notch above V5/V6/V7's peer
+                weight, since exact-triple evidence is strictly more
+                specific than any of theirs individually.
+
+            score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
 
         By construction (important_weight, influence_weight, and
         context_influence_weight all smaller than context_weight),
@@ -949,10 +1061,10 @@ class ImportanceVoteMatrix:
         nudge a decision V3 left open, never override one it already
         made. Confirm this holds for your own weights if you change
         them: it's a property of the ratios, not guaranteed
-        automatically. V5, V6, and V7 are the three layers NOT bound
-        by that rule -- each is independently strong, specific
+        automatically. V5, V6, V7, and V8 are the four layers NOT
+        bound by that rule -- each is independently strong, specific
         evidence, and by default can each outweigh V3 on its own
-        (weight 1.0, same as V3).
+        (weight >= 1.0, same as or greater than V3).
 
         Returns a full trace dict, not just scores, so this stays
         auditable: {"important_tokens": [...], "knows": {...},
@@ -960,8 +1072,9 @@ class ImportanceVoteMatrix:
         "influence_vote": {C: V2}, "context_vote": {C: V3},
         "context_influence_vote": {C: V4}, "bigram_witness_vote":
         {C: V5}, "adjacency_vote": {C: V6}, "prev_current_vote":
-        {C: V7}, "scores": {C: V1+V2+V3+V4+V5+V6+V7}, "cache_used": bool}.
-        "scores" is the one that actually drives select(); the seven
+        {C: V7}, "triple_vote": {C: V8},
+        "scores": {C: V1+V2+V3+V4+V5+V6+V7+V8}, "cache_used": bool}.
+        "scores" is the one that actually drives select(); the eight
         components are exposed separately (already weighted, so they
         sum directly to "scores") so each stays independently
         auditable. Every candidate in `candidates` gets a "scores"
@@ -975,8 +1088,8 @@ class ImportanceVoteMatrix:
         _adjacent -- same formulas, same weights, identical numeric
         result, just without redoing the O(|context| x |candidates|)
         work every step (see build_cache()'s comment for why those five
-        layers -- and only those five -- are cacheable this way). V5
-        and V7 are always computed live either way. "cache_used" in the
+        layers -- and only those five -- are cacheable this way). V5,
+        V7, and V8 are always computed live either way. "cache_used" in the
         returned trace reports which path actually ran, so cached vs.
         live runs stay easy to compare/verify against each other. A
         candidate-set mismatch (e.g. Strict Mode calling this with a
@@ -1115,11 +1228,17 @@ class ImportanceVoteMatrix:
         prev_current_vote = {c: self._prev_current_weight * v
                               for c, v in raw_prev_current_vote.items()}
 
+        # V8 -- a single fixed-triple check: was (previous, current, C)
+        # ever literally one consecutive trained Bridge Matrix triple
+        raw_triple_vote = self._triple_vote(previous, current, candidates)
+        triple_vote = {c: self._triple_weight * v
+                       for c, v in raw_triple_vote.items()}
+
         final_scores = {
             c: important_vote.get(c, 0) + influence_vote.get(c, 0)
                + context_vote.get(c, 0) + context_influence_vote.get(c, 0)
                + bigram_witness_vote.get(c, 0) + adjacency_vote.get(c, 0)
-               + prev_current_vote.get(c, 0)
+               + prev_current_vote.get(c, 0) + triple_vote.get(c, 0)
             for c in candidates
         }
 
@@ -1132,6 +1251,7 @@ class ImportanceVoteMatrix:
                 "bigram_witness_vote": bigram_witness_vote,
                 "adjacency_vote": adjacency_vote,
                 "prev_current_vote": prev_current_vote,
+                "triple_vote": triple_vote,
                 "scores": final_scores,
                 "cache_used": use_cache}
 
@@ -1146,11 +1266,11 @@ class ImportanceVoteMatrix:
     def select(self, candidates, context_tokens, current=None, previous=None):
         """
         Deterministic winner among `candidates` by the combined score
-        (V1 + V2 + V3 + V4 + V5 + V6 + V7, see score_candidates), with
-        a three-stage deterministic tie-break cascade when the
+        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8, see score_candidates),
+        with a three-stage deterministic tie-break cascade when the
         combined score itself doesn't discriminate:
 
-            1. score (V1..V7)       -- primary, structural + contextual
+            1. score (V1..V8)       -- primary, structural + contextual
             2. bigram frequency     -- how often `candidate` literally
                                         followed `current` (requires
                                         `current`; skipped if not given)
@@ -1161,10 +1281,11 @@ class ImportanceVoteMatrix:
         `current` and `previous` are also forwarded into
         score_candidates() itself now (not just used here for the
         tie-break), since V5 needs `current` to look up which bigram
-        is being scored and V7 needs BOTH `previous` and `current` to
-        check the three-way co-occurrence -- passing them through
-        once is enough; V5 degrades to all-zero votes if `current` is
-        omitted, V7 degrades to all-zero votes if either is omitted.
+        is being scored and V7/V8 each need BOTH `previous` and
+        `current` to check their respective three-way conditions --
+        passing them through once is enough; V5 degrades to all-zero
+        votes if `current` is omitted, V7/V8 degrade to all-zero votes
+        if either is omitted.
 
         Each stage only ever narrows a tie the stage before it left
         open; it never overrides a decision an earlier stage already
@@ -1201,9 +1322,11 @@ class ImportanceVoteMatrix:
             "bigram_witness_weight": self._bigram_witness_weight,
             "adjacency_weight": self._adjacency_weight,
             "prev_current_weight": self._prev_current_weight,
+            "triple_weight": self._triple_weight,
             "bigram_freq": {f"{t}:{c}": n for (t, c), n in self._bigram_freq.items()},
             "bigram_rels": {f"{t}:{c}": sorted(r) for (t, c), r in self._bigram_rels.items()},
             "adjacent": [list(pair) for pair in self._adjacent],
+            "triples": [list(tri) for tri in self._triples],
         }
 
     @classmethod
@@ -1218,6 +1341,7 @@ class ImportanceVoteMatrix:
         ivm._bigram_witness_weight = d.get("bigram_witness_weight", IVMConfig.BIGRAM_WITNESS_WEIGHT)
         ivm._adjacency_weight = d.get("adjacency_weight", IVMConfig.ADJACENCY_WEIGHT)
         ivm._prev_current_weight = d.get("prev_current_weight", IVMConfig.PREV_CURRENT_WEIGHT)
+        ivm._triple_weight = d.get("triple_weight", IVMConfig.TRIPLE_WEIGHT)
         ivm._bigram_freq = {}
         for key, n in d.get("bigram_freq", {}).items():
             t, c = key.split(":")
@@ -1227,4 +1351,5 @@ class ImportanceVoteMatrix:
             t, c = key.split(":")
             ivm._bigram_rels[(int(t), int(c))] = set(r)
         ivm._adjacent = {tuple(pair) for pair in d.get("adjacent", [])}
+        ivm._triples = {tuple(tri) for tri in d.get("triples", [])}
         return ivm

@@ -774,23 +774,23 @@ a piglet is like a pig.
                                 "knows", "important_vote", "influence_vote",
                                 "context_vote", "context_influence_vote",
                                 "bigram_witness_vote", "adjacency_vote",
-                                "prev_current_vote",
+                                "prev_current_vote", "triple_vote",
                                 "scores", "winner", "tie_break_stage",
                                 "cache_used"}, info)
     check("open_mode_candidate_scores always covers the entire vocabulary now",
           len(info["candidates"]) == len(m_open.all_candidate_tokens()), info)
     # Now scoring the ENTIRE vocabulary (not just legal successors), so
     # many low-scoring subword/junk tokens are in the mix too -- but the
-    # genuine training-grounded candidate should still win on V3/V5/V6/V7
+    # genuine training-grounded candidate should still win on V3/V5/V6/V7/V8
     # evidence alone.
     check("chair is still the top-scoring candidate in open mode",
           max(info["scores"], key=info["scores"].get) == "chair", info["scores"])
-    check("scores equal the sum of the seven independent vote layers",
+    check("scores equal the sum of the eight independent vote layers",
           all(abs(info["scores"][c] -
                   (info["important_vote"].get(c, 0) + info["influence_vote"].get(c, 0)
                    + info["context_vote"].get(c, 0) + info["context_influence_vote"].get(c, 0)
                    + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0)
-                   + info["prev_current_vote"].get(c, 0))) < 1e-9
+                   + info["prev_current_vote"].get(c, 0) + info["triple_vote"].get(c, 0))) < 1e-9
               for c in info["candidates"]),
           info)
 
@@ -809,6 +809,13 @@ a piglet is like a pig.
     # _influence_weight's actual default is 0.09 (see ivm.py's __init__) --
     # pin it here so the hand-computed numbers in the checks below match
     # exactly, without touching the real production default.
+    # _important_weight and _context_influence_weight are left at their
+    # real production defaults (IVMConfig.IMPORTANT_WEIGHT = 0.4,
+    # IVMConfig.CONTEXT_INFLUENCE_WEIGHT = 0.0) -- the checks below are
+    # computed against those actual values, not the old 0.1/0.01
+    # illustration. Only _influence_weight is pinned here, since
+    # IVMConfig.INFLUENCE_WEIGHT (0.0) would zero out V2 entirely and
+    # this worked example wants to demonstrate a nonzero V2.
     ivm3._influence_weight = 0.1
     ivm3._important = {"A", "B"}
     ivm3._token_rels = {
@@ -820,11 +827,12 @@ a piglet is like a pig.
     }
     trace2 = ivm3.score_candidates(["X", "Y"], {"A", "B", "N"})
     check("V1 (important_vote) is RAW/BINARY, NOT scaled by evidence count -- "
-          "one vote (x0.1) per important token that knows C at all: "
-          "X=0.1*(A knows + B knows)=0.1*2=0.2, Y=0.1*(A knows only)=0.1*1=0.1 "
-          "-- note this does NOT scale with A's evidence count of 2 for X",
-          abs(trace2["important_vote"]["X"] - 0.2) < 1e-9 and
-          abs(trace2["important_vote"]["Y"] - 0.1) < 1e-9, trace2["important_vote"])
+          "one vote (x0.4, IVMConfig.IMPORTANT_WEIGHT) per important token "
+          "that knows C at all: X=0.4*(A knows + B knows)=0.4*2=0.8, "
+          "Y=0.4*(A knows only)=0.4*1=0.4 -- note this does NOT scale with "
+          "A's evidence count of 2 for X",
+          abs(trace2["important_vote"]["X"] - 0.8) < 1e-9 and
+          abs(trace2["important_vote"]["Y"] - 0.4) < 1e-9, trace2["important_vote"])
     check("V2 (influence_vote) = 0.1 x sum of influence(t) for t that knows C: "
           "X=0.1*(2+1)=0.3, Y=0.1*2=0.2",
           abs(trace2["influence_vote"]["X"] - 0.3) < 1e-9 and
@@ -833,23 +841,25 @@ a piglet is like a pig.
           "full weight 1.0 each -- strictly bigger than V1/V2's 0.1: "
           "X gets A+B=2 votes, Y gets A+N=2 votes",
           trace2["context_vote"] == {"X": 2.0, "Y": 2.0}, trace2["context_vote"])
-    check("V4 (context_influence_vote) IS scaled by raw evidence count, tiny "
-          "weight 0.01, for EVERY context token: "
-          "X=0.01*(knowledge(A,X)=2 + knowledge(B,X)=1 + knowledge(N,X)=0)=0.03, "
-          "Y=0.01*(knowledge(A,Y)=1 + knowledge(B,Y)=0 + knowledge(N,Y)=1)=0.02",
-          abs(trace2["context_influence_vote"]["X"] - 0.03) < 1e-9 and
-          abs(trace2["context_influence_vote"]["Y"] - 0.02) < 1e-9,
+    check("V4 (context_influence_vote) IS scaled by raw evidence count, but "
+          "IVMConfig.CONTEXT_INFLUENCE_WEIGHT is currently 0.0 -- so despite "
+          "nonzero evidence (knowledge(A,X)=2, knowledge(B,X)=1, "
+          "knowledge(A,Y)=1, knowledge(N,Y)=1) this layer contributes "
+          "nothing to either candidate right now: X=0.0*(2+1+0)=0.0, "
+          "Y=0.0*(1+0+1)=0.0",
+          abs(trace2["context_influence_vote"]["X"] - 0.0) < 1e-9 and
+          abs(trace2["context_influence_vote"]["Y"] - 0.0) < 1e-9,
           trace2["context_influence_vote"])
     check("N (not important) contributed to Y's score only via V3/V4 -- proof "
           "V3/V4 genuinely include non-important tokens, unlike V1/V2",
           "N" not in trace2["knows"] and trace2["context_vote"]["Y"] > trace2["important_vote"]["Y"] - 1,
           trace2)
-    check("final score = V1+V2+V3+V4 exactly: X=0.2+0.3+2+0.03=2.53, Y=0.1+0.2+2+0.02=2.32",
-          abs(trace2["scores"]["X"] - 2.53) < 1e-9 and
-          abs(trace2["scores"]["Y"] - 2.32) < 1e-9, trace2["scores"])
+    check("final score = V1+V2+V3+V4 exactly: X=0.8+0.3+2+0.0=3.1, Y=0.4+0.2+2+0.0=2.6",
+          abs(trace2["scores"]["X"] - 3.1) < 1e-9 and
+          abs(trace2["scores"]["Y"] - 2.6) < 1e-9, trace2["scores"])
     check("select() picks X, the higher combined score", 
           ivm3.select(["X", "Y"], {"A", "B", "N"})[0] == "X", trace2)
-    check("V1+V2+V4 alone for X (0.53) could never have outvoted V3's "
+    check("V1+V2+V4 alone for X (1.1) could never have outvoted V3's "
           "contribution to Y (2.0) -- proof important tokens/magnitude can't "
           "override context presence by design",
           (trace2["important_vote"]["X"] + trace2["influence_vote"]["X"]
@@ -1567,11 +1577,172 @@ def test_prev_current_co_occurrence_vote():
           isinstance(token, int), trace_step)
 
 
+def test_triple_witness_vote():
+    """
+    V8 (triple witness vote) -- the strictest of the eight layers:
+    unlike V7 (did previous/current/C ever merely share a sentence),
+    V8 asks whether (previous, current, C) was ever literally ONE
+    consecutive trained Bridge Matrix triple, in that exact order.
+    Uses the same CORPUS_EXP / enc() setup as the V7 section above so
+    the two can be directly compared on the SAME (previous, current)
+    pairs.
+    """
+    section("V8: triple witness vote")
+
+    from ivm import ImportanceVoteMatrix
+
+    m = MSEGraphLanguageModel(vocab_size=150)
+    m.train(CORPUS_EXP)
+    tok = m.tokenizer
+    def enc(w):
+        e = [t for t in tok.encode(w) if t != 2]
+        return e[-1]
+
+    cat, dog, boy, sat, ran, the, on = (enc("cat"), enc("dog"), enc("boy"),
+                                          enc("sat"), enc("ran"), enc("the"), enc("on"))
+    mat, carpet, chair, road = enc("mat"), enc("carpet"), enc("chair"), enc("road")
+
+    # CORPUS_EXP: rel 1 "the cat sat on the mat.", rel 2 "the dog sat on
+    # the carpet.", rel 3 "the boy sat on the chair.", rel 4 "the boy ran
+    # on the road." -- the literal triple immediately following (sat, on)
+    # is ALWAYS (sat, on, the) in every one of rels 1-3 (the word right
+    # after "on" is always "the"), never (sat, on, mat/carpet/chair)
+    # directly -- those nouns are the NEXT triple's target, one step
+    # further out. This is exactly the case V7's own test section
+    # demonstrates a vote for (mat/carpet/chair all share a sentence
+    # with sat+on) -- V8 must NOT vote for any of them here, proving
+    # V8 is strictly narrower than V7 on the identical pair.
+    ivm = ImportanceVoteMatrix.build(m, mode="strict")
+
+    v8 = ivm._triple_vote(sat, on, [mat, carpet, chair, road, the])
+    check("previous='sat' current='on' -> NO vote for 'mat', even though "
+          "V7 votes for it (sat/on/mat share rel 1) -- the literal triple "
+          "after (sat, on) is (sat, on, the), not (sat, on, mat)",
+          v8.get(mat, 0) == 0, v8)
+    check("previous='sat' current='on' -> NO vote for 'carpet' either "
+          "(same reasoning, rel 2)",
+          v8.get(carpet, 0) == 0, v8)
+    check("previous='sat' current='on' -> NO vote for 'chair' either "
+          "(same reasoning, rel 3)",
+          v8.get(chair, 0) == 0, v8)
+    check("previous='sat' current='on' -> NO vote for 'road' -- 'sat' "
+          "never occurs in rel 4 at all",
+          v8.get(road, 0) == 0, v8)
+    check("previous='sat' current='on' -> full vote for 'the' -- "
+          "(sat, on, the) IS the literal trained triple in rels 1, 2, "
+          "AND 3 all at once",
+          v8.get(the, 0) == 1.0, v8)
+
+    # Now the pair one step further along: (on, the) is immediately
+    # followed by mat/carpet/chair/road in rels 1/2/3/4 respectively --
+    # every one of them IS the literal triple here, unlike the (sat, on)
+    # pair above.
+    v8b = ivm._triple_vote(on, the, [mat, carpet, chair, road, sat])
+    check("previous='on' current='the' -> full vote for 'mat' -- "
+          "(on, the, mat) is the literal triple in rel 1",
+          v8b.get(mat, 0) == 1.0, v8b)
+    check("previous='on' current='the' -> full vote for 'carpet' (rel 2)",
+          v8b.get(carpet, 0) == 1.0, v8b)
+    check("previous='on' current='the' -> full vote for 'chair' (rel 3)",
+          v8b.get(chair, 0) == 1.0, v8b)
+    check("previous='on' current='the' -> full vote for 'road' (rel 4)",
+          v8b.get(road, 0) == 1.0, v8b)
+    check("previous='on' current='the' -> NO vote for 'sat' -- 'sat' "
+          "was never the token right after (on, the) in any sentence",
+          v8b.get(sat, 0) == 0, v8b)
+
+    # Direct V7-vs-V8 contrast on the identical (previous, current) pair
+    # used in the V7 section: (boy, ran) shares a sentence (rel 4) with
+    # 'road' -- V7 votes for it -- but the literal triple right after
+    # (boy, ran) is (boy, ran, on), not (boy, ran, road) -- V8 must not.
+    v8c = ivm._triple_vote(boy, ran, [on, road, chair])
+    check("previous='boy' current='ran' -> full vote for 'on' -- "
+          "(boy, ran, on) is the literal triple in rel 4",
+          v8c.get(on, 0) == 1.0, v8c)
+    check("previous='boy' current='ran' -> NO vote for 'road', unlike V7 "
+          "-- 'road' shares rel 4 with boy+ran but is not the literal "
+          "very-next token after (boy, ran)",
+          v8c.get(road, 0) == 0, v8c)
+    check("previous='boy' current='ran' -> NO vote for 'chair' -- never "
+          "part of the same sentence as 'ran' at all",
+          v8c.get(chair, 0) == 0, v8c)
+
+    v8_none1 = ivm._triple_vote(None, on, [mat])
+    v8_none2 = ivm._triple_vote(sat, None, [mat])
+    check("V8 is all-zero when previous is None (documented degrade)",
+          v8_none1 == {}, v8_none1)
+    check("V8 is all-zero when current is None (documented degrade)",
+          v8_none2 == {}, v8_none2)
+
+    v8_self = ivm._triple_vote(on, the, [on, the, mat])
+    check("a candidate never votes via being previous or current itself "
+          "-- only 'mat' should appear, not 'on' or 'the'",
+          v8_self == {mat: 1.0}, v8_self)
+
+    v8_empty_ivm = ImportanceVoteMatrix()  # bare object, no triples built
+    v8_empty = v8_empty_ivm._triple_vote(on, the, [mat])
+    check("a bare (unbuilt) ImportanceVoteMatrix has no triple evidence "
+          "at all -- V8 is all-zero, never an error",
+          v8_empty == {}, v8_empty)
+
+    # score_candidates()/select() integration -- V8 requires BOTH
+    # `previous` and `current`; combines additively with V1-V7.
+    trace_v8 = ivm.score_candidates([mat, carpet, chair, road], [cat, dog],
+                                     current=the, previous=on)
+    check("triple_vote key is present and matches _triple_vote, scaled "
+          "by triple_weight",
+          trace_v8["triple_vote"].get(mat, 0) == ivm._triple_weight * 1.0,
+          trace_v8["triple_vote"])
+    check("V8's contribution is included in the final combined score",
+          abs(trace_v8["scores"][mat] -
+              (trace_v8["important_vote"].get(mat, 0) + trace_v8["influence_vote"].get(mat, 0)
+               + trace_v8["context_vote"].get(mat, 0) + trace_v8["context_influence_vote"].get(mat, 0)
+               + trace_v8["bigram_witness_vote"].get(mat, 0) + trace_v8["adjacency_vote"].get(mat, 0)
+               + trace_v8["prev_current_vote"].get(mat, 0) + trace_v8["triple_vote"].get(mat, 0))) < 1e-9,
+          trace_v8["scores"])
+
+    trace_no_prev8 = ivm.score_candidates([mat, carpet, chair, road], [cat, dog], current=the)
+    check("omitting `previous` zeroes V8 specifically, without affecting "
+          "that omission being visible as an empty triple_vote key",
+          trace_no_prev8.get("triple_vote", {}).get(mat, 0) == 0,
+          trace_no_prev8.get("triple_vote"))
+
+    winner8, _ = ivm.select([mat, carpet, chair, road], [cat, dog],
+                             current=the, previous=on)
+    check("select() runs end-to-end with V8 evidence present and returns "
+          "a deterministic winner",
+          winner8 is not None, winner8)
+
+    # to_dict/from_dict must round-trip triple_weight AND the precomputed
+    # _triples set itself (unlike V7, V8 needs its own dedicated index --
+    # it does NOT reuse _token_rels).
+    ivm_rt = ImportanceVoteMatrix.from_dict(ivm.to_dict())
+    check("triple_weight survives to_dict/from_dict",
+          abs(ivm_rt._triple_weight - ivm._triple_weight) < 1e-9,
+          ivm_rt._triple_weight)
+    v8_rt = ivm_rt._triple_vote(on, the, [mat, carpet, chair, road, sat])
+    check("_triple_vote gives identical results after a round-trip",
+          v8_rt == v8b, (v8_rt, v8b))
+
+    # inference.py / model.py integration: Open Mode's real step()/
+    # open_mode_candidate_scores() must thread `previous` all the way
+    # through to V8 without crashing.
+    info = m.open_mode_candidate_scores("the cat sat on the")
+    check("open_mode_candidate_scores() exposes triple_vote in its "
+          "public breakdown",
+          "triple_vote" in info, info.keys())
+
+    token8, trace_step8 = m._open.step(on, the, importance_votes=ivm)
+    check("Open Mode's step() accepts `previous` and returns a token "
+          "without error (V8 now wired through inference.py)",
+          isinstance(token8, int), trace_step8)
+
+
 def test_sparse_token_score_cache():
     """
     Sparse per-token score cache for V1/V2/V3/V4/V6 (see build_cache()/
     enable_cache()/disable_cache() and the "cache" branch of
-    score_candidates() in ivm.py). V5 and V7 are always live -- this
+    score_candidates() in ivm.py). V5, V7, and V8 are always live -- this
     section exists to prove the cache is a pure optimization: identical
     numbers whether it's on or off, never a shortcut that changes the
     answer, plus the toggle and fallback behavior around it.
@@ -1816,6 +1987,7 @@ if __name__ == "__main__":
     test_train_py_cli_path_matches_model_api()
     test_bigram_witness_vote_and_vocab_candidates()
     test_prev_current_co_occurrence_vote()
+    test_triple_witness_vote()
     test_sparse_token_score_cache()
     test_cluster_axis_indexed_lookup()
     print(f"\n{PASS} passed, {FAIL} failed (grand total)")
