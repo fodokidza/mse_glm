@@ -255,7 +255,7 @@ class Display:
 
 def train_with_display(model, corpus_text=None, corpus_file=None,
                        vocab_size=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE, display=None, out_path="runs/model"):
-    from tokenizer import BPETokenizer, split_sentences, normalize
+    from tokenizer import BPETokenizer, split_sentences, normalize, stream_word_freq
     from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
     from inference import InferenceEngine
     from array import array
@@ -270,27 +270,25 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
              stats={"vocab":4,"edges":0,"bridges":0,"clusters":0,"rels":0})
 
     if corpus_file:
-        import re
-        _ws   = re.compile(r"\s+")
-        _norm = re.compile(r"[^a-z0-9\s]")
-        _sp   = re.compile(r"[.!?\n]+")
-        wf = Counter(); sentences = []; buf = ""
+        # Word counting delegates to tokenizer.py's own stream_word_freq()
+        # instead of hand-rolling a second copy of normalize()/split_sentences()
+        # here. This used to be a standalone reimplementation (a bare
+        # `[^a-z0-9\s]` regex that silently dropped every punctuation
+        # character -- quotes, commas, parens, etc. -- from the vocab while
+        # the sentence strings it built still carried that punctuation
+        # through to encode_for_training() later in this function, which
+        # DOES preserve it via the real normalize(). The two disagreeing
+        # about which characters exist meant any such character was never
+        # seeded into the vocab but still got encoded against it, always
+        # resolving to <UNK>. See test.py's
+        # test_train_py_corpus_file_matches_model_api for a regression
+        # test covering exactly this.) Re-reading the file for
+        # split_sentences() afterward mirrors model.py's train_from_file(),
+        # which takes the same two-pass approach for the same reason.
+        wf = Counter()
+        stream_word_freq(corpus_file, wf, TokenizerConfig.STREAM_CHUNK_SIZE)
         with open(corpus_file, "r", encoding="utf-8", errors="ignore") as f:
-            while True:
-                chunk = f.read(TokenizerConfig.STREAM_CHUNK_SIZE)
-                if not chunk: break
-                buf += chunk
-                parts = _sp.split(buf); buf = parts.pop()
-                for p in parts:
-                    p = p.strip()
-                    if not p: continue
-                    sentences.append(p)
-                    for w in _ws.sub(" ", _norm.sub(" ", p.lower())).strip().split():
-                        if w: wf[w] += 1
-        if buf.strip():
-            sentences.append(buf.strip())
-            for w in _ws.sub(" ", _norm.sub(" ", buf.lower())).strip().split():
-                if w: wf[w] += 1
+            sentences = split_sentences(f.read())
     else:
         sentences = split_sentences(corpus_text)
         wf = Counter()

@@ -70,6 +70,123 @@ class Analyser:
             "dead_end_tokens": [tok.id_to_token.get(t, t) for t in dead_ends[:top_n]],
         }
 
+    # ---------------------------------------------------------- raw matrices
+    # Unlike topology()/cluster_report()/relationship_report() above (which
+    # aggregate), these three just page through a matrix's actual rows,
+    # decoded to tokens -- for "what is literally stored in here" rather
+    # than "what does it imply". All three matrices can be large (a
+    # relationship matrix has one row per triple occurrence per training
+    # sentence, so it's the biggest of the three by far -- see analyse.py's
+    # own `stats` command for the real row counts before dumping one
+    # unfiltered), so all three are paged (limit/offset) rather than
+    # returned whole; pass --limit 0 (CLI) / limit=0 (API) for "everything",
+    # e.g. right before piping to --json.
+
+    def edge_matrix(self, source: str = None, target: str = None,
+                     sort: str = "count", limit: int = 50, offset: int = 0) -> dict:
+        """
+        Raw EdgeMatrix rows: every deduplicated (source, dst) bigram with
+        its literal training count (see EdgeMatrix.frequency()). Optionally
+        filtered to a single source and/or target word. `sort`: "count"
+        (default, descending) or "source" (ascending source token id, the
+        matrix's native CSR order).
+        """
+        tok = self.model.tokenizer
+        e = self.model.edges
+        rows = list(zip(e.src, e.dst, e.count))
+
+        if source is not None:
+            src_id = self._resolve_token(source)
+            if src_id is None:
+                return {"total": 0, "offset": offset, "limit": limit, "rows": []}
+            rows = [r for r in rows if r[0] == src_id]
+        if target is not None:
+            dst_id = self._resolve_token(target)
+            if dst_id is None:
+                return {"total": 0, "offset": offset, "limit": limit, "rows": []}
+            rows = [r for r in rows if r[1] == dst_id]
+
+        if sort == "count":
+            rows.sort(key=lambda r: -r[2])
+        else:
+            rows.sort(key=lambda r: (r[0], r[1]))
+
+        total = len(rows)
+        page = rows[offset:offset + limit] if limit else rows[offset:]
+        decoded = [(tok.id_to_token.get(s, s), tok.id_to_token.get(d, d), c) for s, d, c in page]
+        return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
+
+    def bridge_matrix(self, source: str = None, bridge: str = None, target: str = None,
+                       clustered_only: bool = False, limit: int = 50, offset: int = 0) -> dict:
+        """
+        Raw BridgeMatrix rows: every deduplicated (source, bridge, target)
+        triple with its cluster_id (0 = unclustered -- see BridgeMatrix's
+        dual-axis docstring). Optionally filtered to a single source,
+        bridge, and/or target word, and/or restricted to clustered rows
+        only (cluster_id != 0). Native CSR order (by source).
+        """
+        tok = self.model.tokenizer
+        b = self.model.bridges
+        rows = list(zip(b.source, b.bridge, b.target, b.cluster_id))
+
+        for word, slot in ((source, 0), (bridge, 1), (target, 2)):
+            if word is not None:
+                tid = self._resolve_token(word)
+                if tid is None:
+                    return {"total": 0, "offset": offset, "limit": limit, "rows": []}
+                rows = [r for r in rows if r[slot] == tid]
+        if clustered_only:
+            rows = [r for r in rows if r[3] != 0]
+
+        total = len(rows)
+        page = rows[offset:offset + limit] if limit else rows[offset:]
+        decoded = [(tok.id_to_token.get(s, s), tok.id_to_token.get(br, br),
+                    tok.id_to_token.get(t, t), c) for s, br, t, c in page]
+        return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
+
+    def relationship_matrix(self, relationship_id: int = None, triple_id: int = None,
+                             limit: int = 50, offset: int = 0) -> dict:
+        """
+        Raw RelationshipMatrix rows: every (triple_id, relationship_id)
+        pair, decoded to the triple's actual (source, bridge, target)
+        content. One row per triple OCCURRENCE per training sentence --
+        NOT deduplicated the way EdgeMatrix/BridgeMatrix rows are (see
+        RelationshipMatrix's docstring), so this is normally the largest
+        of the three matrices and the one most worth filtering rather
+        than dumping whole. Optionally filtered to one relationship_id
+        (one training sentence's rows) or one triple_id (every sentence
+        that triple occurs in) -- not both at once.
+        """
+        if relationship_id is not None and triple_id is not None:
+            raise ValueError("relationship_matrix: pass relationship_id OR triple_id, not both")
+        r = self.model.rels
+        b = self.model.bridges
+        tok = self.model.tokenizer
+        rows = list(zip(r.r_triple, r.r_rel))
+        if relationship_id is not None:
+            rows = [row for row in rows if row[1] == relationship_id]
+        elif triple_id is not None:
+            rows = [row for row in rows if row[0] == triple_id]
+
+        total = len(rows)
+        page = rows[offset:offset + limit] if limit else rows[offset:]
+        decoded = []
+        for tid, rel_id in page:
+            s, br, t = b.source[tid], b.bridge[tid], b.target[tid]
+            decoded.append((rel_id, tid, tok.id_to_token.get(s, s),
+                             tok.id_to_token.get(br, br), tok.id_to_token.get(t, t)))
+        return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
+
+    def _resolve_token(self, word):
+        """Encode a surface word to its last real token id (drops <BOS>), or
+        None if it doesn't exist in the vocabulary. Shared by every raw-
+        matrix filter above -- same convention as per_token_report()."""
+        if word is None:
+            return None
+        tok = self.model.tokenizer
+        enc = [t for t in tok.encode(word) if t != 2]
+        return enc[-1] if enc else None
+
     # -------------------------------------------------------------- clusters
     def cluster_report(self, top_n: int = 10, axis: str = None) -> list:
         """
@@ -435,6 +552,31 @@ def main():
     p = sub.add_parser("relationship", help="Full detail for one relationship_id (training sentence)")
     p.add_argument("relationship_id", type=int)
 
+    p = sub.add_parser("edges", help="Raw EdgeMatrix rows (source, dst, count), paged")
+    p.add_argument("--source", help="Filter to one source word")
+    p.add_argument("--target", help="Filter to one target/dst word")
+    p.add_argument("--sort", choices=["count", "source"], default="count")
+    p.add_argument("--limit", type=int, default=50, help="0 = no limit")
+    p.add_argument("--offset", type=int, default=0)
+
+    p = sub.add_parser("bridges", help="Raw BridgeMatrix rows (source, bridge, target, cluster_id), paged")
+    p.add_argument("--source", help="Filter to one source word")
+    p.add_argument("--bridge", help="Filter to one bridge word")
+    p.add_argument("--target", help="Filter to one target word")
+    p.add_argument("--clustered-only", action="store_true", help="Only rows with cluster_id != 0")
+    p.add_argument("--limit", type=int, default=50, help="0 = no limit")
+    p.add_argument("--offset", type=int, default=0)
+
+    p = sub.add_parser("rel-rows",
+                        help="Raw RelationshipMatrix rows (relationship_id, triple_id, "
+                             "decoded source/bridge/target), paged -- normally the biggest "
+                             "of the three matrices; filter with --relationship or --triple")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--relationship", type=int, help="Only rows for this relationship_id")
+    g.add_argument("--triple", type=int, help="Only rows for this triple_id")
+    p.add_argument("--limit", type=int, default=50, help="0 = no limit")
+    p.add_argument("--offset", type=int, default=0)
+
     p = sub.add_parser("token", help="Per-token report: successors, bridge triples, clusters")
     p.add_argument("word")
 
@@ -581,6 +723,34 @@ def main():
         _emit(result, args.json, lambda r: (
             print(f"  relationship_id: {r['relationship_id']}"),
             _print_table(r["triples"], ["source", "target", "bridge"]),
+        ))
+
+    elif args.command == "edges":
+        result = analyser.edge_matrix(source=args.source, target=args.target,
+                                       sort=args.sort, limit=args.limit, offset=args.offset)
+        _emit(result, args.json, lambda r: (
+            print(f"  {r['total']} row(s) total (showing offset={r['offset']}, "
+                  f"limit={r['limit'] or 'none'})"),
+            _print_table(r["rows"], ["source", "dst", "count"]),
+        ))
+
+    elif args.command == "bridges":
+        result = analyser.bridge_matrix(source=args.source, bridge=args.bridge, target=args.target,
+                                         clustered_only=args.clustered_only,
+                                         limit=args.limit, offset=args.offset)
+        _emit(result, args.json, lambda r: (
+            print(f"  {r['total']} row(s) total (showing offset={r['offset']}, "
+                  f"limit={r['limit'] or 'none'})"),
+            _print_table(r["rows"], ["source", "bridge", "target", "cluster_id"]),
+        ))
+
+    elif args.command == "rel-rows":
+        result = analyser.relationship_matrix(relationship_id=args.relationship, triple_id=args.triple,
+                                               limit=args.limit, offset=args.offset)
+        _emit(result, args.json, lambda r: (
+            print(f"  {r['total']} row(s) total (showing offset={r['offset']}, "
+                  f"limit={r['limit'] or 'none'})"),
+            _print_table(r["rows"], ["relationship_id", "triple_id", "source", "bridge", "target"]),
         ))
 
     elif args.command == "token":
