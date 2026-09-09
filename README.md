@@ -628,6 +628,30 @@ python3 train.py --continue-from runs/model --corpus more_data.txt \
   you use `use_context_triggers=True` anywhere, rebuild the CTM
   after merging; `train_incremental()`'s return value tells you
   whether it was affected: `summary["ctm_invalidated"]`.
+- **The Relationship Matrix deduplicates by literal sentence content**,
+  the same principle the Edge Matrix already applies to bigrams and
+  the Bridge Matrix already applies to triples (see `graph.py`'s
+  `RelationshipMatrix` docstring). Two training sentences with the
+  IDENTICAL token sequence get exactly one `relationship_id`, not two;
+  `rel_count` (queryable via `model.rels.count(rel_id)`) tracks how
+  many literal occurrences share that content. `model.stats()`
+  reflects this split: `"relationships"` is the unique-sentence count,
+  `"relationship_occurrences"` is the raw total — on a corpus with no
+  repeated sentences the two numbers are identical, but they diverge
+  the moment any sentence repeats verbatim. This also means
+  `ctm.py`'s trigger "support" counts and `importance.py`'s
+  `trigger_matrix()`'s `distinct_sequences` now count distinct
+  sentence CONTENT, not distinct raw occurrences — a sentence
+  repeated N times in the corpus contributes support/distinctness 1,
+  not N. `train_incremental()`'s merge honors this too: re-feeding an
+  exact repeat of an already-known sentence collapses onto its
+  existing `relationship_id` (incrementing its `rel_count`) instead
+  of minting a new one — see that method's docstring for the one
+  known limitation (a pre-existing sentence too short to have any
+  triples at all, under 3 tokens, can't be reconstructed from the
+  Bridge Matrix during a merge and may collapse with other such
+  short sentences; harmless in practice since a triple-less sentence
+  casts no votes anywhere in this codebase).
 - **The Context Trigger Matrix is not persisted by `save()`/`load()`.**
   It's cheap enough to rebuild per session
   (`model.build_context_triggers()`) but if you want it cached to

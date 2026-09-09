@@ -65,14 +65,14 @@ class IVMConfig:
     smaller than context_weight BY DESIGN (see that docstring); if you
     retune these, that ratio is a property you need to preserve
     yourself, not something enforced automatically."""
-    IMPORTANT_WEIGHT = 0.6            # V1
-    INFLUENCE_WEIGHT = 0.000           # V2
-    CONTEXT_WEIGHT = 1.9              # V3
-    CONTEXT_INFLUENCE_WEIGHT = 0.000   # V4
-    BIGRAM_WITNESS_WEIGHT = 0.3      # V5
-    ADJACENCY_WEIGHT = 0.003            # V6
+    IMPORTANT_WEIGHT = 0.4            # V1
+    INFLUENCE_WEIGHT = 0.0003           # V2
+    CONTEXT_WEIGHT = 1.0              # V3
+    CONTEXT_INFLUENCE_WEIGHT = 0.0003   # V4
+    BIGRAM_WITNESS_WEIGHT = 0.7       # V5
+    ADJACENCY_WEIGHT = 0.6            # V6
     PREV_CURRENT_WEIGHT = 1.7         # V7
-    TRIPLE_WEIGHT = 1.0                # V8 -- see ivm.py; peer-weighted
+    TRIPLE_WEIGHT = 2.0                # V8 -- see ivm.py; peer-weighted
                                         # with V5/V6/V7 (independently
                                         # strong, literal evidence), set
                                         # a notch above them since it is

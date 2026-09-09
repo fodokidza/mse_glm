@@ -60,7 +60,11 @@ Honesty notes
     co-occurred in, not distinct triples -- if a member's cluster
     membership is attested by several triples that all happen to come
     from one sentence, that sentence's other tokens are only counted
-    once each, not once per triple.
+    once each, not once per triple. Since RelationshipMatrix
+    deduplicates identical literal sentences into one relationship_id
+    (see graph.py), this also means a sentence repeated verbatim N
+    times in the corpus still contributes support 1, not N -- "distinct
+    sentences" means distinct CONTENT, not distinct raw occurrences.
   - This module never changes what inference.py decides UNLESS it is
     explicitly opted into (a ContextTriggerMatrix instance must be
     passed to InferenceEngine.step()/generate() by the caller). Every

@@ -257,12 +257,39 @@ class RelationshipMatrix:
     foreign key into BridgeMatrix's row order; no triple content is
     duplicated here. Many-to-many: a triple_id may appear under several
     relationship_ids if shared across training sequences.
+
+    Deduplicated by literal sentence content, same principle
+    EdgeMatrix already applies to bigrams and BridgeMatrix already
+    applies to triples: two training sentences with the IDENTICAL
+    token sequence get exactly one relationship_id, not two -- kept
+    parallel to that dedup is `rel_count` -- how many times each
+    unique sentence literally occurred across training ("sentence
+    frequency"), one count per unique sequence (not per occurrence).
+    This mirrors EdgeMatrix.count exactly: the dedup keeps every
+    relationship_id-based lookup (triples_for_relationship,
+    relationships_for_triple, sequence_for_relationship in
+    importance.py) counting genuinely DISTINCT sentences, while
+    rel_count is purely additional weight for anything that cares how
+    often a given sentence was actually seen -- nothing in this file
+    reads it; it exists for callers like model.stats() and analyse.py.
+
+    Before this dedup existed, a corpus with the same sentence
+    repeated N times produced N distinct relationship_ids for
+    identical content -- inflating "how many distinct sentences does
+    this evidence span" claims elsewhere (ctm.py's context-trigger
+    support counts, importance.py's trigger_matrix distinct_sequences)
+    even though Edge/Bridge already correctly deduplicated the
+    bigrams/triples those same N repeats produced. That inconsistency
+    is exactly what this dedup closes.
     """
 
     def __init__(self):
         self.r_triple = array("i")
         self.r_rel = array("i")
         self.index = array("i")  # CSR offsets keyed on relationship_id
+        self.rel_count = array("i")  # count[rel_id] = how many literal
+                                      # training occurrences shared this
+                                      # exact sentence content
         self._n_rels = 0
         self._by_triple_rel = None    # lazily-built CSR keyed on triple_id
         self._by_triple_index = None  # (rel array, offset array)
@@ -299,8 +326,26 @@ class RelationshipMatrix:
         for idx, (s, t, b) in enumerate(zip(bridge.source, bridge.target, bridge.bridge)):
             triple_to_id[(s, t, b)] = idx
 
+        # Dedup sequences by exact content, first-occurrence order (same
+        # "stable, deterministic, order-of-first-appearance" rule
+        # EdgeMatrix/BridgeMatrix already use for their own dedup) --
+        # a sentence with zero triples (< 3 tokens) still gets exactly
+        # one relationship_id, it just never appears in any row below.
+        seq_to_rel_id = {}
+        unique_seqs = []
+        counts = []
+        for seq in sequences:
+            key = tuple(seq)
+            rel_id = seq_to_rel_id.get(key)
+            if rel_id is None:
+                rel_id = len(unique_seqs)
+                seq_to_rel_id[key] = rel_id
+                unique_seqs.append(seq)
+                counts.append(0)
+            counts[rel_id] += 1
+
         rows = []  # (triple_id, rel_id)
-        for rel_id, seq in enumerate(sequences):
+        for rel_id, seq in enumerate(unique_seqs):
             for i in range(len(seq) - 2):
                 source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
                 entry = (source, target, bridge_tok)
@@ -309,7 +354,8 @@ class RelationshipMatrix:
                     rows.append((triple_id, rel_id))
 
         rows.sort(key=lambda r: r[1])
-        self._n_rels = len(sequences)
+        self._n_rels = len(unique_seqs)
+        self.rel_count = array("i", counts)
         self.r_triple = array("i", [r[0] for r in rows])
         self.r_rel = array("i", [r[1] for r in rows])
 
@@ -320,6 +366,19 @@ class RelationshipMatrix:
             self.index[i] += self.index[i - 1]
         self._by_triple_rel = None
         self._by_triple_index = None
+
+    def count(self, rel_id: int):
+        """
+        How many literal training occurrences shared this exact
+        sentence content -- 0 for an out-of-range rel_id, same
+        "never raise, just report no evidence" convention as
+        EdgeMatrix.frequency(). 1 for every relationship_id that
+        wasn't a repeat of another sentence, same as any freshly-built
+        model before this field existed would imply.
+        """
+        if rel_id < 0 or rel_id >= len(self.rel_count):
+            return 0
+        return self.rel_count[rel_id]
 
     def triples_for_relationship(self, rel_id: int):
         if rel_id < 0 or rel_id + 1 >= len(self.index):
@@ -339,6 +398,7 @@ class RelationshipMatrix:
         return {
             "r_triple": list(self.r_triple), "r_rel": list(self.r_rel),
             "index": list(self.index), "n_rels": self._n_rels,
+            "rel_count": list(self.rel_count),
         }
 
     @classmethod
@@ -348,4 +408,10 @@ class RelationshipMatrix:
         m.r_rel = array("i", d["r_rel"])
         m.index = array("i", d["index"])
         m._n_rels = d["n_rels"]
+        # Older saved models were written before rel_count existed;
+        # default every relationship_id to a count of 1 so count()
+        # degrades to "this sentence was seen (at least once)" rather
+        # than crashing on load -- same fallback EdgeMatrix.from_dict
+        # already uses for its own .count.
+        m.rel_count = array("i", d.get("rel_count", [1] * m._n_rels))
         return m

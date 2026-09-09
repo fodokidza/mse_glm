@@ -239,13 +239,16 @@ class Analyser:
         shared = [tid for tid in set(r.r_triple) if len(r.relationships_for_triple(tid)) > 1]
         return {
             "total_relationships": r._n_rels,
+            "total_occurrences": sum(r.rel_count),
             "total_rows": len(r.r_triple),
             "unique_triples_referenced": len(set(r.r_triple)),
             "shared_triple_count": len(shared),
         }
 
     def relationship_detail(self, relationship_id: int) -> dict:
-        """Every triple belonging to a single training sequence (sentence)."""
+        """Every triple belonging to a single training sequence (sentence),
+        plus how many literal training occurrences shared that exact
+        sentence content (see graph.py's RelationshipMatrix docstring)."""
         b = self.model.bridges
         tok = self.model.tokenizer
         triple_ids = self.model.rels.triples_for_relationship(relationship_id)
@@ -254,7 +257,8 @@ class Analyser:
             s, t, br = b.source[tid], b.target[tid], b.bridge[tid]
             triples.append((tok.id_to_token.get(s, s), tok.id_to_token.get(t, t),
                              tok.id_to_token.get(br, br)))
-        return {"relationship_id": relationship_id, "triples": triples}
+        return {"relationship_id": relationship_id, "triples": triples,
+                "occurrences": self.model.rels.count(relationship_id)}
 
     # ---------------------------------------------------------- per-token
     def per_token_report(self, word: str) -> dict:

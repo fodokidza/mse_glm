@@ -165,7 +165,7 @@ class Display:
             ("Edge Matrix",       f"{stats.get('edges',0):,} unique bigrams"),
             ("Bridge Matrix",     f"{stats.get('bridges',0):,} unique triples"),
             ("Clustered triples", f"{stats.get('clustered_bridges',0):,}  ({stats.get('clusters',0)} clusters)"),
-            ("Relationship rows", f"{stats.get('relationship_rows',0):,}  ({stats.get('relationships',0)} sentences)"),
+            ("Relationship rows", f"{stats.get('relationship_rows',0):,}  ({stats.get('relationships',0)} unique sentences)"),
             ("Total time",        f"{time.time() - self.t0:.2f}s"),
         ]
         w = max(len(k) for k,_ in rows)
@@ -482,22 +482,49 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
     # ══ Phase 5: Relationship Matrix ══════════════════════════════════════════
     D.phase = "rels"; D.phase_label = PHASES[4][1]
     D.phase_t0 = time.time(); D.next_phase = "Save"; D.rate_unit = "row"
-    total_r = sum(max(len(s)-2, 0) for s in sequences)
+
+    # Dedup sentences by exact content first -- same principle Phase 3
+    # already applies to triples: two literally identical training
+    # sentences share ONE relationship_id, with rel_count tracking how
+    # many times that exact content occurred (see graph.py's
+    # RelationshipMatrix docstring). Must match RelationshipMatrix.build()
+    # exactly, or this hand-rolled display path silently drifts from the
+    # library path again -- see config.py's own warning about exactly
+    # this class of bug (train.py already caused it once, for
+    # EdgeMatrix.count, before test_train_py_cli_path_matches_model_api
+    # existed to catch it).
+    seq_to_rel_id = {}
+    unique_seqs = []
+    rel_counts = []
+    for seq in sequences:
+        key = tuple(seq)
+        rid = seq_to_rel_id.get(key)
+        if rid is None:
+            rid = len(unique_seqs)
+            seq_to_rel_id[key] = rid
+            unique_seqs.append(seq)
+            rel_counts.append(0)
+        rel_counts[rid] += 1
+
+    total_r = sum(max(len(s)-2, 0) for s in unique_seqs)
     triple_to_id = {(s,t,b): i for i,(s,t,b) in enumerate(triples)}
     D.update(step=0, total=total_r)
-    D.item(dim(f"linking {n} triples to {len(sequences)} sentence rel_ids…"), force=True)
+    D.item(dim(f"linking {n} triples to {len(unique_seqs)} unique sentence "
+                f"rel_ids ({len(sequences)} raw sentences seen)…"), force=True)
 
     rel_matrix = RelationshipMatrix()
     rows = []; step = 0
-    # count how many times each triple appears across all sentences (to detect shared)
+    # count how many DISTINCT relationship_ids each triple appears under
+    # (to detect shared) -- matches relationships_for_triple()'s dedup
+    # semantics now, not raw sentence-occurrence count.
     triple_appearances = Counter()
-    for rel_id, seq in enumerate(sequences):
+    for rel_id, seq in enumerate(unique_seqs):
         for i in range(len(seq)-2):
             src, br, tgt = seq[i], seq[i+1], seq[i+2]
             tid = triple_to_id.get((src, tgt, br))
             if tid is not None: triple_appearances[tid] += 1
 
-    for rel_id, seq in enumerate(sequences):
+    for rel_id, seq in enumerate(unique_seqs):
         for i in range(len(seq)-2):
             src, br, tgt = seq[i], seq[i+1], seq[i+2]
             tid = triple_to_id.get((src, tgt, br))
@@ -516,15 +543,18 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
                 )
 
     rows.sort(key=lambda r: r[1])
-    rel_matrix._n_rels  = len(sequences)
-    rel_matrix.r_triple = array("i", [r[0] for r in rows])
-    rel_matrix.r_rel    = array("i", [r[1] for r in rows])
-    rel_matrix.index    = array("i", [0] * (len(sequences) + 1))
+    rel_matrix._n_rels   = len(unique_seqs)
+    rel_matrix.rel_count = array("i", rel_counts)
+    rel_matrix.r_triple  = array("i", [r[0] for r in rows])
+    rel_matrix.r_rel     = array("i", [r[1] for r in rows])
+    rel_matrix.index     = array("i", [0] * (len(unique_seqs) + 1))
     for r in rel_matrix.r_rel: rel_matrix.index[r+1] += 1
     for i in range(1, len(rel_matrix.index)): rel_matrix.index[i] += rel_matrix.index[i-1]
 
     D.update(step=total_r, stats={"rels": len(rows)})
-    D.phase_done(PHASES[4][1], f"{len(rows):,} rows  ·  {len(sequences)} sentences")
+    D.phase_done(PHASES[4][1],
+                 f"{len(rows):,} rows  ·  {len(unique_seqs):,} unique sentences"
+                 f"  ({len(sequences):,} raw)")
 
     # ══ Phase 6: Save ═════════════════════════════════════════════════════════
     D.phase = "save"; D.phase_label = PHASES[5][1]
@@ -604,7 +634,7 @@ def continue_training_cli(args):
         ("Clustered triples", f"{before['clustered_bridges']:,} → {after['clustered_bridges']:,}"
                                f"  ({before['clusters']} → {after['clusters']} clusters)"),
         ("Relationship rows", f"{before['relationship_rows']:,} → {after['relationship_rows']:,}"
-                               f"  ({before['relationships']} → {after['relationships']} sentences)"),
+                               f"  ({before['relationships']} → {after['relationships']} unique sentences)"),
     ]
     if summary["ctm_invalidated"]:
         rows.append(("Context Trigger Matrix", amber("invalidated — call build_context_triggers() again")))

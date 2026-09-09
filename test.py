@@ -9,6 +9,7 @@ from model import MSEGraphLanguageModel
 from analyse import CorpusAnalyser, Analyser
 from tokenizer import normalize, split_sentences
 from train_corpus import discover_txt_files, train_from_folder
+from graph import RelationshipMatrix
 
 PASS = FAIL = 0
 
@@ -497,10 +498,11 @@ a piglet is like a pig.
     section("Incremental training (train_incremental)")
 
     # Re-feeding the identical sentence must not duplicate Edge/Bridge
-    # structure -- both are always deduplicated -- but relationship_ids
-    # ARE expected to grow (one per sentence occurrence, matching
-    # from-scratch behavior: training on the same sentence twice in one
-    # corpus also produces two relationship_ids, not one).
+    # structure -- both are always deduplicated -- and now Relationship
+    # structure is deduplicated the same way: relationship_ids stay
+    # unique per DISTINCT sentence content, with rel_count tracking how
+    # many literal occurrences share that content (see graph.py's
+    # RelationshipMatrix docstring).
     m_incr = MSEGraphLanguageModel(vocab_size=200)
     m_incr.train("the cat sat on the mat.")
     before_dup = m_incr.stats()
@@ -510,9 +512,17 @@ a piglet is like a pig.
           after_dup["edges"] == before_dup["edges"], (before_dup, after_dup))
     check("re-feeding identical sentence: no new bridges",
           after_dup["bridges"] == before_dup["bridges"], (before_dup, after_dup))
-    check("re-feeding identical sentence: relationships DO grow (matches "
-          "from-scratch semantics of one relationship_id per sentence)",
-          after_dup["relationships"] == before_dup["relationships"] + 1, (before_dup, after_dup))
+    check("re-feeding identical sentence: relationships do NOT grow -- "
+          "same content collapses onto the same relationship_id",
+          after_dup["relationships"] == before_dup["relationships"], (before_dup, after_dup))
+    check("re-feeding identical sentence: relationship_occurrences DOES "
+          "grow by 1 -- the repeat is still counted, just not as a new "
+          "relationship_id",
+          after_dup["relationship_occurrences"] == before_dup["relationship_occurrences"] + 1,
+          (before_dup, after_dup))
+    check("re-feeding identical sentence: the repeat's rel_count is "
+          "actually 2 on the one relationship_id it shares",
+          m_incr.rels.count(0) == 2, list(m_incr.rels.rel_count))
 
     # The core case this feature exists for: a cluster that can only form
     # once BOTH increments are present, because it depends on tokens from
@@ -1169,6 +1179,34 @@ def test_train_py_cli_path_matches_model_api():
           sorted(zip(m2.edges.src, m2.edges.dst, m2.edges.count)),
           (list(zip(m1.edges.src, m1.edges.dst, m1.edges.count)),
            list(zip(m2.edges.src, m2.edges.dst, m2.edges.count))))
+
+    # Same class of check, for the Relationship Matrix's dedup-by-content
+    # + rel_count (train.py hand-rolls this matrix too, for its live
+    # display -- see graph.py's RelationshipMatrix docstring for what
+    # "dedup" means here). Compare via reconstructed sentence CONTENT
+    # (sequence_for_relationship), not raw rel_id numbering -- the two
+    # paths aren't guaranteed to assign the same numeric rel_id to the
+    # same sentence, only the same SET of (content, count) pairs.
+    from importance import sequence_for_relationship
+    def content_counts(m):
+        return sorted(
+            (tuple(sequence_for_relationship(m, rid)), m.rels.count(rid))
+            for rid in range(m.rels._n_rels)
+        )
+    check("train.py's RelationshipMatrix has rel_count populated (same "
+          "length as _n_rels, all real counts) -- the same class of bug "
+          "the EdgeMatrix.count check above exists to catch",
+          len(m1.rels.rel_count) == m1.rels._n_rels and m1.rels._n_rels > 0
+          and all(c > 0 for c in m1.rels.rel_count),
+          list(m1.rels.rel_count))
+    check("train.py's RelationshipMatrix dedup matches model.train()'s "
+          "for every unique sentence (content, rel_count) pair",
+          content_counts(m1) == content_counts(m2),
+          (content_counts(m1), content_counts(m2)))
+    check("train.py's RelationshipMatrix has no duplicate relationship_ids "
+          "for identical sentence content -- CORPUS_EXP has 4 distinct "
+          "sentences, so _n_rels must be exactly 4, not more",
+          m1.rels._n_rels == 4, m1.rels._n_rels)
 
     # The actual reported failure: frequency() on a real edge must not crash.
     the_id = m1.tokenizer.token_to_id.get("the")
@@ -1878,6 +1916,117 @@ def test_sparse_token_score_cache():
           info["cache_used"] is True, info["cache_used"])
 
 
+def test_relationship_matrix_dedup():
+    """
+    RelationshipMatrix.build() now deduplicates by literal sentence
+    content, the same principle EdgeMatrix already applies to bigrams
+    and BridgeMatrix already applies to triples -- see graph.py's
+    RelationshipMatrix docstring. A corpus with an exact duplicate
+    sentence should produce ONE relationship_id for it (rel_count=2),
+    not two relationship_ids.
+    """
+    section("Relationship Matrix: dedup by sentence content")
+
+    from importance import sequence_for_relationship
+
+    # "the cat sat on the mat." appears twice, verbatim -- everything
+    # else is distinct.
+    corpus = ("the cat sat on the mat.\n"
+              "the dog sat on the carpet.\n"
+              "the cat sat on the mat.\n"
+              "the boy ran on the road.\n")
+    m = MSEGraphLanguageModel(vocab_size=200)
+    m.train(corpus)
+
+    check("3 distinct sentences -> exactly 3 relationship_ids, not 4 "
+          "(the raw sentence count)",
+          m.rels._n_rels == 3, m.rels._n_rels)
+    check("total occurrences across all relationship_ids still equals "
+          "the raw sentence count (4) -- dedup shrinks _n_rels, never "
+          "loses the fact that a repeat happened",
+          sum(m.rels.rel_count) == 4, list(m.rels.rel_count))
+
+    counts_by_content = {
+        tuple(sequence_for_relationship(m, rid)): m.rels.count(rid)
+        for rid in range(m.rels._n_rels)
+    }
+    the_cat = m.tokenizer.encode_for_training("the cat sat on the mat.")
+    the_dog = m.tokenizer.encode_for_training("the dog sat on the carpet.")
+    the_boy = m.tokenizer.encode_for_training("the boy ran on the road.")
+    check("the repeated sentence's relationship_id has rel_count == 2",
+          counts_by_content.get(tuple(the_cat)) == 2, counts_by_content)
+    check("a non-repeated sentence's relationship_id has rel_count == 1",
+          counts_by_content.get(tuple(the_dog)) == 1, counts_by_content)
+    check("every relationship_id's rel_count matches count(rel_id)",
+          all(m.rels.count(rid) == m.rels.rel_count[rid]
+              for rid in range(m.rels._n_rels)))
+    check("count() on an out-of-range rel_id returns 0, never raises",
+          m.rels.count(9999) == 0 and m.rels.count(-1) == 0)
+
+    check("model.stats()['relationships'] reports the UNIQUE count (3)",
+          m.stats()["relationships"] == 3, m.stats())
+    check("model.stats()['relationship_occurrences'] reports the RAW "
+          "total (4) -- the two numbers now genuinely differ when a "
+          "corpus has repeats, instead of relationships silently "
+          "inflating to match raw count",
+          m.stats()["relationship_occurrences"] == 4, m.stats())
+
+    # to_dict/from_dict round-trip must preserve rel_count exactly.
+    m2_rels = RelationshipMatrix.from_dict(m.rels.to_dict())
+    check("rel_count survives to_dict/from_dict exactly",
+          list(m2_rels.rel_count) == list(m.rels.rel_count),
+          (list(m2_rels.rel_count), list(m.rels.rel_count)))
+
+    # Backward compatibility: a dict saved before rel_count existed
+    # (no "rel_count" key at all) must still load, defaulting every
+    # count to 1 -- same fallback EdgeMatrix.from_dict already uses.
+    old_style = m.rels.to_dict()
+    del old_style["rel_count"]
+    m3_rels = RelationshipMatrix.from_dict(old_style)
+    check("from_dict on a pre-rel_count save defaults every count to 1, "
+          "never crashes",
+          list(m3_rels.rel_count) == [1] * m3_rels._n_rels,
+          list(m3_rels.rel_count))
+
+    # train_incremental: re-feeding an EXISTING sentence verbatim must
+    # collapse onto its existing relationship_id, not mint a new one --
+    # see train_incremental's own docstring for this exact guarantee.
+    m4 = MSEGraphLanguageModel(vocab_size=200)
+    m4.train("the cat sat on the mat.\nthe dog sat on the carpet.\n")
+    before = m4.stats()
+    m4.train_incremental("the cat sat on the mat.\nthe boy ran on the road.\n")
+    after = m4.stats()
+    check("train_incremental: one genuinely NEW sentence -> "
+          "relationships grows by exactly 1, not 2",
+          after["relationships"] == before["relationships"] + 1,
+          (before, after))
+    check("train_incremental: the repeated sentence's occurrence count "
+          "grows even though its relationship_id didn't change",
+          after["relationship_occurrences"] == before["relationship_occurrences"] + 2,
+          (before, after))
+    the_cat_m4 = m4.tokenizer.encode_for_training("the cat sat on the mat.")
+    cat_rel_id = next(rid for rid in range(m4.rels._n_rels)
+                       if tuple(sequence_for_relationship(m4, rid)) == tuple(the_cat_m4))
+    check("the repeated sentence's rel_count is now 2 after the merge",
+          m4.rels.count(cat_rel_id) == 2, m4.rels.count(cat_rel_id))
+
+    # analyse.py surfaces the same numbers
+    a = Analyser(m)
+    rr = a.relationship_report()
+    check("Analyser.relationship_report()'s total_relationships matches "
+          "the unique count",
+          rr["total_relationships"] == 3, rr)
+    check("Analyser.relationship_report()'s total_occurrences matches "
+          "the raw total",
+          rr["total_occurrences"] == 4, rr)
+    the_cat_rid = next(rid for rid in range(m.rels._n_rels)
+                        if tuple(sequence_for_relationship(m, rid)) == tuple(the_cat))
+    rd = a.relationship_detail(the_cat_rid)
+    check("Analyser.relationship_detail() reports occurrences==2 for the "
+          "repeated sentence",
+          rd["occurrences"] == 2, rd)
+
+
 def test_cluster_axis_indexed_lookup():
     """
     BridgeMatrix.cluster_axis() used to scan EVERY triple in the graph
@@ -1989,6 +2138,7 @@ if __name__ == "__main__":
     test_prev_current_co_occurrence_vote()
     test_triple_witness_vote()
     test_sparse_token_score_cache()
+    test_relationship_matrix_dedup()
     test_cluster_axis_indexed_lookup()
     print(f"\n{PASS} passed, {FAIL} failed (grand total)")
     if FAIL: sys.exit(1)

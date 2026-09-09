@@ -75,10 +75,32 @@ class MSEGraphLanguageModel:
         arrived in a different training call ("the cat sat on the mat"
         now, "the dog sat on the carpet" later) only form a real
         bridge-axis cluster once both exist together. Existing
-        relationship_ids (one per originally-trained sentence) are
-        preserved and only remapped to whatever row position their
-        triple ends up at after the merge; new sentences get new
-        relationship_ids continuing after the last existing one.
+        relationship_ids (one per unique training sentence) are
+        preserved for any sentence whose exact content isn't a repeat
+        of something in the new corpus (only their triple_id
+        references are remapped for the merged Bridge Matrix's new
+        row order); if a NEW sentence is an exact literal repeat of
+        an EXISTING one, it now collapses onto that existing
+        relationship_id instead of getting a new one -- the same
+        dedup-by-content rule RelationshipMatrix.build() applies to a
+        from-scratch train(), now applied consistently across an
+        incremental merge too (see graph.py's RelationshipMatrix
+        docstring). Genuinely new sentences get new relationship_ids
+        continuing after the last existing one. rel_count is merged
+        accordingly: a sentence that already occurred N times before
+        this call and appears M more times in the new corpus ends up
+        with rel_count = N + M under the SAME relationship_id, not a
+        second one. One known limitation: a pre-existing
+        relationship_id whose sentence was too short to have any
+        triples at all (< 3 tokens) can't be reconstructed from the
+        Bridge Matrix alone (there's nothing there to reconstruct
+        from); every such degenerate sentence collapses onto one
+        shared relationship_id across a merge, even if their original
+        literal contents actually differed -- harmless in practice,
+        since a triple-less sentence casts no votes and drives no
+        evidence anywhere else in this codebase, but worth knowing if
+        you're inspecting rel_count directly on a corpus with very
+        short sentences.
 
         Open Mode (self._open/self.open_ctm) is automatically rebuilt
         from the merged graphs -- no separate call needed. The Context
@@ -205,37 +227,23 @@ class MSEGraphLanguageModel:
                 t_index[t].add(c)
         bm.t_index = {k: sorted(v) for k, v in t_index.items()}
 
-        # ── Relationship Matrix: remap existing rows to their new
-        #    triple_id (content unchanged, row position may have moved),
-        #    then append new sentences with fresh relationship_ids ─────
-        new_triple_to_id = {trip: idx for idx, trip in enumerate(merged_triples)}
-        old_n_rels = self.rels._n_rels
+        # ── Relationship Matrix: reconstruct every existing relationship_id's
+        #    literal sentence content (from the PRE-merge bridges/rels,
+        #    still intact here), then dedupe that content against new_seqs
+        #    exactly like a from-scratch build() would -- so a new sentence
+        #    that's an exact literal repeat of an existing one collapses
+        #    onto the SAME relationship_id (rel_count incremented) instead
+        #    of getting a new one, and existing sentences keep their
+        #    relationship_id when they're not repeats of anything new.
+        #    See train_incremental's docstring for the one known
+        #    limitation (triple-less, <3-token sentences can't be
+        #    reconstructed and collapse together across a merge).
+        from importance import sequence_for_relationship
+        old_sequences = [sequence_for_relationship(self, rid)
+                          for rid in range(self.rels._n_rels)]
 
-        merged_rows = []
-        for old_tid, rel_id in zip(self.rels.r_triple, self.rels.r_rel):
-            content = old_triple_content[old_tid]
-            merged_rows.append((new_triple_to_id[content], rel_id))
-
-        for local_idx, seq in enumerate(new_seqs):
-            rel_id = old_n_rels + local_idx
-            for i in range(len(seq) - 2):
-                source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
-                tid = new_triple_to_id.get((source, target, bridge_tok))
-                if tid is not None:
-                    merged_rows.append((tid, rel_id))
-
-        merged_rows.sort(key=lambda r: r[1])
         rm = RelationshipMatrix()
-        rm._n_rels = old_n_rels + len(new_seqs)
-        rm.r_triple = array("i", [r[0] for r in merged_rows])
-        rm.r_rel = array("i", [r[1] for r in merged_rows])
-        rm.index = array("i", [0] * (rm._n_rels + 1))
-        for r in rm.r_rel:
-            rm.index[r + 1] += 1
-        for i in range(1, len(rm.index)):
-            rm.index[i] += rm.index[i - 1]
-        rm._by_triple_rel = None
-        rm._by_triple_index = None
+        rm.build(old_sequences + new_seqs, bm)
 
         self.edges, self.bridges, self.rels = em, bm, rm
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
@@ -613,6 +621,7 @@ class MSEGraphLanguageModel:
             "clusters":          len(set(c for c in self.bridges.cluster_id if c != 0)),
             "relationships":     self.rels._n_rels,
             "relationship_rows": len(self.rels.r_triple),
+            "relationship_occurrences": sum(self.rels.rel_count),
         }
 
     # ─── save / load ──────────────────────────────────────────────────────

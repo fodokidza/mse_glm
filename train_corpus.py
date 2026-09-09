@@ -171,7 +171,7 @@ def train_from_folder(folder, out_path, vocab_size=TokenizerConfig.DEFAULT_VOCAB
         ("Edge Matrix",       f"{stats['edges']:,} unique bigrams"),
         ("Bridge Matrix",     f"{stats['bridges']:,} unique triples"),
         ("Clustered triples", f"{stats['clustered_bridges']:,}  ({stats['clusters']} clusters)"),
-        ("Relationship rows", f"{stats['relationship_rows']:,}  ({stats['relationships']} sentences)"),
+        ("Relationship rows", f"{stats['relationship_rows']:,}  ({stats['relationships']} unique sentences)"),
         ("Total time",        f"{time.time()-t0:.2f}s"),
     ]
     w = max(len(k) for k, _ in rows)

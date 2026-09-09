@@ -43,7 +43,11 @@ adding new inferential power, and is presented that way on purpose:
      a fixed axis; if those triples came from different sentences, the
      generalization already happened at training time). Building this
      table surfaces and quantifies that, it doesn't discover a new
-     mechanism.
+     mechanism. "different sentences" here means different literal
+     CONTENT: RelationshipMatrix deduplicates identical sentences into
+     one relationship_id (see graph.py), so a verbatim-repeated
+     sentence in the corpus is never double-counted as if it were two
+     different training sentences.
 
 Also included: an explicit, read-only bridge to what generation
 already does with this structure -- expected_importance() tells you
