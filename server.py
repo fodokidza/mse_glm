@@ -3,9 +3,9 @@ import sys
 import json
 import time
 import argparse
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import ServerConfig, GenerationConfig
+from model import MSEGraphLanguageModel
 from flask import (
     Flask, request, jsonify,
     render_template_string,
@@ -13,7 +13,7 @@ from flask import (
 )
 
 # ============================================================
-# ARGUMENT PARSING
+# ARGUMENT PARSING + STARTUP
 # ============================================================
 # MSE-GLM has no checkpoints to select between (no --finetuned /
 # --rlhf here — there are no learned weights of any kind). The only
@@ -22,100 +22,133 @@ from flask import (
 # opt-in) Context Trigger Matrix for tie-break disambiguation, and
 # whether to build+enable Open Mode's (also optional, opt-in) sparse
 # per-token score cache.
+#
+# All of this used to run unconditionally at module level (parsing
+# sys.argv, loading a model from disk, sys.exit(1) if it's missing)
+# -- meaning simply `import server` from anywhere (a test, a WSGI
+# entry point, another script reusing PromptRejected/generate_text)
+# had the side effect of parsing whatever process happened to invoke
+# the import as if it were server.py's own CLI flags, and could
+# crash the importer outright if no model existed at the default
+# path. It's collected into _startup() instead, called explicitly
+# from `if __name__ == "__main__":` below -- importing this module
+# now only defines things, never loads a model or touches sys.argv.
+# NOTE for real WSGI deployment (gunicorn/uwsgi, multiple workers):
+# this is still process-global state, not a proper app factory --
+# call _startup() once yourself (e.g. from a small wsgi.py) before
+# handing `app` to the WSGI server, and don't run multiple worker
+# processes expecting independent model state, they'd all share
+# whatever the parent process loaded.
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='mse_model',
-                     help='Path to a saved MSE-GLM model folder')
-parser.add_argument('--mode',  default='strict',
-                     choices=['strict', 'open'],
-                     help='Default inference mode for new sessions')
-parser.add_argument('--ctm',   action='store_true',
-                     help='Build the Context Trigger Matrix at startup '
-                          'and use it for tie-break disambiguation')
-parser.add_argument('--cache', action='store_true',
-                     help='Build and enable Open Mode\'s sparse '
-                          'V1/V2/V3/V4/V6 score cache at startup '
-                          '(see ivm.py) -- same scores either way, '
-                          'purely a speed optimization')
-parser.add_argument('--port',  type=int, default=ServerConfig.DEFAULT_PORT)
-args = parser.parse_args()
-
-MODEL_PATH    = args.model
-DEFAULT_MODE  = args.mode
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-print("=" * 60)
-print("  MSE-GLM SERVER")
-print("=" * 60)
-print(f"\n  Model: {MODEL_PATH}")
-print(f"  Default mode: {DEFAULT_MODE.upper()}")
-
-if not os.path.exists(MODEL_PATH):
-    print("\n\u274c No model found!")
-    print("   Run: python3 train.py --corpus <file> --out "
-          f"{MODEL_PATH}")
-    print("   or:  python3 train_corpus.py --corpus-dir <dir> --out "
-          f"{MODEL_PATH}")
-    sys.exit(1)
-
-from model import MSEGraphLanguageModel
-
-model = MSEGraphLanguageModel.load(MODEL_PATH)
-
-# Open Mode has no separate "build" step -- it's automatically ready
-# as soon as the model is trained or loaded (see model.py's
-# _rebuild_open_engine()). This check is a defensive sanity check,
-# not a "was it built yet" gate the way it used to be.
-OPEN_AVAILABLE = model._open is not None
-
+args = None
+MODEL_PATH = None
+DEFAULT_MODE = None
+model = None
+OPEN_AVAILABLE = False
 USE_CTM = False
-if args.ctm:
-    print("  Building Context Trigger Matrix ...")
-    model.build_context_triggers(mode=DEFAULT_MODE)
-    USE_CTM = True
-    print("  Context Trigger Matrix ready.")
+tokenizer = None
+vocab_words = None
+_stats = None
 
-if args.cache:
-    if OPEN_AVAILABLE:
-        print("  Building Open Mode's sparse score cache ...")
-        model.open_ctm.enable_cache(model.all_candidate_tokens())
-        print(f"  Cache ready ({len(model.open_ctm._token_cache)} token rows, "
-              f"{sum(len(r) for r in model.open_ctm._token_cache.values())} entries).")
-    else:
-        print("  --cache requested but Open Mode isn't available -- skipped.")
 
-tokenizer = model.tokenizer
-vocab_words = [
-    w for w in tokenizer.token_to_id.keys()
-    if w not in ('<PAD>', '<UNK>', '<BOS>', '<EOS>')
-]
+def _startup(argv=None):
+    global args, MODEL_PATH, DEFAULT_MODE, model, OPEN_AVAILABLE, \
+        USE_CTM, tokenizer, vocab_words, _stats
 
-_stats = model.stats()
-print(f"  Vocabulary:    {_stats['vocab_size']:,} tokens")
-print(f"  Edges:         {_stats['edges']:,}")
-print(f"  Bridges:       {_stats['bridges']:,}")
-print(f"  Clusters:      {_stats['clusters']:,}")
-print(f"  Open Mode:     {'available' if OPEN_AVAILABLE else 'not built'}\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='mse_model',
+                         help='Path to a saved MSE-GLM model folder')
+    parser.add_argument('--mode',  default='strict',
+                         choices=['strict', 'open'],
+                         help='Default inference mode for new sessions')
+    parser.add_argument('--ctm',   action='store_true',
+                         help='Build the Context Trigger Matrix at startup '
+                              'and use it for tie-break disambiguation')
+    parser.add_argument('--cache', action='store_true',
+                         help='Build and enable Open Mode\'s sparse '
+                              'V1/V2/V3/V4/V6 score cache at startup '
+                              '(see ivm.py) -- same scores either way, '
+                              'purely a speed optimization')
+    parser.add_argument('--port',  type=int, default=ServerConfig.DEFAULT_PORT)
+    args = parser.parse_args(argv)
+
+    MODEL_PATH   = args.model
+    DEFAULT_MODE = args.mode
+
+    print("=" * 60)
+    print("  MSE-GLM SERVER")
+    print("=" * 60)
+    print(f"\n  Model: {MODEL_PATH}")
+    print(f"  Default mode: {DEFAULT_MODE.upper()}")
+
+    if not os.path.exists(MODEL_PATH):
+        print("\n\u274c No model found!")
+        print("   Run: python3 train.py --corpus <file> --out "
+              f"{MODEL_PATH}")
+        print("   or:  python3 train_corpus.py --corpus-dir <dir> --out "
+              f"{MODEL_PATH}")
+        sys.exit(1)
+
+    model = MSEGraphLanguageModel.load(MODEL_PATH)
+
+    # Open Mode has no separate "build" step -- it's automatically ready
+    # as soon as the model is trained or loaded (see model.py's
+    # _rebuild_open_engine()). This check is a defensive sanity check,
+    # not a "was it built yet" gate the way it used to be.
+    OPEN_AVAILABLE = model._open is not None
+
+    USE_CTM = False
+    if args.ctm:
+        print("  Building Context Trigger Matrix ...")
+        model.build_context_triggers(mode=DEFAULT_MODE)
+        USE_CTM = True
+        print("  Context Trigger Matrix ready.")
+
+    if args.cache:
+        if OPEN_AVAILABLE:
+            print("  Building Open Mode's sparse score cache ...")
+            model.open_ctm.enable_cache(model.all_candidate_tokens())
+            print(f"  Cache ready ({len(model.open_ctm._token_cache)} token rows, "
+                  f"{sum(len(r) for r in model.open_ctm._token_cache.values())} entries).")
+        else:
+            print("  --cache requested but Open Mode isn't available -- skipped.")
+
+    tokenizer = model.tokenizer
+    vocab_words = [
+        w for w in tokenizer.token_to_id.keys()
+        if w not in ('<PAD>', '<UNK>', '<BOS>', '<EOS>')
+    ]
+
+    _stats = model.stats()
+    print(f"  Vocabulary:    {_stats['vocab_size']:,} tokens")
+    print(f"  Edges:         {_stats['edges']:,}")
+    print(f"  Bridges:       {_stats['bridges']:,}")
+    print(f"  Clusters:      {_stats['clusters']:,}")
+    print(f"  Open Mode:     {'available' if OPEN_AVAILABLE else 'not built'}\n")
 
 # ============================================================
 # MODE PRESETS
 # ============================================================
 # There is no system-prompt concept here. A neural LLM can be
 # steered with free-text instructions because it generalizes past
-# its training data; MSE-GLM's generate() explicitly refuses to —
-# every bigram in the prompt must have been literally observed
-# (Strict) or structurally justified by clustering (Open), or the
-# whole prompt is rejected outright (illegal_prompt_bigram). An
-# injected "### System: you are a helpful assistant..." prefix
-# would almost never survive that check. So instead of personas,
+# its training data. Strict Mode takes the same stance deliberately —
+# every bigram in the prompt must have been literally observed, or
+# the whole prompt is rejected outright (illegal_prompt_bigram) — an
+# injected "### System: you are a helpful assistant..." prefix would
+# almost never survive that check. Open Mode does NOT reject any
+# prompt: its per-step candidates are already the entire vocabulary,
+# scored by IVM (ivm.py) rather than gated by whether a bigram was
+# ever literally seen, so there is nothing for that check to protect
+# there and it's skipped entirely (see inference.py's generate()) --
+# an injected system-prompt-style prefix would still be free to
+# ground its own start, though it would then compete on IVM's
+# evidence-weighted scoring at every step after that, same as any
+# other prompt, not receive special authority. So instead of personas,
 # sessions choose an inference MODE — the one dial MSE-GLM actually
 # exposes: Strict Mode gates every step to literal training bigrams
 # (a two-stage lineage vote, tie-broken deterministically); Open Mode
 # has no successor gating at all -- candidates are the ENTIRE
-# vocabulary every step, chosen by IVM's eight-layer weighted voting
+# vocabulary every step, chosen by IVM's nine-layer weighted voting
 # (see ivm.py) rather than by whether a bigram was ever literally
 # observed.
 
@@ -128,7 +161,7 @@ MODE_PRESETS = {
 # Two OPTIONAL, read-only diagnostic endpoints sit alongside the mode
 # presets above -- neither mutates session state:
 #   /scores, /bigram (new routes below) -- read-only audit endpoints,
-#       not generation. /scores exposes the full V1-V8 weighted-vote
+#       not generation. /scores exposes the full V1-V9 weighted-vote
 #       breakdown IVM used to pick the next token (see ivm.py);
 #       /bigram exposes the raw evidence counts (including V5's
 #       literal witness-sentence count) for one (prev, curr) pair.
@@ -188,10 +221,13 @@ def get_session(session_id):
 
 class PromptRejected(Exception):
     """Raised when the prompt itself contains a transition MSE-GLM
-    never observed (Strict) or never structurally justified (Open).
-    This is not an error condition in the neural-LLM sense — it's
-    the model correctly refusing to fabricate a continuation for
-    something it has no grounds for."""
+    never observed. STRICT MODE ONLY -- Open Mode never raises this
+    (see inference.py's generate(): its prompt-bigram check is skipped
+    entirely for Open Mode, since Open Mode's per-step candidates are
+    already the full vocabulary and don't depend on it). This is not
+    an error condition in the neural-LLM sense — it's the model
+    correctly refusing to fabricate a continuation for something it
+    has no grounds for."""
     pass
 
 
@@ -1526,7 +1562,7 @@ def mode_route():
 def scores():
     """
     Open Mode only, read-only, stateless (no session_id, no history
-    mutation) -- the full V1-V8 weighted-vote breakdown IVM used (or
+    mutation) -- the full V1-V9 weighted-vote breakdown IVM used (or
     would use) to pick the next token for `prompt` (see ivm.py's
     score_candidates()/select()). Mirrors chat.py's /scores REPL
     command and analyse.py's `open-scores` CLI subcommand.
@@ -1535,14 +1571,15 @@ def scores():
     Always scores the entire vocabulary -- Open Mode has no successor
     gating at all, so there is no narrower option anymore.
 
-    "scores" is the FINAL combined score -- the sum of ALL EIGHT
+    "scores" is the FINAL combined score -- the sum of ALL NINE
     layers (important_vote/influence_vote/context_vote/
     context_influence_vote/bigram_witness_vote/adjacency_vote/
-    prev_current_vote/triple_vote), each also returned separately so the
-    breakdown stays auditable. Don't expect the first four to sum to
-    "scores" on their own -- bigram_witness_vote (V5), adjacency_vote
-    (V6), prev_current_vote (V7), and triple_vote (V8) are usually the
-    largest single
+    prev_current_vote/triple_vote/whole_context_vote), each also
+    returned separately so the breakdown stays auditable. Don't
+    expect the first four to sum to "scores" on their own --
+    bigram_witness_vote (V5), adjacency_vote (V6), prev_current_vote
+    (V7), triple_vote (V8), and whole_context_vote (V9) are usually
+    the largest single
     contributors: V5 whenever the exact bigram was literally seen in
     training, V6 whenever the context token was ever directly,
     immediately followed by the candidate (directional -- token->
@@ -1552,7 +1589,9 @@ def scores():
     not just one), V8 whenever the prompt's last two tokens were ever
     literally, immediately followed by the candidate as one exact
     trained triple (stricter than V7 -- requires that exact order and
-    adjacency, not just shared presence in a sentence).
+    adjacency, not just shared presence in a sentence), V9 whenever
+    EVERY non-reserved context token, not just one, knows the
+    candidate at all (the strictest of the nine).
 
     "cache_used" reports whether this breakdown was actually served
     from Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see
@@ -1697,7 +1736,13 @@ def session_stats():
 # RUN
 # ============================================================
 
-if __name__ == '__main__':
+# ============================================================
+# RUN
+# ============================================================
+
+def main():
+    _startup()
+
     print(f"\n{'='*60}")
     print(f"  READY")
     print(f"{'='*60}")
@@ -1708,7 +1753,7 @@ if __name__ == '__main__':
     print(f"    POST /generate")
     print(f"    POST /stream")
     print(f"    POST /mode")
-    print(f"    POST /scores   (Open Mode only -- full V1-V8 breakdown for a prompt)")
+    print(f"    POST /scores   (Open Mode only -- full V1-V9 breakdown for a prompt)")
     print(f"    POST /bigram   (raw bigram evidence incl. V5 witness_sentences)")
     print(f"    POST /cache    (toggle/inspect the sparse V1/V2/V3/V4/V6 score cache)")
     print(f"    POST /reset")
@@ -1727,3 +1772,7 @@ if __name__ == '__main__':
         debug = False,
         threaded = True,
     )
+
+
+if __name__ == "__main__":
+    main()

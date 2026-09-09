@@ -20,7 +20,7 @@ import time
 import shutil
 from collections import Counter, defaultdict
 
-from config import TokenizerConfig, GenerationConfig
+from config import TokenizerConfig
 
 # ─── terminal helpers ─────────────────────────────────────────────────────────
 

@@ -13,16 +13,37 @@ Two entry points, two different roles:
       PRIMARY Open Mode mechanism. Called on the FULL legal candidate
       set every step, not just on ties -- this is what decides Open
       Mode generation now, replacing Stage 2's lineage tie-break
-      entirely (see inference.py). EIGHT INDEPENDENT vote layers,
+      entirely (see inference.py). NINE INDEPENDENT vote layers,
       summed -- not one formula where a factor multiplies another.
       An important token is ALSO a context token (I ⊆ P), so it casts
-      up to six of the eight votes: V1 and V2 because it's important,
+      up to six of the nine votes: V1 and V2 because it's important,
       PLUS its own V3, V4, V5, and V6 votes as an ordinary context
       member -- it never loses those for being important, V1/V2 are
       additive bonuses. V7 and V8 are different from all six -- neither
       is "every context token votes," each is a single fixed-pair (V7)
       or fixed-triple (V8) check on `previous`/`current` specifically
-      (see below).
+      (see below). V9 is different again -- it's the only layer that
+      requires EVERY context token to agree, not just one (V3) or a
+      fixed pair (V7/V8).
+
+  The gate (co-occurrence index, `_co_occurring` -- see build())
+      V1-V6 and V9 all reduce, ultimately, to the same underlying
+      question for a given (context token t, candidate C) pair: "did t
+      and C ever appear in the same training sentence at all?" A
+      candidate C that no context token has EVER co-occurred with is
+      therefore guaranteed a zero vote from every one of those six
+      layers -- not approximately, exactly, by construction (see
+      score_candidates()'s docstring for the proof). `_co_occurring`
+      precomputes, once per model, exactly which OTHER tokens each
+      token has ever shared a training sentence with -- the same
+      reverse-index trick build_cache() already used for its sparse
+      cache, generalized to the WHOLE vocabulary (not just one
+      candidate set) and computed once so both the live scoring path
+      and build_cache() itself can reuse it instead of each
+      recomputing their own version. score_candidates()'s live path
+      uses it to skip straight to a zero score for any candidate no
+      context token has ever heard of, instead of testing it against
+      every layer in turn.
 
   build_cache(candidates) / enable_cache(candidates=None) / disable_cache()
       Opt-in sparse per-token cache for V1/V2/V3/V4/V6 -- each is a sum
@@ -162,8 +183,11 @@ Two entry points, two different roles:
         V8(C) = triple_weight × 1[(previous, current, C) was ever a
                                     literal, consecutive Bridge Matrix
                                     triple in training]
-            "Triple witness" vote -- the single STRICTEST, most
-            literal question of all eight layers: not "did these three
+            "Triple witness" vote -- among the eight OTHER layers, the
+            single STRICTEST, most literal question (V9 is stricter
+            still, but strict in a different DIMENSION -- unanimity
+            across an arbitrary-size context, not positional
+            exactness): not "did these three
             tokens ever share a sentence" (V7), not "was C ever
             immediately preceded by current, in some sentence, for
             some reason" (V5's bigram_relationships key is (source,
@@ -191,7 +215,30 @@ Two entry points, two different roles:
             since an exact triple match is strictly more specific
             evidence than any of V5/V6/V7 individually.
 
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
+        V9(C) = whole_context_weight × 1[every non-reserved token
+                                          t ∈ P, t ≠ C, satisfies
+                                          knowledge(t, C) > 0]
+            "Whole context" / UNANIMOUS vote -- the odd one out among
+            the nine: every other layer either sums a per-token
+            contribution over context (V1-V6) or checks one FIXED pair
+            (V7) or triple (V8); V9 instead asks whether the WHOLE of
+            context agrees at once. V3 already asks "does at least one
+            context token know C" -- V9 asks the strictly harder
+            question "do ALL of them" (excluding C itself, if C
+            happens to already be a context token -- same "a token
+            never has to vouch for itself" rule as every other layer,
+            just checked once per required token here instead of
+            skipped inside a sum). One flat binary vote per candidate,
+            not scaled by context size or evidence count -- unanimity
+            either holds or it doesn't. No vote for ANY candidate if
+            context has no qualifying (non-reserved, not-C) tokens at
+            all -- unanimity among zero voters proves nothing, so an
+            empty or fully-reserved context casts no V9 votes for
+            anyone, same as V3 casts no votes from an empty context
+            either. Default weight 2.5 -- see config.py's
+            WHOLE_CONTEXT_WEIGHT for why it's set a notch above V8.
+
+        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C)
 
       This deliberately reopens the door rule 24 shut ("unclustered
       tokens contribute 0 votes") -- V3/V4 are a considered exception,
@@ -402,6 +449,89 @@ def adjacent_pairs(model):
     return {(a, b) for a, b in zip(e.src, e.dst)}
 
 
+def co_occurrence_index(token_rels, adjacent=None):
+    """
+    {token: {other_token: shared_relationship_count}} for EVERY pair
+    of (non-reserved) tokens that ever appear together in at least one
+    training relationship (sentence) -- the whole-vocabulary
+    co-occurrence graph underneath V1/V3/V4/V6/V9, and the gate that
+    lets score_candidates() skip a candidate straight to a 0 score
+    once no context token has ever heard of it (see the module
+    docstring's "The gate" section for the proof of why that's always
+    safe for V1-V6/V9, and score_candidates()'s docstring for the one
+    extra condition V7/V8 need).
+
+    Built by inverting token_rels (relationship_id -> its member
+    tokens) ONCE and, for each relationship, only visiting the tokens
+    actually IN it -- the same technique
+    ImportanceVoteMatrix.build_cache() used to use internally (see its
+    docstring for the full O(vocab^2)-vs-O(corpus co-occurrence) cost
+    argument), just generalized here to the ENTIRE vocabulary instead
+    of one candidate set, and computed exactly once per model build so
+    build_cache() (now just a filter over this) and score_candidates()
+    (the live gate) both reuse the same underlying work instead of
+    each paying for their own O(sum of sentence-length^2) pass.
+
+    If `adjacent` (a set of directed (t, c) pairs -- see
+    adjacent_pairs()) is given, also backfills any adjacency-only pair
+    NOT already present with a shared count of 0, for any t that has
+    AT LEAST ONE relationship-based entry already (token_rels.get(t)
+    is truthy) -- the same condition the live scoring path and the
+    cache-building code both already applied before this function
+    existed (a token with literally zero known relationships is
+    skipped by both, regardless of any adjacency it might have; this
+    backfill deliberately preserves that existing behavior rather than
+    widening it). This covers a real, if rare, edge case: two tokens
+    that were literally consecutive in a training sentence too SHORT
+    (fewer than 3 tokens) to have produced a Bridge Matrix triple --
+    and therefore a relationship_id -- at all (see importance.py's
+    note on degenerate short sentences). Such a pair has adjacency
+    (V6's evidence) but zero relationship-level co-occurrence
+    (V1/V3/V4/V9's evidence) for that SPECIFIC candidate -- V6 can
+    still vote for it on its own terms regardless of what this index
+    says, but WITHOUT this backfill the gate would wrongly treat that
+    candidate as "no context token has ever heard of it" and skip it,
+    silently dropping the V6 vote it's actually entitled to. The
+    backfilled entry's shared count is 0, so it contributes nothing to
+    V1/V3/V4/V9 (still correctly zero for them) -- it only keeps the
+    candidate visible to the gate so V6 itself still gets a chance to
+    fire.
+
+    Reserved tokens never appear as a key or a value, and a token
+    never "co-occurs" with itself -- same exclusions every other
+    layer in this module applies.
+    """
+    rel_to_tokens = defaultdict(set)
+    for tok, rels in token_rels.items():
+        if tok in RESERVED or not rels:
+            continue
+        for r in rels:
+            rel_to_tokens[r].add(tok)
+
+    co_occurring = defaultdict(Counter)
+    for toks in rel_to_tokens.values():
+        toks = list(toks)
+        for i, ti in enumerate(toks):
+            row = co_occurring[ti]
+            for j, tj in enumerate(toks):
+                if i != j:
+                    row[tj] += 1
+
+    result = {t: dict(row) for t, row in co_occurring.items()}
+
+    if adjacent:
+        for (t, c) in adjacent:
+            if t in RESERVED or c in RESERVED or c == t:
+                continue
+            if not token_rels.get(t):
+                continue
+            row = result.setdefault(t, {})
+            if c not in row:
+                row[c] = 0
+
+    return result
+
+
 def literal_triples(model):
     """
     {(source, bridge, target), ...} -- every literal, deduplicated
@@ -445,10 +575,21 @@ class ImportanceVoteMatrix:
         self._adjacency_weight = IVMConfig.ADJACENCY_WEIGHT  # V6's per-token weight -- see score_candidates()
         self._prev_current_weight = IVMConfig.PREV_CURRENT_WEIGHT  # V7's flat weight -- see score_candidates()
         self._triple_weight = IVMConfig.TRIPLE_WEIGHT  # V8's flat weight -- see score_candidates()
+        self._whole_context_weight = IVMConfig.WHOLE_CONTEXT_WEIGHT  # V9's flat weight -- see score_candidates()
         self._bigram_freq = {}  # (token, candidate) -> count, from bigram_frequencies()
         self._bigram_rels = {}  # (token, candidate) -> set(rel_id), from bigram_relationships()
-        self._adjacent = set()  # {frozenset({a,b}), ...}, from adjacent_pairs()
+        self._adjacent = set()  # {(from_token, to_token), ...}, from adjacent_pairs() -- directed
         self._triples = set()   # {(source, bridge, target), ...}, from literal_triples()
+        # {token: {other_token: shared_relationship_count}} -- the
+        # whole-vocabulary co-occurrence gate/reverse-index, built once
+        # in build()/from_dict() (never serialized -- fully re-derivable
+        # from _token_rels, same "derived, not stored" treatment as
+        # _token_cache below). Powers three things: (1) build_cache()'s
+        # sparse cache construction, (2) score_candidates()'s live gate
+        # (skip a candidate straight to a 0 score if no context token
+        # has ever co-occurred with it), (3) V9's unanimous-agreement
+        # check. See the module docstring's "The gate" section.
+        self._co_occurring = {}
         # Sparse per-token score cache for V1/V2/V3/V4/V6 -- see build_cache()
         # and the "cache" branch of score_candidates(). NOT serialized by
         # to_dict/from_dict (it's fully re-derivable from _token_rels,
@@ -466,7 +607,8 @@ class ImportanceVoteMatrix:
               bigram_witness_weight=IVMConfig.BIGRAM_WITNESS_WEIGHT,
               adjacency_weight=IVMConfig.ADJACENCY_WEIGHT,
               prev_current_weight=IVMConfig.PREV_CURRENT_WEIGHT,
-              triple_weight=IVMConfig.TRIPLE_WEIGHT, use_cache=False):
+              triple_weight=IVMConfig.TRIPLE_WEIGHT,
+              whole_context_weight=IVMConfig.WHOLE_CONTEXT_WEIGHT, use_cache=False):
         ivm = cls()
         ivm._token_rels = token_to_relationships(model)
         ivm._important = important_member_tokens(model, mode=mode)
@@ -478,10 +620,16 @@ class ImportanceVoteMatrix:
         ivm._adjacency_weight = adjacency_weight
         ivm._prev_current_weight = prev_current_weight
         ivm._triple_weight = triple_weight
+        ivm._whole_context_weight = whole_context_weight
         ivm._bigram_freq = bigram_frequencies(model, mode=mode)
         ivm._bigram_rels = bigram_relationships(model)
         ivm._adjacent = adjacent_pairs(model)
         ivm._triples = literal_triples(model)
+        # Whole-vocabulary co-occurrence gate/reverse-index -- built
+        # once here (from the _token_rels just computed above) and
+        # reused by build_cache() below AND by score_candidates()'s
+        # live path, instead of each recomputing its own version.
+        ivm._co_occurring = co_occurrence_index(ivm._token_rels, adjacent=ivm._adjacent)
         if use_cache:
             # Open Mode always scores the FULL vocabulary as candidates
             # (see model.all_candidate_tokens()/model.py's
@@ -503,16 +651,19 @@ class ImportanceVoteMatrix:
     # _adjacency_vote -- plus _knows_rels' own O(|important present| x
     # |candidates|) loop) on every single call.
     #
-    # V5, V7, and V8 are deliberately NOT part of this cache: V5's vote
-    # for (t, c) also depends on `current` (a different `current` means
-    # a different witness set for the same t/c), and V7/V8 aren't a
+    # V5, V7, V8, and V9 are deliberately NOT part of this cache: V5's
+    # vote for (t, c) also depends on `current` (a different `current`
+    # means a different witness set for the same t/c); V7/V8 aren't a
     # per-token contribution at all -- each is a single fixed-pair
     # (V7) or fixed-triple (V8) check on (previous, current), not a
-    # sum over context tokens. All three are already cheap, sparse
-    # set/tuple lookups (over _bigram_rels / _token_rels / _triples),
-    # not the dense-looking nested loops V1-V4/V6 use live -- so
-    # they're computed live in score_candidates() whether or not the
-    # cache is enabled.
+    # sum over context tokens; V9 is a conjunction ACROSS every
+    # context token for one candidate, not a sum of independent
+    # per-(t, c) terms, so it can't be decomposed into per-token rows
+    # the way V1-V4/V6 can either. All four are still fast, though --
+    # V5/V7/V8 are cheap sparse set/tuple lookups (over _bigram_rels /
+    # _token_rels / _triples), and V9 reuses this same instance's
+    # _co_occurring gate (see score_candidates()) -- so they're
+    # computed live whether or not the V1-V4/V6 cache is enabled.
     #
     # Only ONE raw quantity actually varies per (t, c) pair here:
     # shared = len(rels(t) & rels(c)). V1 (a token knows C at all) and V3
@@ -546,70 +697,41 @@ class ImportanceVoteMatrix:
 
         ALGORITHM NOTE: shared(t, c) = |rels(t) & rels(c)| is exactly
         the number of relationships (training sentences) containing
-        BOTH t and c. The previous version tested every (t, c) pair in
-        a full |tokens_with_relationships| x |candidates| double loop,
+        BOTH t and c. An old version tested every (t, c) pair in a
+        full |tokens_with_relationships| x |candidates| double loop,
         computing that intersection from scratch each time -- an
         O(vocab^2) cost that dominated model build time for anything
         past a small vocabulary (empirically ~4x slower per ~2x
-        vocabulary growth: quadratic, not linear). Almost all of those
-        pairs come back empty, since two tokens only share a
-        relationship if they actually co-occurred in some training
-        sentence -- so instead we invert the index once (relationship
-        -> its member tokens, from the same _token_rels data) and, for
-        each relationship, only visit the tokens actually IN it,
-        incrementing shared-counts for just those pairs. Total work is
-        O(sum of sentence-length^2 across the corpus) -- proportional
-        to actual co-occurrence, not to vocab size squared, and no
-        longer dependent on vocab size at all beyond the corpus's own
-        sentence lengths.
+        vocabulary growth: quadratic, not linear). A later version
+        fixed that here directly, by inverting relationship -> member
+        tokens ONCE and only visiting tokens actually co-occurring
+        together -- O(sum of sentence-length^2 across the corpus)
+        instead of O(vocab^2). That inversion is now
+        co_occurrence_index(), computed ONCE per model in build() (and
+        from_dict()) as self._co_occurring, since score_candidates()'s
+        live gate needs the exact same whole-vocabulary co-occurrence
+        graph -- this method is now just a FILTER over that shared
+        structure down to `candidates`, not a separate O(sum of
+        sentence-length^2) pass of its own every time build_cache() is
+        called (e.g. re-enabling the cache for a different candidate
+        set after incremental training no longer re-pays that cost).
         """
         candidates = frozenset(candidates)
 
-        rel_to_tokens = defaultdict(set)
-        for tok, rels in self._token_rels.items():
-            if tok in RESERVED or not rels:
-                continue
-            for r in rels:
-                rel_to_tokens[r].add(tok)
-
-        shared_counts = defaultdict(Counter)
-        for toks in rel_to_tokens.values():
-            toks = list(toks)
-            for i, ti in enumerate(toks):
-                row = shared_counts[ti]
-                for j, tj in enumerate(toks):
-                    if i != j:
-                        row[tj] += 1
-        del rel_to_tokens  # only shared_counts is needed from here on
-
         cache = {}
-        for t in list(shared_counts.keys()):
-            row = shared_counts.pop(t)  # free each row's Counter as we consume it
+        for t, row in self._co_occurring.items():
             out_row = {}
             for c, shared in row.items():
-                if c in RESERVED or c == t or c not in candidates:
+                # co_occurrence_index() already excludes RESERVED and
+                # self-pairs (t, t) by construction, and already
+                # backfills adjacency-only (shared=0) pairs -- only the
+                # candidate-set restriction is this method's own job.
+                if c not in candidates:
                     continue
                 adjacent = 1 if (t, c) in self._adjacent else 0
                 out_row[c] = (shared, adjacent)
             if out_row:
                 cache[t] = out_row
-
-        # Adjacency-only backfill: two literally-consecutive tokens are
-        # necessarily in the same training sentence together, so
-        # shared >= 1 always holds for an adjacent pair in practice
-        # (see the module comment above) and the co-occurrence pass
-        # already covers it -- this just guards that invariant
-        # explicitly instead of silently depending on it, at the cost
-        # of one extra pass over _adjacent (O(edges), not O(vocab^2)).
-        for (t, c) in self._adjacent:
-            if t in RESERVED or c in RESERVED or c == t or c not in candidates:
-                continue
-            rels_t = self._token_rels.get(t)
-            if not rels_t:
-                continue
-            row = cache.setdefault(t, {})
-            if c not in row:
-                row[c] = (0, 1)
 
         self._token_cache = cache
         self._cache_candidates = candidates
@@ -882,6 +1004,50 @@ class ImportanceVoteMatrix:
                 votes[c] += 1.0
         return dict(votes)
 
+    def _whole_context_vote(self, context_tokens, candidates):
+        """
+        V9: for each candidate C, cast one full binary vote iff EVERY
+        non-reserved token currently in context (other than C itself,
+        if C happens to already be a context token) has co-occurred
+        with C in at least one training relationship. V3 asks "does
+        at least one context token know C" -- this asks the strictly
+        harder "do ALL of them" -- unanimous CONSENSUS rather than
+        mere presence of evidence.
+
+        Uses self._co_occurring (the same whole-vocabulary
+        co-occurrence gate score_candidates()'s live path uses -- see
+        co_occurrence_index()) so each "does t know C" check is an
+        O(1)-average dict lookup against a precomputed row, checking
+        the stored shared-relationship COUNT is > 0 -- not just key
+        membership, since that same structure also carries adjacency-
+        only backfill entries (shared=0) that must NOT count as
+        "knowledge" here even though they're valid gate members for
+        V6's sake elsewhere.
+
+        A qualifying context token that equals C itself is excluded
+        from the requirement, not from eligibility -- same "a token
+        never has to vouch for itself" rule every other layer applies
+        to voting, just checked once per required token here instead
+        of skipped inside a sum. If that leaves NO qualifying tokens
+        at all for a given C (e.g. context is empty, entirely
+        reserved, or entirely equal to C itself), no vote is cast for
+        C -- unanimity among zero voters is not evidence, the same
+        reasoning V3 already applies to an empty context.
+        """
+        votes = Counter()
+        required_all = [t for t in (context_tokens or []) if t not in RESERVED]
+        if not required_all:
+            return dict(votes)
+        for c in candidates:
+            if c in RESERVED:
+                continue
+            required = [t for t in required_all if t != c]
+            if not required:
+                continue
+            if all(self._co_occurring.get(t, {}).get(c, 0) > 0 for t in required):
+                votes[c] += 1.0
+        return dict(votes)
+
     def votes(self, candidates, context_tokens):
         """
         Full working, exposed for inspection/tracing (not just the
@@ -944,15 +1110,17 @@ class ImportanceVoteMatrix:
     def score_candidates(self, candidates, context_tokens, current=None, previous=None):
         """
         Open Mode's primary scoring pass -- evaluates EVERY candidate
-        given, not just a pre-existing tie. SEVEN independent vote
+        given, not just a pre-existing tie. NINE independent vote
         layers, summed (see the module docstring for the full
         rationale). An important token is ALSO a context token
         (I ⊆ P), so it votes in every context-token layer it
         qualifies for -- V3, V4, and V6 as a plain context member,
         PLUS V1 and V2 because it's important. Non-important context
-        tokens cast V3/V4/V6. V7 is separate from all of that -- it
-        doesn't iterate over context at all, only `previous` and
-        `current` specifically (see below and _prev_current_vote).
+        tokens cast V3/V4/V6. V7 and V8 are separate from all of
+        that -- neither iterates over context at all, only `previous`
+        and `current` specifically (see below and _prev_current_vote).
+        V9 is separate again -- it's the only layer that requires
+        EVERY context token to agree, not just one or a fixed pair.
 
             V1(C) = important_weight × Σ_{t∈I} 1[knowledge(t, C) > 0]
                 Important tokens vote independently, RAW/binary --
@@ -1052,7 +1220,23 @@ class ImportanceVoteMatrix:
                 weight, since exact-triple evidence is strictly more
                 specific than any of theirs individually.
 
-            score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
+            V9(C) = whole_context_weight × 1[every non-reserved token
+                        t ∈ P, t ≠ C, satisfies knowledge(t, C) > 0]
+                "Whole context" / UNANIMOUS vote -- V3 asks "does at
+                least one context token know C"; this asks the
+                strictly harder "do ALL of them" (excluding C itself
+                from the requirement if it's already a context
+                token -- same self-exclusion rule as every other
+                layer). One flat binary vote, not scaled by context
+                size or evidence magnitude -- unanimity either holds
+                or it doesn't. No vote for ANY candidate if context
+                has no qualifying tokens at all (empty, fully
+                reserved, or entirely equal to C) -- unanimity among
+                zero voters proves nothing. Default weight 2.5 -- see
+                config.py's WHOLE_CONTEXT_WEIGHT for why it sits a
+                notch above V8.
+
+            score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C)
 
         By construction (important_weight, influence_weight, and
         context_influence_weight all smaller than context_weight),
@@ -1061,10 +1245,39 @@ class ImportanceVoteMatrix:
         nudge a decision V3 left open, never override one it already
         made. Confirm this holds for your own weights if you change
         them: it's a property of the ratios, not guaranteed
-        automatically. V5, V6, V7, and V8 are the four layers NOT
+        automatically. V5, V6, V7, V8, and V9 are the five layers NOT
         bound by that rule -- each is independently strong, specific
         evidence, and by default can each outweigh V3 on its own
         (weight >= 1.0, same as or greater than V3).
+
+        THE GATE: V1, V2, V3, V4, V6, and V9 all reduce to sums or
+        conjunctions of "did t and C ever co-occur" (self._co_occurring
+        -- see co_occurrence_index()) -- so if NO context token has
+        EVER co-occurred with a given candidate C, every one of those
+        six layers is guaranteed 0 for C, by construction, not by
+        approximation:
+          - V1/V2 only consider important tokens, a SUBSET of context.
+          - V3/V4 sum over exactly the tokens the gate checks.
+          - V6 requires t immediately followed by C in training, which
+            implies t and C shared that sentence -- a STRICTER
+            condition than mere co-occurrence, so V6-eligible implies
+            gate-eligible.
+          - V9 requires ALL context tokens to co-occur with C, which
+            trivially implies at least one does.
+        V5 sums over context tokens too (checking a stronger,
+        bigram-specific condition), so the same argument applies to it
+        UNCONDITIONALLY. V7 and V8 check `previous`/`current` directly
+        rather than summing over context, so the gate only covers them
+        when `previous` and `current` are THEMSELVES members of
+        `context_tokens` -- true for every real generation call (see
+        inference.py/model.py, which always build context_tokens as
+        the full token sequence including both), but NOT guaranteed
+        for an arbitrary caller. This method checks that condition at
+        runtime before applying the gate to V7/V8, and falls back to
+        scoring them against the full candidate list (never skipping
+        work that might change the answer) when it doesn't hold --
+        e.g. a caller (see test.py) that deliberately narrows
+        context_tokens to isolate one layer in a unit test.
 
         Returns a full trace dict, not just scores, so this stays
         auditable: {"important_tokens": [...], "knows": {...},
@@ -1072,9 +1285,9 @@ class ImportanceVoteMatrix:
         "influence_vote": {C: V2}, "context_vote": {C: V3},
         "context_influence_vote": {C: V4}, "bigram_witness_vote":
         {C: V5}, "adjacency_vote": {C: V6}, "prev_current_vote":
-        {C: V7}, "triple_vote": {C: V8},
-        "scores": {C: V1+V2+V3+V4+V5+V6+V7+V8}, "cache_used": bool}.
-        "scores" is the one that actually drives select(); the eight
+        {C: V7}, "triple_vote": {C: V8}, "whole_context_vote": {C: V9},
+        "scores": {C: V1+V2+...+V9}, "cache_used": bool}.
+        "scores" is the one that actually drives select(); the nine
         components are exposed separately (already weighted, so they
         sum directly to "scores") so each stays independently
         auditable. Every candidate in `candidates` gets a "scores"
@@ -1088,16 +1301,26 @@ class ImportanceVoteMatrix:
         _adjacent -- same formulas, same weights, identical numeric
         result, just without redoing the O(|context| x |candidates|)
         work every step (see build_cache()'s comment for why those five
-        layers -- and only those five -- are cacheable this way). V5,
-        V7, and V8 are always computed live either way. "cache_used" in the
-        returned trace reports which path actually ran, so cached vs.
-        live runs stay easy to compare/verify against each other. A
-        candidate-set mismatch (e.g. Strict Mode calling this with a
-        narrower successor set) silently falls back to the live path --
-        never a wrong answer, just not the fast one.
+        layers -- and only those five -- are cacheable this way). When
+        the cache is off (or doesn't match), the same five layers are
+        computed live via the gate above instead of the old dense
+        O(|context| x |candidates|) loop: for each context token, only
+        the candidates it's KNOWN to co-occur with (self._co_occurring
+        row) are ever visited, so the loop's real cost tracks actual
+        co-occurrence in the corpus, not vocabulary size. V5, V7, V8,
+        and V9 are always computed live either way, each restricted to
+        the gate-derived candidate set per the paragraph above.
+        "cache_used" in the returned trace reports which path actually
+        ran, so cached vs. live runs stay easy to compare/verify
+        against each other. A candidate-set mismatch (e.g. Strict Mode
+        calling this with a narrower successor set) silently falls
+        back to the live path -- never a wrong answer, just not the
+        fast one.
         """
         candidates = sorted(set(candidates))
+        candidates_set = set(candidates)
         context_tokens = context_tokens or []
+        context_set = set(context_tokens)
         important = self.important_tokens_in(context_tokens)
         use_cache = (self._use_cache and self._cache_candidates is not None
                      and self._cache_candidates == frozenset(candidates))
@@ -1149,17 +1372,24 @@ class ImportanceVoteMatrix:
             # recomputed from scratch up to three separate times per
             # candidate (once in _knows_rels, again in _context_vote, again
             # in _context_influence_vote), on top of a fourth separate scan
-            # for adjacency. Profiling a mid-sized vocabulary showed these
-            # four calls alone accounting for the large majority of a live
-            # (uncached) score_candidates() call. Every one of them reads
-            # only `rels_t`, `rels_c`, and `self._adjacent` -- exactly the
-            # same (t, c) inputs enable_cache()'s build_cache() already
-            # precomputes for the cached path (see its comment above) -- so
-            # they're folded into one loop here, computing `shared`/
-            # `adjacent` once per (t, c) and feeding all five vote layers
-            # from that single result. Same formulas, same weights,
-            # identical numeric output to the previous four-loop version
-            # (test.py's cached-vs-live parity checks cover this).
+            # for adjacency. A later version merged those four scans into
+            # one loop over (t, c), still tested against every candidate in
+            # `candidates` regardless of whether t and c had ever
+            # co-occurred. This version goes one step further: instead of
+            # `for c in candidates: rels_c = ...; shared = len(rels_t &
+            # rels_c)`, it looks up self._co_occurring[t] -- precomputed
+            # once per model in build() (see co_occurrence_index()) -- and
+            # only visits the candidates t is ALREADY known to co-occur
+            # (or be directly adjacent to) with. For a candidate t has never
+            # heard of, this skips the work entirely rather than computing
+            # an intersection that was always going to come back empty --
+            # real cost now tracks actual co-occurrence in the corpus, not
+            # |candidates| (typically the full vocabulary in Open Mode).
+            # Same formulas, same weights, identical numeric output to the
+            # previous versions (test.py's cached-vs-live parity checks
+            # cover this, and co_occurrence_index()'s adjacency backfill is
+            # what keeps V6 exact even for the rare degenerate-short-
+            # sentence case -- see its docstring).
             knows = {}
             influence = {}
             raw_context_vote = Counter()
@@ -1175,11 +1405,20 @@ class ImportanceVoteMatrix:
                     continue
                 is_important = t in important_set
                 t_knows = {} if is_important else None
-                for c in candidates:
-                    if c in RESERVED or c == t:
+                # GATE: only visit candidates t has ever actually
+                # co-occurred (or, per co_occurrence_index()'s
+                # backfill, been directly adjacent to) with, instead
+                # of testing every candidate in the full set. Same
+                # `shared`/`adjacent` values the old per-candidate
+                # intersection would have computed -- see
+                # co_occurrence_index()'s docstring for why this is
+                # exactly equivalent, not an approximation.
+                row = self._co_occurring.get(t)
+                if not row:
+                    continue
+                for c, shared in row.items():
+                    if c not in candidates_set:
                         continue
-                    rels_c = self._token_rels.get(c)
-                    shared = len(rels_t & rels_c) if rels_c else 0
                     if shared:
                         raw_context_vote[c] += 1.0
                         context_influence_vote[c] += self._context_influence_weight * shared
@@ -1214,31 +1453,61 @@ class ImportanceVoteMatrix:
             important_vote = dict(important_vote)
             influence_vote = dict(influence_vote)
 
+        # GATE for V5/V7/V8/V9: any candidate that raised a V3 or V6
+        # vote above is a candidate at least one context token has
+        # co-occurred (or, via the adjacency backfill, been directly
+        # adjacent) with. V5 and V9 are BOTH sums/conjunctions over
+        # context tokens themselves, so restricting them to this set is
+        # always exact (see the module docstring's "THE GATE" section
+        # for the proof) -- no candidate outside it could ever have
+        # scored nonzero on V5 or V9 anyway. V7/V8 check `previous`/
+        # `current` directly rather than summing over context, so the
+        # same restriction is only valid for them when both are
+        # themselves members of context_tokens (true for every real
+        # generation call -- see model.py/inference.py -- but not
+        # guaranteed for an arbitrary caller, e.g. some of test.py's
+        # isolated-layer checks); otherwise fall back to the full
+        # candidate list for V7/V8 specifically, so nothing is ever
+        # silently under-scored.
+        gate_candidates = (set(raw_context_vote) | set(raw_adjacency_vote)) & candidates_set
+
         # V5 -- every context token casts a full vote iff it literally
         # witnessed the exact (current, C) bigram in a training sentence.
         # Always live (see build_cache()'s comment for why) -- depends on
         # `current`, not just t/c, so it can't be a per-token cache entry.
-        raw_bigram_witness_vote = self._bigram_witness_vote(current, context_tokens, candidates)
+        raw_bigram_witness_vote = self._bigram_witness_vote(current, context_tokens, gate_candidates)
         bigram_witness_vote = {c: self._bigram_witness_weight * v
                                 for c, v in raw_bigram_witness_vote.items()}
 
+        v78_gate_safe = ((previous is None or previous in context_set)
+                          and (current is None or current in context_set))
+        v78_candidates = gate_candidates if v78_gate_safe else candidates_set
+
         # V7 -- a single fixed-pair check: did previous, current, and C
         # ever all three share one training sentence together
-        raw_prev_current_vote = self._prev_current_vote(previous, current, candidates)
+        raw_prev_current_vote = self._prev_current_vote(previous, current, v78_candidates)
         prev_current_vote = {c: self._prev_current_weight * v
                               for c, v in raw_prev_current_vote.items()}
 
         # V8 -- a single fixed-triple check: was (previous, current, C)
         # ever literally one consecutive trained Bridge Matrix triple
-        raw_triple_vote = self._triple_vote(previous, current, candidates)
+        raw_triple_vote = self._triple_vote(previous, current, v78_candidates)
         triple_vote = {c: self._triple_weight * v
                        for c, v in raw_triple_vote.items()}
+
+        # V9 -- unanimous vote: every non-reserved, non-self context
+        # token has to know C, not just one (V3's question). Gated the
+        # same unconditional way as V5 -- see the comment above.
+        raw_whole_context_vote = self._whole_context_vote(context_tokens, gate_candidates)
+        whole_context_vote = {c: self._whole_context_weight * v
+                               for c, v in raw_whole_context_vote.items()}
 
         final_scores = {
             c: important_vote.get(c, 0) + influence_vote.get(c, 0)
                + context_vote.get(c, 0) + context_influence_vote.get(c, 0)
                + bigram_witness_vote.get(c, 0) + adjacency_vote.get(c, 0)
                + prev_current_vote.get(c, 0) + triple_vote.get(c, 0)
+               + whole_context_vote.get(c, 0)
             for c in candidates
         }
 
@@ -1252,6 +1521,7 @@ class ImportanceVoteMatrix:
                 "adjacency_vote": adjacency_vote,
                 "prev_current_vote": prev_current_vote,
                 "triple_vote": triple_vote,
+                "whole_context_vote": whole_context_vote,
                 "scores": final_scores,
                 "cache_used": use_cache}
 
@@ -1266,11 +1536,11 @@ class ImportanceVoteMatrix:
     def select(self, candidates, context_tokens, current=None, previous=None):
         """
         Deterministic winner among `candidates` by the combined score
-        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8, see score_candidates),
-        with a three-stage deterministic tie-break cascade when the
-        combined score itself doesn't discriminate:
+        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9, see
+        score_candidates), with a three-stage deterministic tie-break
+        cascade when the combined score itself doesn't discriminate:
 
-            1. score (V1..V8)       -- primary, structural + contextual
+            1. score (V1..V9)       -- primary, structural + contextual
             2. bigram frequency     -- how often `candidate` literally
                                         followed `current` (requires
                                         `current`; skipped if not given)
@@ -1323,6 +1593,7 @@ class ImportanceVoteMatrix:
             "adjacency_weight": self._adjacency_weight,
             "prev_current_weight": self._prev_current_weight,
             "triple_weight": self._triple_weight,
+            "whole_context_weight": self._whole_context_weight,
             "bigram_freq": {f"{t}:{c}": n for (t, c), n in self._bigram_freq.items()},
             "bigram_rels": {f"{t}:{c}": sorted(r) for (t, c), r in self._bigram_rels.items()},
             "adjacent": [list(pair) for pair in self._adjacent],
@@ -1342,6 +1613,7 @@ class ImportanceVoteMatrix:
         ivm._adjacency_weight = d.get("adjacency_weight", IVMConfig.ADJACENCY_WEIGHT)
         ivm._prev_current_weight = d.get("prev_current_weight", IVMConfig.PREV_CURRENT_WEIGHT)
         ivm._triple_weight = d.get("triple_weight", IVMConfig.TRIPLE_WEIGHT)
+        ivm._whole_context_weight = d.get("whole_context_weight", IVMConfig.WHOLE_CONTEXT_WEIGHT)
         ivm._bigram_freq = {}
         for key, n in d.get("bigram_freq", {}).items():
             t, c = key.split(":")
@@ -1352,4 +1624,8 @@ class ImportanceVoteMatrix:
             ivm._bigram_rels[(int(t), int(c))] = set(r)
         ivm._adjacent = {tuple(pair) for pair in d.get("adjacent", [])}
         ivm._triples = {tuple(tri) for tri in d.get("triples", [])}
+        # Derived, not stored -- same "re-derive on load" treatment as
+        # everything else here that's fully computable from data
+        # already in this dict (see build()'s matching comment).
+        ivm._co_occurring = co_occurrence_index(ivm._token_rels, adjacent=ivm._adjacent)
         return ivm

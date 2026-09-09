@@ -41,7 +41,7 @@ The optional `server.py` HTTP server additionally needs `flask`
 - [5. Run the HTTP API server](#5-run-the-http-api-server)
 - [6. Analyse a trained model](#6-analyse-a-trained-model)
 - [7. Cluster Interpreter Matrix (naming clusters)](#7-cluster-interpreter-matrix-naming-clusters)
-- [8. Open Mode's primary mechanism: IVM weighted voting (V1-V8)](#8-open-modes-primary-mechanism-ivm-weighted-voting-v1-v8)
+- [8. Open Mode's primary mechanism: IVM weighted voting (V1-V9)](#8-open-modes-primary-mechanism-ivm-weighted-voting-v1-v9)
 - [9. Context Trigger Matrix (contextual disambiguation)](#9-context-trigger-matrix-contextual-disambiguation)
 - [10. Token Importance / Trigger analysis (Python API only)](#10-token-importance--trigger-analysis-python-api-only)
 - [11. Analyse raw text with no trained model](#11-analyse-raw-text-with-no-trained-model)
@@ -59,7 +59,7 @@ The optional `server.py` HTTP server additionally needs `flask`
 | `graph.py`            | Edge / Bridge / Relationship matrices + dual-axis clustering            |
 | `model.py`            | `MSEGraphLanguageModel` — orchestrates everything, save/load            |
 | `inference.py`        | Deterministic inference engine — Strict Mode's two-stage lineage-vote pipeline and Open Mode's IVM-scored candidate selection |
-| `ivm.py`               | Importance Vote Matrix — Open Mode's PRIMARY candidate-scoring mechanism (V1-V8 weighted voting, see section 8); also Strict Mode's legacy opt-in tie-break |
+| `ivm.py`               | Importance Vote Matrix — Open Mode's PRIMARY candidate-scoring mechanism (V1-V9 weighted voting, see section 8); also Strict Mode's legacy opt-in tie-break |
 | `interpret.py`        | Cluster Interpreter Matrix — names clusters, mines the zero-cluster bucket |
 | `importance.py`       | Sequence reconstruction + per-triple importance/trigger tagging (Python API only) |
 | `ctm.py`               | Context Trigger Matrix — contextual disambiguation among cluster members |
@@ -69,7 +69,7 @@ The optional `server.py` HTTP server additionally needs `flask`
 | `chat.py`             | Interactive REPL over a trained model                                  |
 | `server.py`           | Optional Flask HTTP API + web UI over a trained model (needs `flask`)   |
 | `benchmark_cache.py`  | Standalone script: times Open Mode's sparse score cache vs. live scoring, confirms they agree, on your own trained model (section 8) |
-| `test.py`             | Full regression suite (all features, 290+ checks)                       |
+| `test.py`             | Full regression suite (all features, 340+ checks)                       |
 
 ---
 
@@ -188,7 +188,7 @@ REPL commands once inside:
 | `<any text>`                 | Generate a continuation in the current mode        |
 | `/mode strict` / `/mode open`| Switch modes (Open Mode is always ready — no separate build step) |
 | `/explain <prev> \| <curr>`  | Explain one inference step                         |
-| `/scores <prompt>`           | Open Mode only: full V1-V8 IVM score breakdown for the next token (see section 8), plus which tie-break stage (if any) decided the winner |
+| `/scores <prompt>`           | Open Mode only: full V1-V9 IVM score breakdown for the next token (see section 8), plus which tie-break stage (if any) decided the winner. Prints only the top N by score by default (`--top <n>` / `--all` to change) |
 | `/bigram <prev> <curr>`      | Bigram evidence for a pair — training/total counts (Strict Mode's tie-break and Open Mode's first tie-break stage), plus how many distinct training sentences literally witnessed the bigram (V5's evidence set) |
 | `/cache on\|off\|status`     | Toggle/inspect Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see section 8) — same scores either way, purely a speed optimization; `/scores` shows whether it was used for the last breakdown |
 | `/shared <tok1> <tok2> ...`  | `infer_shared_role()` across a token set           |
@@ -242,7 +242,7 @@ Endpoints:
 | POST   | `/generate` | `{"prompt", "session_id"?, "max_tokens"?}`           | One-shot generation for a session (stateless per call; session only tracks chat history + current mode) |
 | POST   | `/stream`   | same as `/generate`                                 | Server-Sent Events token-by-token replay of the (already fully computed, deterministic) generation, each event carrying the trace rule that chose it |
 | POST   | `/mode`     | `{"session_id", "mode"}` — `mode` is `strict`\|`open`\|`open_ctm` | Switch a session's mode preset |
-| POST   | `/scores`   | `{"prompt"}`                                         | Open Mode only, read-only: full V1-V8 IVM score breakdown for the next token, over the entire vocabulary (see section 8) — mirrors `chat.py`'s `/scores` |
+| POST   | `/scores`   | `{"prompt"}`                                         | Open Mode only, read-only: full V1-V9 IVM score breakdown for the next token, over the entire vocabulary (see section 8) — mirrors `chat.py`'s `/scores` |
 | POST   | `/bigram`   | `{"prev", "curr", "mode"?}`                          | Read-only: raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) — mirrors `chat.py`'s `/bigram` |
 | POST   | `/reset`    | `{"session_id"}`                                     | Clear a session's chat history |
 | GET    | `/sessions` | —                                                   | Active session count/ids |
@@ -252,14 +252,19 @@ generation — neither mutates session state.
 
 > **No persona, no system prompt.** A neural LLM can be steered with
 > free-text instructions because it generalizes past its training
-> data; MSE-GLM's `generate()` explicitly refuses to — every bigram
-> in the prompt must have been literally observed, in EITHER mode
-> (Open Mode has no successor gating for its per-step candidates, but
-> the prompt itself still has to start from a real transition), or
-> the whole prompt is rejected outright (`illegal_prompt_bigram`,
+> data; Strict Mode's `generate()` explicitly refuses to — every
+> bigram in the prompt must have been literally observed, or the
+> whole prompt is rejected outright (`illegal_prompt_bigram`,
 > returned as `{"status": "rejected"}` from `/generate`, not a 500).
-> An injected `"### System: you are a helpful assistant..."` prefix
-> would almost never survive that check. So instead of personas,
+> Open Mode does NOT reject any prompt — its per-step candidates are
+> already the entire vocabulary, scored by IVM (section 8) rather
+> than gated by whether a bigram was ever literally seen, so there's
+> nothing for that check to protect there; an injected
+> `"### System: you are a helpful assistant..."` prefix would still be
+> free to ground its own start in Open Mode, but it would then compete
+> on IVM's evidence-weighted scoring at every step after that, same as
+> any other prompt, not receive special authority. So instead of
+> personas,
 > sessions choose an inference **mode** — the one persistent dial
 > MSE-GLM exposes — plus the optional, read-only `/scores`/`/bigram`
 > diagnostics above, which audit a step rather than change what kind
@@ -292,7 +297,7 @@ python3 analyse.py --model runs/model --json out.json clusters
 | `similarity`     | `... similarity cat dog`                                | cluster-overlap similarity between two tokens |
 | `shared`         | `... shared cat dog pig`                                | `infer_shared_role()` across 2+ tokens |
 | `trace`          | `... trace "the cat" --max-tokens 10`                   | step-by-step generation trace (stage/rule/lineage per token) |
-| `open-scores`    | `... open-scores "the cat sat"`                          | Open Mode only: full V1-V8 IVM score breakdown for the next token, over the entire vocabulary (see section 8); add `--cache` to enable the sparse cache first |
+| `open-scores`    | `... open-scores "the cat sat"`                          | Open Mode only: full V1-V9 IVM score breakdown for the next token, over the entire vocabulary (see section 8); add `--cache` to enable the sparse cache first, `--top-n <n>`/`--top-n 0` to change how many rows print |
 | `cache`          | `... cache on`                                          | Toggle/inspect Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see section 8) — `on`, `off`, or `status` (default) |
 | `bigram`         | `... bigram the mat --mode open`                        | raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) |
 | `report`         | `... report --top 10`                                   | combined stats + topology + clusters + relationships |
@@ -329,39 +334,46 @@ identical clusters and evidence for all four subcommands.
 
 ---
 
-## 8. Open Mode's primary mechanism: IVM weighted voting (V1-V8)
+## 8. Open Mode's primary mechanism: IVM weighted voting (V1-V9)
 
 The Bridge Matrix answers "which tokens are structurally related
 here?" Open Mode's **Importance Vote Matrix** (`ivm.py`) answers
 "given the whole context so far, which token should actually come
 next?" — and it's not a tie-break: Open Mode has no successor gating
-at all. Every step, the ENTIRE vocabulary is scored by summing eight
-independent, weighted vote layers:
+at all, and (unlike Strict Mode) it doesn't reject the PROMPT either —
+any prompt is accepted, even one containing a transition the model
+has genuinely never seen; there's simply nothing after that first
+step for a "was this ever literally seen" check to protect, since
+every step already scores the whole vocabulary regardless. Every
+step, the ENTIRE vocabulary is scored by summing nine independent,
+weighted vote layers:
 
 | Layer | What it measures | Default weight | Role |
 |-------|-------------------|-----------------|------|
 | V1 `important_vote` | Binary: did an "important" context token (cluster member) ever co-occur with this candidate at all? | 0.4 | Small — can only nudge a tie V3 left open |
-| V2 `influence_vote`  | Same, but scaled by how much total evidence that important token carries (its "influence") | 0.0 | Small, same role as V1 (currently off) |
+| V2 `influence_vote`  | Same, but scaled by how much total evidence that important token carries (its "influence") | 0.0003 | Small, same role as V1 |
 | V3 `context_vote`    | Binary: did ANY context token (important or not) ever co-occur with this candidate? Full weight, every context token counted | 1.0 | Primary signal |
-| V4 `context_influence_vote` | Same as V3 but scaled by raw co-occurrence count, for every context token | 0.0 | Tiny refinement, can't override V3 (currently off) |
-| V5 `bigram_witness_vote` | Binary per context token: was that token EVER in a training sentence containing the exact literal bigram `(current -> candidate)`? A narrower, stronger claim than V3's "co-occurred anywhere" | 0.8 | Peer-weighted with V3 — usually the single largest contributor once the exact bigram was literally seen |
-| V6 `adjacency_vote` | Binary per context token: was that token EVER DIRECTIONALLY, literally, immediately followed by this candidate in training (`token -> candidate`, not the reverse) — not necessarily this specific transition (contrast V5), but must have been actually consecutive in that exact order, not just co-occurring (contrast V3) | 1.0 | Peer-weighted with V3/V5 — often the largest contributor once the token was ever directly followed by the candidate |
+| V4 `context_influence_vote` | Same as V3 but scaled by raw co-occurrence count, for every context token | 0.0003 | Tiny refinement, can't override V3 |
+| V5 `bigram_witness_vote` | Binary per context token: was that token EVER in a training sentence containing the exact literal bigram `(current -> candidate)`? A narrower, stronger claim than V3's "co-occurred anywhere" | 0.7 | Peer-weighted with V3 — usually the single largest contributor once the exact bigram was literally seen |
+| V6 `adjacency_vote` | Binary per context token: was that token EVER DIRECTIONALLY, literally, immediately followed by this candidate in training (`token -> candidate`, not the reverse) — not necessarily this specific transition (contrast V5), but must have been actually consecutive in that exact order, not just co-occurring (contrast V3) | 0.6 | Peer-weighted with V3/V5 — often the largest contributor once the token was ever directly followed by the candidate |
 | V7 `prev_current_vote` | Binary, a SINGLE flat check (not summed per context token): did `previous`, `current`, AND this candidate ever all three share one training sentence together, no adjacency required between any of them? | 1.7 | Peer-weighted with V3/V5/V6 — a fixed-pair question about the two most recent tokens specifically, narrower than V3 (needs both tokens, not just one) but broader than V5 (no adjacency required) |
-| V8 `triple_vote` | Binary, a SINGLE flat check (not summed per context token): was `(previous, current, candidate)` ever literally ONE consecutive trained Bridge Matrix triple, in that exact order? | 2.0 | Peer-weighted with V3/V5/V6/V7, a notch above — the single strictest, most literal evidence of all eight: an exact triple match, not merely a shared sentence (V7) or a directional pair (V6) |
+| V8 `triple_vote` | Binary, a SINGLE flat check (not summed per context token): was `(previous, current, candidate)` ever literally ONE consecutive trained Bridge Matrix triple, in that exact order? | 2.0 | Peer-weighted with V3/V5/V6/V7, a notch above — the strictest, most positionally exact single-triple evidence |
+| V9 `whole_context_vote` | Binary, UNANIMOUS: does EVERY non-reserved context token (not just one, V3's question), excluding the candidate itself if it's already in context, co-occur with this candidate? | 2.5 | Peer-weighted with V3/V5/V6/V7/V8, a further notch above V8 — the strictest CONSENSUS evidence, harder to satisfy the larger the context gets |
 
-`score(candidate) = V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8`, highest
-score
+`score(candidate) = V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9`,
+highest score
 wins; a genuine tie falls to a deterministic cascade (bigram
 frequency, then global frequency, then lowest token id — never
 randomness). V1/V2/V4 are deliberately kept smaller than V3 by
 design, so important-token membership or raw evidence magnitude
 alone can never override what plain context presence already
-decided — they can only break a tie V3 left open. V5, V6, V7, and V8
-are the four layers NOT bound by that "stay small" rule: each is
-independently strong, specific (bigram-, pair-, or triple-level, not
-merely sentence-level) evidence, so all four are peer-weighted with
-V3 rather than riding on top of it (V8 a notch above the rest).
-They differ from each other in
+decided — they can only break a tie V3 left open. V5, V6, V7, V8,
+and V9 are the five layers NOT bound by that "stay small" rule: each
+is independently strong, specific (bigram-, pair-, triple-, or
+whole-context-level, not merely sentence-level) evidence, so all
+five are peer-weighted with V3 rather than riding on top of it (V8
+and V9 a notch above the rest, V9 highest of all). They differ from
+each other in
 specificity: V5 requires witnessing the exact `current -> candidate`
 transition; V6 only requires that the context token was EVER
 immediately followed by the candidate, directionally, in any
@@ -370,9 +382,28 @@ adjacency at all between any of the three tokens, only that
 `previous`, `current`, and the candidate all shared one sentence —
 but unlike V3/V5/V6, it is not "every context token votes," it is a
 single check tied to the two most recent tokens specifically; V8 is
-the same fixed-pair shape as V7 but requires the STRICTEST condition
-of all eight — an exact, consecutive, in-order trained triple, not
-merely a shared sentence.
+the same fixed-pair shape as V7 but requires the strictest
+POSITIONALLY EXACT condition — an exact, consecutive, in-order
+trained triple, not merely a shared sentence; V9 goes back to "every
+context token votes" like V3, but requires ALL of them to agree
+rather than just one — the strictest CONSENSUS condition, and the
+only layer where a larger context makes the bar harder to clear, not
+easier.
+
+### The co-occurrence gate
+
+V1, V3, V4, V6, and V9 all reduce to sums or conjunctions over the
+same underlying fact: did token *t* and candidate *C* ever co-occur
+in a training relationship? (V5 sums over context too, checking a
+stronger, bigram-specific version of the same fact.) `ivm.py`
+precomputes a whole-vocabulary co-occurrence index once per model
+build (`co_occurrence_index()`) and uses it to skip straight to a
+score of 0 for any candidate no context token has ever heard of,
+instead of testing it against every layer in turn — real cost then
+tracks actual co-occurrence in the corpus, not vocabulary size. This
+is exact, not an approximation (see `ivm.py`'s module docstring for
+the proof), and it's what `build_cache()` below is now built on top
+of too, rather than each computing its own version.
 
 ```python
 from model import MSEGraphLanguageModel
@@ -385,14 +416,23 @@ info = model.open_mode_candidate_scores("the cat sat on the")
 # info["scores"], info["winner"], info["tie_break_stage"], plus each
 # layer separately: important_vote / influence_vote / context_vote /
 # context_influence_vote / bigram_witness_vote / adjacency_vote /
-# prev_current_vote / triple_vote
+# prev_current_vote / triple_vote / whole_context_vote
 # info["candidates"] always covers the entire vocabulary.
 
 text, ids, trace = model.generate("the cat sat on the", mode="open")
+# Any prompt works in Open Mode, including one containing a
+# transition never literally seen in training -- only Strict Mode
+# rejects those (rule "illegal_prompt_bigram").
 ```
 
 CLI/REPL equivalents: `analyse.py open-scores` and `chat.py`'s
-`/scores` (section 6 and 4); `/bigram` and `analyse.py bigram`
+`/scores` (section 6 and 4) — both print only the top N
+candidates by score by default (`config.py`'s
+`ScoresDisplayConfig.TOP_N`, 25) since a full vocabulary can't fit on
+screen; pass `--top-n <n>` / `--top-n 0` (analyse.py) or
+`--top <n>` / `--all` (chat.py) to change that. The winner is always
+shown even if it falls outside the shown set. `/bigram` and
+`analyse.py bigram`
 expose V5's raw evidence (`witness_sentences`) for one pair without
 running the full vote.
 
@@ -402,23 +442,30 @@ V1, V2, V3, V4, and V6 are each a **sum over context tokens** of a
 contribution that only depends on the pair `(token, candidate)` —
 never on which other tokens happen to be in context that step, and
 never on `current`/`previous`. That makes each `(token, candidate)`
-contribution precomputable once and reused for every future step,
-instead of three separate `O(context × candidates)` loops running
-from scratch on every single call. `ivm.py`'s `ImportanceVoteMatrix`
+contribution precomputable once and reused for every future step.
+`ivm.py`'s `ImportanceVoteMatrix`
 exposes this as an opt-in sparse cache — sparse meaning only nonzero
 `(token, candidate)` entries are stored, never a dense
 `vocab × vocab` table, which for a real vocabulary would be mostly
-zeros anyway (most token pairs never co-occur in training).
+zeros anyway (most token pairs never co-occur in training). As of the
+co-occurrence gate above, `build_cache()` is now just a filter over
+the same precomputed index the live path uses, rather than its own
+separate pass — building the cache and skipping ungated candidates
+live are the same underlying optimization, applied in two different
+places.
 
-V5, V7, and V8 are deliberately **not** part of this cache and are
+V5, V7, V8, and V9 are deliberately **not** part of this cache and are
 always
 computed live: V5's vote also depends on `current` (a different
-`current` means a different witness set for the same pair), and
-V7/V8
+`current` means a different witness set for the same pair); V7/V8
 aren't a per-token contribution at all — each is a single fixed-pair
-(V7) or fixed-triple (V8) check on `(previous, current)`. All three are
-already cheap sparse
-lookups, not the dense-looking nested loops V1-V4/V6 use live.
+(V7) or fixed-triple (V8) check on `(previous, current)`; V9 is a
+conjunction ACROSS every context token for one candidate, not a sum
+of independent per-`(token, candidate)` terms. All four are still
+fast, though — V5/V7/V8 are cheap sparse
+lookups, and V9 reuses the same co-occurrence gate as the cache
+itself, so all four run live whether or not the V1-V4/V6 cache is
+enabled.
 
 ```python
 model = MSEGraphLanguageModel.load("runs/model")
@@ -451,9 +498,14 @@ CLI/REPL equivalents: `analyse.py cache [on|off|status]` and
 `analyse.py open-scores --cache`; `chat.py`'s `/cache on|off|status`.
 Run `python3 benchmark_cache.py` to measure the actual speedup on
 your own trained model (confirms cached and live scores match
-exactly, then times both) — on this repo's own test corpus it's
-roughly a 2-3x speedup per step, with the one-time cache-build cost
-paid back within about a dozen steps.
+exactly, then times both). Since the co-occurrence gate now speeds
+up the LIVE path too, the cache's own marginal benefit over live
+scoring is smaller than it used to be, and on a small vocabulary the
+cache can even come out slightly slower than gated live scoring (its
+per-step bookkeeping overhead no longer has as much dead weight to
+save) — the gate is what does most of the heavy lifting now; the
+cache is worth measuring on your own model and vocabulary size rather
+than assumed.
 
 `ivm.py`'s `ImportanceVoteMatrix` also has a Strict Mode LEGACY role
 (`resolve_tie()`) — opt-in only, substituting importance voting for
@@ -550,8 +602,10 @@ python3 test.py
 
 No flags. Runs the full regression suite (tokenizer, graph
 construction, generation determinism, Open Mode's vocabulary-as-
-candidates architecture, IVM weighted voting incl. V5 bigram-witness,
-V6 adjacency, and V7 prev+current co-occurrence, the sparse per-token
+candidates architecture and any-prompt-accepted behavior, IVM
+weighted voting incl. V5 bigram-witness, V6 adjacency, V7
+prev+current co-occurrence, V8 triple witness, and V9 whole-context
+unanimous vote, the co-occurrence gate, the sparse per-token
 score cache, Cluster Interpreter, zero-cluster mining, Token
 Importance analysis, Context Trigger Matrix, incremental training,
 large-corpus pipeline, save/load round-trips) and prints a final

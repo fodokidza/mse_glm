@@ -59,7 +59,7 @@ class TokenizerConfig:
 
 
 class IVMConfig:
-    """Default weights for ivm.py's eight vote layers (V1-V8) -- see
+    """Default weights for ivm.py's nine vote layers (V1-V9) -- see
     ivm.py's module docstring for what each one means. important_weight,
     influence_weight, and context_influence_weight are deliberately
     smaller than context_weight BY DESIGN (see that docstring); if you
@@ -80,6 +80,20 @@ class IVMConfig:
                                         # literal check of the eight:
                                         # an exact trained (previous,
                                         # current, candidate) triple.
+    WHOLE_CONTEXT_WEIGHT = 2.5         # V9 -- see ivm.py; UNANIMOUS
+                                        # agreement across every token
+                                        # currently in context, not just
+                                        # one (V3's question). Set above
+                                        # V8: unanimity gets strictly
+                                        # harder to satisfy as context
+                                        # grows, so when it does fire on
+                                        # a non-trivial context it is at
+                                        # least as specific as a single
+                                        # exact triple match, and it
+                                        # cannot fire at all unless V3
+                                        # already fired for every one of
+                                        # those tokens (see ivm.py's
+                                        # _whole_context_vote).
 
 
 class ScoresDisplayConfig:

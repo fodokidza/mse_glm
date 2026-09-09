@@ -4,7 +4,7 @@ test.py — Full regression suite for MSE-GLM v2.1 + Open Mode.
 Usage:  python3 test.py
 """
 
-import os, random, shutil, sys, tempfile
+import os, shutil, sys, tempfile
 from model import MSEGraphLanguageModel
 from analyse import CorpusAnalyser, Analyser
 from tokenizer import normalize, split_sentences
@@ -353,7 +353,7 @@ the pig sat on the rug.
 
     section("Context Trigger Matrix (ctm.py)")
 
-    from ctm import ContextTriggerMatrix, build_context_trigger_matrix, token_to_relationships
+    from ctm import ContextTriggerMatrix, token_to_relationships
 
     # Each animal gets its own distinct surrounding vocabulary so the
     # signatures should cleanly discriminate them, matching the
@@ -785,6 +785,7 @@ a piglet is like a pig.
                                 "context_vote", "context_influence_vote",
                                 "bigram_witness_vote", "adjacency_vote",
                                 "prev_current_vote", "triple_vote",
+                                "whole_context_vote",
                                 "scores", "winner", "tie_break_stage",
                                 "cache_used"}, info)
     check("open_mode_candidate_scores always covers the entire vocabulary now",
@@ -795,12 +796,13 @@ a piglet is like a pig.
     # evidence alone.
     check("chair is still the top-scoring candidate in open mode",
           max(info["scores"], key=info["scores"].get) == "chair", info["scores"])
-    check("scores equal the sum of the eight independent vote layers",
+    check("scores equal the sum of the nine independent vote layers",
           all(abs(info["scores"][c] -
                   (info["important_vote"].get(c, 0) + info["influence_vote"].get(c, 0)
                    + info["context_vote"].get(c, 0) + info["context_influence_vote"].get(c, 0)
                    + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0)
-                   + info["prev_current_vote"].get(c, 0) + info["triple_vote"].get(c, 0))) < 1e-9
+                   + info["prev_current_vote"].get(c, 0) + info["triple_vote"].get(c, 0)
+                   + info["whole_context_vote"].get(c, 0))) < 1e-9
               for c in info["candidates"]),
           info)
 
@@ -812,7 +814,7 @@ a piglet is like a pig.
     #   B knows X with evidence 1 only (doesn't know Y)     -> influence(B)=1
     #   N (unimportant) co-occurs with Y only, not X -- V3/V4 are the ONLY
     #     layers N can contribute to, and it does, for Y only.
-    from ivm import ImportanceVoteMatrix
+    from ivm import ImportanceVoteMatrix, co_occurrence_index
     ivm3 = ImportanceVoteMatrix()
     # This worked example's comments use clean 0.1 weights throughout for
     # readability. _important_weight already defaults to 0.1, but
@@ -835,6 +837,15 @@ a piglet is like a pig.
         "X": {1, 2, 50, 51},
         "Y": {3, 60},
     }
+    # score_candidates() now reads co-occurrence from the precomputed
+    # gate/reverse-index (_co_occurring, see ivm.py's build()), not by
+    # re-intersecting _token_rels live -- this hand-built fixture has
+    # to derive it the same way build() does, or every layer that
+    # depends on it (V1/V2/V3/V4/V6/V9) would silently see no data at
+    # all instead of an error, since an empty _co_occurring is
+    # indistinguishable from "no context token knows anything" (see
+    # co_occurrence_index()'s docstring for what this derives).
+    ivm3._co_occurring = co_occurrence_index(ivm3._token_rels, adjacent=ivm3._adjacent)
     trace2 = ivm3.score_candidates(["X", "Y"], {"A", "B", "N"})
     check("V1 (important_vote) is RAW/BINARY, NOT scaled by evidence count -- "
           "one vote (x0.4, IVMConfig.IMPORTANT_WEIGHT) per important token "
@@ -887,6 +898,9 @@ a piglet is like a pig.
         "X2": {1, 100},
         "Y2": {2, 200},
     }
+    # See the matching comment on ivm3 above -- same derivation, needed
+    # for the same reason.
+    ivm4._co_occurring = co_occurrence_index(ivm4._token_rels, adjacent=ivm4._adjacent)
     trace4 = ivm4.score_candidates(["X2", "Y2"], {"A"})
     check("scores tie by construction (symmetric evidence)",
           trace4["scores"]["X2"] == trace4["scores"]["Y2"], trace4["scores"])
@@ -909,6 +923,11 @@ a piglet is like a pig.
     # (corpus-wide) frequency -- should decide it at the LAST stage.
     ivm4._bigram_freq = {("the", "X2"): 3, ("the", "Y2"): 3}
     ivm4._token_rels["X2"] = {1, 100, 101, 102}   # 4 relationships total
+    # Re-derive again -- X2's relationship set just changed, and this
+    # test's winner4c check goes through select()/score_candidates()
+    # again, which reads co-occurrence from _co_occurring, not
+    # _token_rels directly.
+    ivm4._co_occurring = co_occurrence_index(ivm4._token_rels, adjacent=ivm4._adjacent)
     winner4c, _ = ivm4.select(["X2", "Y2"], {"A"}, current="the")
     check("bigram frequency ties too -- global frequency breaks it "
           "(X2 now has 4 relationships vs Y2's 2)",
@@ -946,7 +965,17 @@ the cat sat on the mat.
 
     section("Summary")
     print(f"  {PASS} passed, {FAIL} failed")
-    if FAIL: sys.exit(1)
+    # NOTE: deliberately no sys.exit(1) here even if FAIL > 0 -- this
+    # is one of several test functions __main__ runs in sequence (see
+    # bottom of file); exiting early here would silently skip every
+    # test function after this one, which is exactly what happened
+    # before this fix (a failure introduced by a config.py weight
+    # tuning change meant test_prompt_seeding_and_mode_boundaries()
+    # and eight other test functions -- covering V5-V9, the sparse
+    # cache, and more -- never ran at all for an extended period, and
+    # nothing here indicated that). The single exit-on-failure check
+    # now lives ONLY at the very end of __main__, after every test
+    # function has had a chance to run and contribute to PASS/FAIL.
 
 
 def test_prompt_seeding_and_mode_boundaries():
@@ -1008,33 +1037,41 @@ the boy ran on the road.
     check("case1 'the boy' open → one of ['mat', 'road']",
           any(v in text for v in ["mat", "road"]), f"got '{text}'")
 
-    # Case 2: 'the cat ran' — cat->ran not in training E, in EITHER mode
-    # now (no separate Experience Edge Matrix to widen prompt legality
-    # in Open Mode anymore). The PROMPT itself must still start from a
-    # literally-observed transition in both modes; only what happens
-    # AFTER the prompt differs (Open Mode's per-step candidates are the
-    # whole vocabulary, not gated by successors -- see inference.py).
+    # Case 2: 'the cat ran' — cat->ran not in training E. Strict Mode
+    # still rejects this outright (its whole guarantee depends on every
+    # bigram, prompt included, being literally trained). Open Mode does
+    # NOT reject it anymore -- its prompt-bigram check is skipped
+    # entirely (see inference.py's generate()), since Open Mode's
+    # per-step candidates are already the full vocabulary and were never
+    # gated by prompt legality in the first place; the never-seen
+    # cat->ran transition is simply part of the context IVM scores
+    # against going forward, same as anything else in context.
     for prompt in ["the cat ran", "the dog ran"]:
         ts, _, trace_s = mb.generate(prompt, max_tokens=10, mode="strict")
         check(f"case2 '{prompt}' strict → illegal_prompt_bigram",
               trace_s[0].get("rule") == "illegal_prompt_bigram",
               f"rule={trace_s[0].get('rule')} out='{ts}'")
         to, _, trace_o = mb.generate(prompt, max_tokens=10, mode="open")
-        check(f"case2 '{prompt}' open ALSO → illegal_prompt_bigram (same "
-              "literal Edge Matrix gates the prompt in both modes now)",
-              trace_o[0].get("rule") == "illegal_prompt_bigram",
+        check(f"case2 '{prompt}' open → NOT rejected -- any prompt is now "
+              "accepted in Open Mode, even one containing a transition "
+              "the model has genuinely never seen",
+              trace_o[0].get("rule") != "illegal_prompt_bigram",
               f"rule={trace_o[0].get('rule')} out='{to}'")
+        check(f"case2 '{prompt}' open → actually generated real tokens, "
+              "not just terminated immediately",
+              len(to.strip()) > 0, f"out='{to}'")
 
-    # Case 3: 'the cat ran on the' — also illegal in BOTH modes, same
-    # bad bigram, same reasoning as case 2.
+    # Case 3: 'the cat ran on the' — same bad bigram earlier in the
+    # prompt. Same split: still illegal in Strict Mode, still accepted
+    # and generated from in Open Mode.
     for prompt in ["the cat ran on the", "the dog ran on the"]:
         ts, _, trace_s = mb.generate(prompt, max_tokens=4, mode="strict")
         check(f"case3 '{prompt}' strict → illegal_prompt_bigram",
               trace_s[0].get("rule") == "illegal_prompt_bigram",
               f"rule={trace_s[0].get('rule')} out='{ts}'")
         to, _, trace_o = mb.generate(prompt, max_tokens=4, mode="open")
-        check(f"case3 '{prompt}' open ALSO → illegal_prompt_bigram",
-              trace_o[0].get("rule") == "illegal_prompt_bigram",
+        check(f"case3 '{prompt}' open → NOT rejected",
+              trace_o[0].get("rule") != "illegal_prompt_bigram",
               f"rule={trace_o[0].get('rule')} out='{to}'")
 
     # Case 4: legal unambiguous prompt resolves correctly in strict
@@ -1407,7 +1444,8 @@ def test_bigram_witness_vote_and_vocab_candidates():
           abs(trace_v6["scores"][sat] -
               (trace_v6["important_vote"].get(sat, 0) + trace_v6["influence_vote"].get(sat, 0)
                + trace_v6["context_vote"].get(sat, 0) + trace_v6["context_influence_vote"].get(sat, 0)
-               + trace_v6["bigram_witness_vote"].get(sat, 0) + trace_v6["adjacency_vote"].get(sat, 0))) < 1e-9,
+               + trace_v6["bigram_witness_vote"].get(sat, 0) + trace_v6["adjacency_vote"].get(sat, 0)
+               + trace_v6["whole_context_vote"].get(sat, 0))) < 1e-9,
           trace_v6["scores"])
 
     # to_dict/from_dict must round-trip V6's index and weight too
@@ -1617,7 +1655,9 @@ def test_prev_current_co_occurrence_vote():
 
 def test_triple_witness_vote():
     """
-    V8 (triple witness vote) -- the strictest of the eight layers:
+    V8 (triple witness vote) -- the strictest, most positionally exact
+    of the nine layers (V9 is stricter in a different sense --
+    unanimity across the whole context, not positional exactness):
     unlike V7 (did previous/current/C ever merely share a sentence),
     V8 asks whether (previous, current, C) was ever literally ONE
     consecutive trained Bridge Matrix triple, in that exact order.

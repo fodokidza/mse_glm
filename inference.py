@@ -47,8 +47,8 @@ once at construction (see model.py's all_candidate_tokens()) — not
 narrowed by whether a bigram was ever literally observed. EVERY
 candidate is scored — via `importance_votes.select()` (ivm.py's
 PRIMARY, not legacy, API) — using cluster-membership-derived
-"important" context tokens plus seven other independent vote layers
-(V1-V8, see ivm.py), and the highest scorer wins. This is deterministic
+"important" context tokens plus eight other independent vote layers
+(V1-V9, see ivm.py), and the highest scorer wins. This is deterministic
 by construction (ties broken by lowest token id inside select()); if no
 importance_votes object is supplied, or `self.vocab` is empty, the
 fallback is ALSO deterministic — lowest token id in `self.vocab` — never
@@ -56,7 +56,6 @@ random.choice. See ivm.py's module docstring for the full formula and
 rationale.
 """
 
-from collections import Counter
 from tokenizer import EOS
 from config import GenerationConfig
 
@@ -226,10 +225,10 @@ class InferenceEngine:
         bigram was ever literally observed — every one of them is
         scored here, this is not a tie-break inserted after some
         other mechanism narrows things down. See ivm.py's
-        select()/score_candidates() for the eight-layer weighted-
-        voting formula (V1-V8; V1/V2/V4 deliberately weighted small
+        select()/score_candidates() for the nine-layer weighted-
+        voting formula (V1-V9; V1/V2/V4 deliberately weighted small
         so they can only nudge a tie V3 left open, never override it;
-        V5/V6/V7/V8 peer-weighted with V3, V8 a notch above) and for
+        V5/V6/V7/V8/V9 peer-weighted with V3, V8/V9 a notch above) and for
         the bigram-frequency →
         global-frequency → lowest-token-id tie-break cascade `current`
         feeds into. `previous` is forwarded too now, purely for V7
@@ -283,7 +282,7 @@ class InferenceEngine:
         # ── OPEN MODE: candidates are ALWAYS the full vocabulary ───────────
         # No successor gating at all -- self.vocab (set once at construction,
         # see model.all_candidate_tokens()) is the entire candidate universe
-        # every step, scored by IVM's V1-V8 weighted voting (ivm.py). Not an
+        # every step, scored by IVM's V1-V9 weighted voting (ivm.py). Not an
         # opt-in: any engine constructed with mode="open" behaves this way
         # unconditionally. Strict Mode engines never reach this branch.
         if self.mode == "open":
@@ -418,26 +417,34 @@ class InferenceEngine:
         # ── validate every adjacent bigram in the prompt ──────────────
         # If any (curr→next) pair does not exist in E, the prompt
         # contains a transition the model has never seen. Return
-        # immediately — cannot legally continue. Applied in BOTH modes:
-        # Open Mode's per-step candidates are the full vocabulary, but
-        # the PROMPT itself must still start from real, literally-seen
-        # transitions -- otherwise there's nothing for lineage/IVM to
-        # ground the first step in.
+        # immediately — cannot legally continue. STRICT MODE ONLY:
+        # Strict Mode's whole guarantee is that every step is a
+        # literal, trained transition, so a prompt containing one that
+        # never occurred can't ground that guarantee from the first
+        # step onward. Open Mode makes no such promise — its per-step
+        # candidates are already the full vocabulary, scored by IVM
+        # (ivm.py), not gated by whether a bigram was ever literally
+        # seen — so there is nothing for THIS check to protect there;
+        # requiring it anyway would reject prompts Open Mode is
+        # perfectly willing and able to continue from. Any prompt is
+        # therefore accepted in Open Mode, including one the model
+        # has genuinely never seen any part of.
         def _has_edge(a, b):
             return b in self.edges.successors(a)
 
-        # ── validate prompt bigrams (skip BOS→first_token) ──────────
-        # BOS is prepended artificially by encode() — it is not a real
-        # training token with known successors. Any real token is a valid
-        # generation starting point. Only validate pairs between real tokens.
-        for i in range(1, len(ids) - 1):
-            curr, nxt = ids[i], ids[i + 1]
-            if not _has_edge(curr, nxt):
-                return ids, [{"stage": 0,
-                              "rule": "illegal_prompt_bigram",
-                              "chosen": EOS,
-                              "detail": f"bigram ({curr}->{nxt}) not in edge matrix",
-                              "active_rels": set()}]
+        if self.mode == "strict":
+            # ── validate prompt bigrams (skip BOS→first_token) ──────
+            # BOS is prepended artificially by encode() — it is not a real
+            # training token with known successors. Any real token is a valid
+            # generation starting point. Only validate pairs between real tokens.
+            for i in range(1, len(ids) - 1):
+                curr, nxt = ids[i], ids[i + 1]
+                if not _has_edge(curr, nxt):
+                    return ids, [{"stage": 0,
+                                  "rule": "illegal_prompt_bigram",
+                                  "chosen": EOS,
+                                  "detail": f"bigram ({curr}->{nxt}) not in edge matrix",
+                                  "active_rels": set()}]
 
         # ── seed active_rels from prompt triples ──────────────────────
         active_rels = set()

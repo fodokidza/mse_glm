@@ -368,8 +368,13 @@ class MSEGraphLanguageModel:
             # Candidates for every step are the ENTIRE vocabulary
             # (self._open.vocab, set once at construction -- see
             # all_candidate_tokens() above), not gated by whether a
-            # bigram was ever literally observed. IVM's V1-V6 vote
-            # layers score the full set directly, every step.
+            # bigram was ever literally observed -- and neither is the
+            # PROMPT itself: unlike Strict Mode, engine.generate() skips
+            # its prompt-bigram legality check entirely for Open Mode
+            # (see inference.py), so any prompt is accepted here, even
+            # one containing a transition the model has genuinely never
+            # seen. IVM's nine vote layers (V1-V9) score the full
+            # candidate set directly, every step.
             ids, trace = engine.generate(
                 self.tokenizer.encode(prompt), max_tokens=max_tokens,
                 importance_votes=self.open_ctm)
@@ -405,8 +410,9 @@ class MSEGraphLanguageModel:
         V2 ("influence_vote") + V3 ("context_vote") + V4
         ("context_influence_vote") + V5 ("bigram_witness_vote") + V6
         ("adjacency_vote") + V7 ("prev_current_vote") + V8
-        ("triple_vote") -- eight independent vote layers, summed, each
-        exposed separately so all eight stay independently auditable.
+        ("triple_vote") + V9 ("whole_context_vote") -- nine independent
+        vote layers, summed, each exposed separately so all nine stay
+        independently auditable.
         "winner" and
         "tie_break_stage" report what select() actually returned and
         which stage of the cascade decided it (score /
@@ -461,6 +467,7 @@ class MSEGraphLanguageModel:
             "adjacency_vote": {dec(c): v for c, v in trace["adjacency_vote"].items()},
             "prev_current_vote": {dec(c): v for c, v in trace["prev_current_vote"].items()},
             "triple_vote": {dec(c): v for c, v in trace["triple_vote"].items()},
+            "whole_context_vote": {dec(c): v for c, v in trace["whole_context_vote"].items()},
             "scores": {dec(c): v for c, v in trace["scores"].items()},
             "winner": dec(winner) if winner is not None else None,
             "tie_break_stage": tie_break_stage,

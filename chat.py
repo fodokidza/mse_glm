@@ -10,7 +10,7 @@ of a random pick -- see inference.py's _bigram_tie_break.
 
 Open Mode's candidates are the ENTIRE vocabulary, every step -- no
 successor gating at all. Selection is CTM/IVM weighted voting over
-that full candidate set -- EIGHT independent, summed vote layers:
+that full candidate set -- NINE independent, summed vote layers:
   V1 important + V2 influence   -- both deliberately small, ride on
                                     top of V3, can only ever nudge a
                                     tie V3 left open, never override it
@@ -45,9 +45,16 @@ that full candidate set -- EIGHT independent, summed vote layers:
                                     candidate) ever literally ONE
                                     consecutive trained triple, in
                                     that exact order? Weighted a notch
-                                    ABOVE V3/V5/V6/V7 -- the single
-                                    strictest, most literal evidence
-                                    of all eight layers.
+                                    above V3/V5/V6/V7.
+  V9 whole-context vote         -- the strictest of all nine: does
+                                    EVERY non-reserved context token
+                                    (not just one, V3's question) know
+                                    the candidate? Weighted a notch
+                                    above V8 -- the single strictest,
+                                    most literal evidence of all nine
+                                    layers, since unanimity across an
+                                    arbitrary-size context is at least
+                                    as specific as one exact triple.
 then a deterministic cascade if the score itself still ties: bigram
 frequency, then global frequency, then lowest token id. See ivm.py's
 module docstring for the full formula. /scores below exposes the
@@ -69,7 +76,7 @@ Commands:
                              vocabulary, CTM/IVM weighted voting as
                              primary mechanism)
   /explain <prev> | <curr>  explain a single inference step
-  /scores <prompt>          Open Mode only: full V1-V8 score breakdown for
+  /scores <prompt>          Open Mode only: full V1-V9 score breakdown for
                              the next token, plus which tie-break stage (if
                              any) decided the winner. Always SCORES the
                              entire vocabulary -- only DISPLAYS the top N
@@ -303,13 +310,15 @@ def main():
                 v6 = info["adjacency_vote"].get(c, 0)
                 v7 = info["prev_current_vote"].get(c, 0)
                 v8 = info["triple_vote"].get(c, 0)
+                v9 = info["whole_context_vote"].get(c, 0)
                 marker = tag if tag else ("  <- winner" if c == info["winner"] else "")
                 print(f"    {c:13s} {v1:15.2f} {v2:15.2f} {v3:13.2f} {v4:15.2f} {v5:17.2f} "
-                      f"{v6:14.2f} {v7:15.2f} {v8:13.2f} {info['scores'][c]:8.2f}{marker}")
+                      f"{v6:14.2f} {v7:15.2f} {v8:13.2f} {v9:15.2f} {info['scores'][c]:8.2f}{marker}")
 
             print(f"  {'candidate':15s} {'V1 (important)':>15s} {'V2 (influence)':>15s} "
                   f"{'V3 (context)':>13s} {'V4 (ctx.infl.)':>15s} {'V5 (big.witness)':>17s} "
-                  f"{'V6 (adjacent)':>14s} {'V7 (prev+curr)':>15s} {'V8 (triple)':>13s} {'score':>8s}")
+                  f"{'V6 (adjacent)':>14s} {'V7 (prev+curr)':>15s} {'V8 (triple)':>13s} "
+                  f"{'V9 (unanimous)':>15s} {'score':>8s}")
             for c in shown:
                 _print_score_row(c)
             # The winner is never allowed to silently fall off-screen --
