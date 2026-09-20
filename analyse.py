@@ -359,6 +359,105 @@ class Analyser:
             for r in rows
         ]
 
+    # --------------------------------------------------------- Layer 2 (products.py)
+    # Unlike context_trigger_matrix() above, this DOES auto-build
+    # (model.build_layer2(), cached as model.layer2) on first use if it
+    # isn't built yet. That's a deliberate difference, not an
+    # inconsistency: model.ctm feeds generate(..., use_context_triggers=
+    # True), so building it is a real decision with downstream effects
+    # worth making explicit; model.layer2 feeds nothing but this query,
+    # so there's no behavior to accidentally opt into by building it
+    # lazily here -- it exists purely so the CLI is convenient for
+    # exploring/testing the Layer 2 idea one query at a time, per
+    # products.py's own module docstring.
+
+    def ask(self, question_word: str, anchor_word: str) -> dict:
+        """
+        Layer 2 query -- e.g. ask("who", "smiled") for "who smiled?".
+        See products.ask()'s docstring for the full contract: returns
+        None (no evidence / anchor_word never trained), a single
+        {"answer", "score", "votes"} dict, or an explicit
+        {"ambiguous": True, "candidates": [...]} dict when two or more
+        different candidates are genuinely tied for the top score --
+        never a silent pick between them. Raises ValueError for a
+        question_word that isn't implemented yet (see
+        products.py's _QUESTION_BUILDERS for what is).
+        """
+        from products import ask as _ask
+        if self.model.layer2 is None:
+            self.model.build_layer2()
+        return _ask(self.model, question_word, anchor_word)
+
+    def layer2_questions(self) -> list:
+        """Which question words (who/where/...) are currently implemented -- see products.py."""
+        from products import _QUESTION_BUILDERS
+        return sorted(_QUESTION_BUILDERS)
+
+    def why(self, question_word: str, anchor_word: str, candidate_word: str) -> dict:
+        """
+        Independent follow-up to ask(): why does (or doesn't)
+        candidate_word get a yes for question_word+anchor_word, per
+        vote layer, with the exact relationship_ids behind each yes?
+        See products.why()'s docstring.
+        """
+        from products import why as _why
+        if self.model.layer2 is None:
+            self.model.build_layer2()
+        return _why(self.model, question_word, anchor_word, candidate_word)
+
+    def noise_homes(self, word: str) -> list:
+        """Every training sentence containing this word -- see noise.find_homes()."""
+        from noise import find_homes
+        if self.model.noise_index is None:
+            self.model.build_noise_index()
+        return find_homes(self.model, word)
+
+    def noise_scores(self, anchor_word: str, home: int = None) -> dict:
+        """
+        Noise-cancellation scores for one anchor+home, broken down by
+        the three underlying stages plus their average -- see
+        noise.noise_scores_detailed()'s docstring. Raises ValueError
+        if anchor_word has multiple candidate home sentences and
+        `home` wasn't given.
+        """
+        from noise import noise_scores_detailed as _noise_scores_detailed
+        if self.model.noise_index is None:
+            self.model.build_noise_index()
+        return _noise_scores_detailed(self.model, anchor_word, home_relationship_id=home)
+
+    def focus_scores(self, anchor_word: str) -> dict:
+        """
+        Global, cross-sentence version of noise_scores() -- each
+        candidate scored once across every home the anchor appears
+        in, broken down by stage plus average. See
+        noise.focus_scores_detailed()'s docstring.
+        """
+        from noise import focus_scores_detailed as _focus_scores_detailed
+        if self.model.noise_index is None:
+            self.model.build_noise_index()
+        return _focus_scores_detailed(self.model, anchor_word)
+
+    def token_row(self, word: str) -> dict:
+        """Permanent, precomputed vocabulary row for one token, broken down by stage -- see noise.vocabulary_row_detailed()."""
+        from noise import vocabulary_row_detailed
+        if self.model.token_vocab is None:
+            self.model.build_token_vocab()
+        return vocabulary_row_detailed(self.model, word)
+
+    def combine(self, words: list) -> dict:
+        """Sum several tokens' precomputed rows into one combined score per target, broken down by stage -- see noise.combine_context_detailed()."""
+        from noise import combine_context_detailed
+        if self.model.token_vocab is None:
+            self.model.build_token_vocab()
+        return combine_context_detailed(self.model, words)
+
+    def noise_why(self, anchor_word: str, home: int, candidate_word: str) -> dict:
+        """Independent follow-up: which relationship_ids voted yes for one candidate? See noise.why()."""
+        from noise import why as _why
+        if self.model.noise_index is None:
+            self.model.build_noise_index()
+        return _why(self.model, anchor_word, home, candidate_word)
+
     # -------------------------------------------------------------- traces
     def generation_trace(self, prompt: str, max_tokens: int = 20, mode: str = "strict"):
         """
@@ -629,6 +728,78 @@ def main():
     p.add_argument("--min-support", type=int, default=CTMConfig.MIN_SUPPORT)
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
+    p = sub.add_parser("ask",
+                        help="Layer 2 query (products.py): e.g. 'ask who smiled' for "
+                             "\"who smiled?\". Reports an explicit ambiguous result, listing "
+                             "every tied candidate, rather than silently picking one when "
+                             "the anchor word alone doesn't distinguish them.")
+    p.add_argument("question_word", help="One of the implemented question types -- run "
+                                          "with no question_word to list them")
+    p.add_argument("anchor_word", nargs="?", help="The verb/event word the question anchors to")
+
+    p = sub.add_parser("why",
+                        help="Independent follow-up to 'ask': why does (or doesn't) a specific "
+                             "candidate get a yes for a question+anchor, per vote layer, with "
+                             "the exact relationship_ids ('ref') behind each yes? Works on any "
+                             "candidate, not just the winning one -- e.g. run this on a wrong "
+                             "answer to see exactly which layer was fooled and by what "
+                             "training sentence.")
+    p.add_argument("question_word")
+    p.add_argument("anchor_word")
+    p.add_argument("candidate_word")
+
+    p = sub.add_parser("noise-homes",
+                        help="noise.py: every training sentence (relationship_id) containing "
+                             "this word -- use this to pick a home_relationship_id for "
+                             "'noise-scores' when the word appears in more than one training "
+                             "sentence.")
+    p.add_argument("word")
+
+    p = sub.add_parser("noise-scores",
+                        help="Noise-cancellation scoring (noise.py): given an anchor word "
+                             "sitting in one home sentence, score every OTHER word in that "
+                             "sentence across three vote rules -- stage1 (literal sentence "
+                             "membership), stage2 (sentence-level global co-occurrence), stage3 "
+                             "(token-level global co-occurrence, deduped) -- plus their average, "
+                             "shown as four columns. A voter votes 'pay attention' only if it "
+                             "does NOT already know the word -- 'the' lands at 0 on every stage, "
+                             "with no stopword list.")
+    p.add_argument("anchor_word")
+    p.add_argument("--home", type=int, help="relationship_id to use as the home sentence -- "
+                                              "required if anchor_word appears in more than "
+                                              "one training sentence (see noise-homes)")
+
+    p = sub.add_parser("focus-scores",
+                        help="Global, cross-sentence version of noise-scores: sums each stage "
+                             "(plus average) across EVERY training sentence the anchor appears "
+                             "in, so the result is 'wherever this token shows up, focus on "
+                             "these' rather than a single sentence's table.")
+    p.add_argument("anchor_word")
+
+    p = sub.add_parser("token-row",
+                        help="Permanent, precomputed vocabulary row for one token (noise.py's "
+                             "TokenVocabularyMatrix), broken down by stage plus average -- "
+                             "'wherever this token appears, these are the tokens it has "
+                             "accumulated evidence to pay attention to'. Never re-reads any "
+                             "training sentence -- built once (auto-built on first use).")
+    p.add_argument("word")
+
+    p = sub.add_parser("combine",
+                        help="Sum several tokens' precomputed vocabulary rows into one combined "
+                             "score per target, broken down by stage plus average -- the "
+                             "inference-time step: which OTHER words does a context of these "
+                             "active tokens have the most accumulated evidence to focus on?")
+    p.add_argument("words", nargs="+")
+
+    p = sub.add_parser("noise-why",
+                        help="Independent follow-up to noise-scores/focus-scores/token-row: "
+                             "which SPECIFIC relationship_ids don't already know one candidate, "
+                             "given an anchor+home? Never computed by the bulk/fast paths -- "
+                             "only here, on demand.")
+    p.add_argument("anchor_word")
+    p.add_argument("home", type=int)
+    p.add_argument("candidate_word")
+
     p = sub.add_parser("trace", help="Step-by-step generation trace for a prompt")
     p.add_argument("prompt")
     p.add_argument("--max-tokens", type=int, default=20)
@@ -858,6 +1029,140 @@ def main():
              for row in r],
             ["trigger_token", "cluster_id", "member_token", "support"],
         ) if r else None)
+
+    elif args.command == "ask":
+        if args.anchor_word is None:
+            print("  implemented question types: " + ", ".join(analyser.layer2_questions()))
+        else:
+            try:
+                result = analyser.ask(args.question_word, args.anchor_word)
+            except ValueError as e:
+                print(f"  error: {e}")
+                return
+
+            def _print_ask(r):
+                if r is None:
+                    print(f"  no evidence for '{args.question_word} {args.anchor_word}?'")
+                elif r.get("ambiguous"):
+                    print(f"  ambiguous -- {len(r['candidates'])} tied candidate(s), refusing to guess:")
+                    _print_table(
+                        [(c["answer"], c["score"], ", ".join(f"{k}={v}" for k, v in c["votes"].items()))
+                         for c in r["candidates"]],
+                        ["candidate", "score", "votes"],
+                    )
+                else:
+                    print(f"  answer: {r['answer']}  (score {r['score']})")
+                    print(f"  votes:  " + ", ".join(f"{k}={v}" for k, v in r["votes"].items()))
+            _emit(result, args.json, _print_ask)
+
+    elif args.command == "why":
+        try:
+            result = analyser.why(args.question_word, args.anchor_word, args.candidate_word)
+        except ValueError as e:
+            print(f"  error: {e}")
+            return
+        if result is None:
+            print(f"  '{args.anchor_word}' or '{args.candidate_word}' never appeared in training")
+        else:
+            _emit(result, args.json, lambda r: _print_table(
+                [(layer, info["answer"], ", ".join(str(x) for x in info["ref"]))
+                 for layer, info in r.items()],
+                ["layer", "answer", "ref (relationship_ids)"],
+            ))
+
+    elif args.command == "noise-homes":
+        result = analyser.noise_homes(args.word)
+        if not result:
+            print(f"  '{args.word}' was never trained")
+        _emit(result, args.json, lambda r: _print_table(
+            [(row["relationship_id"], row["sentence"]) for row in r],
+            ["relationship_id", "sentence"],
+        ) if r else None)
+
+    elif args.command == "noise-scores":
+        try:
+            result = analyser.noise_scores(args.anchor_word, home=args.home)
+        except ValueError as e:
+            print(f"  error: {e}")
+            return
+        if result is None:
+            print(f"  '{args.anchor_word}' was never trained")
+            return
+
+        def _print_noise(r):
+            print(f"  home #{r['home']}: \"{r['home_sentence']}\"")
+            rows = sorted(
+                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                 for w, info in r["scores"].items()),
+                key=lambda row: -row[4],
+            )
+            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+            print("\n  (for stage 2's exact voters on one candidate, use noise-why)")
+        _emit(result, args.json, _print_noise)
+
+    elif args.command == "focus-scores":
+        result = analyser.focus_scores(args.anchor_word)
+        if result is None:
+            print(f"  '{args.anchor_word}' was never trained")
+            return
+
+        def _print_focus(r):
+            print(f"  homes: {r['homes']}")
+            rows = sorted(
+                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                 for w, info in r["scores"].items()),
+                key=lambda row: -row[4],
+            )
+            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+        _emit(result, args.json, _print_focus)
+
+    elif args.command == "token-row":
+        result = analyser.token_row(args.word)
+        if result is None:
+            print(f"  '{args.word}' was never trained")
+        elif not result:
+            print(f"  '{args.word}' was trained but never had a home sentence to learn a row from")
+
+        def _print_row(r):
+            if not r:
+                return
+            rows = sorted(
+                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                 for w, info in r.items()),
+                key=lambda row: -row[4],
+            )
+            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+        _emit(result, args.json, _print_row)
+
+    elif args.command == "combine":
+        result = analyser.combine(args.words)
+        if not result:
+            print(f"  none of {args.words} were trained / had any accumulated row")
+
+        def _print_combined(r):
+            if not r:
+                return
+            rows = sorted(
+                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                 for w, info in r.items()),
+                key=lambda row: -row[4],
+            )
+            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+        _emit(result, args.json, _print_combined)
+
+    elif args.command == "noise-why":
+        try:
+            result = analyser.noise_why(args.anchor_word, args.home, args.candidate_word)
+        except ValueError as e:
+            print(f"  error: {e}")
+            return
+        if result is None:
+            print(f"  '{args.anchor_word}' or '{args.candidate_word}' was never trained")
+            return
+        _emit(result, args.json, lambda r: (
+            print(f"  score: {r['score']}"),
+            print(f"  voters (relationship_ids): {r['voters']}"),
+        ))
 
     elif args.command == "trace":
         text, trace = analyser.generation_trace(args.prompt, max_tokens=args.max_tokens, mode=args.mode)

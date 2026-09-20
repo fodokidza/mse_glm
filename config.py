@@ -25,7 +25,20 @@ they don't.
 # imports it -- ctm.py used to keep its own separate literal
 # `RESERVED = {0, 1, 2, 3}` in sync by hand.
 PAD, UNK, BOS, EOS = 0, 1, 2, 3
-SPECIAL_TOKENS = {"<PAD>": PAD, "<UNK>": UNK, "<BOS>": BOS, "<EOS>": EOS}
+# WORD_BOUND: tokenizer.py's CharWordTokenizer only --
+# marks "a new stage-1-spelled word starts here" in the token stream,
+# immediately before a single-character word or a fallback-spelled
+# multi-character word (see tokenizer.py's module docstring).
+# Without it, two such words sitting next to each other with nothing
+# else between them (no stage-2 word, no punctuation) are
+# indistinguishable from one longer word during decode() -- there is
+# nothing else in a flat id stream to mark where the first one ends.
+# Deliberately NOT in RESERVED, same treatment as EOS: the model needs
+# to be able to select it during generation too (real graph edges into
+# and out of it), or a MODEL-GENERATED fallback-spelled word would
+# have this exact gluing problem with no way to fix it after the fact.
+WORD_BOUND = 4
+SPECIAL_TOKENS = {"<PAD>": PAD, "<UNK>": UNK, "<BOS>": BOS, "<EOS>": EOS, "<WORD_BOUND>": WORD_BOUND}
 RESERVED = frozenset({PAD, UNK, BOS})
 
 
@@ -59,7 +72,7 @@ class TokenizerConfig:
 
 
 class IVMConfig:
-    """Default weights for ivm.py's nine vote layers (V1-V9) -- see
+    """Default weights for ivm.py's ten vote layers (V1-V10) -- see
     ivm.py's module docstring for what each one means. important_weight,
     influence_weight, and context_influence_weight are deliberately
     smaller than context_weight BY DESIGN (see that docstring); if you
@@ -94,6 +107,47 @@ class IVMConfig:
                                         # already fired for every one of
                                         # those tokens (see ivm.py's
                                         # _whole_context_vote).
+    NOISE_WEIGHT = 0.0001               # V10 -- see ivm.py/noise.py.
+                                        # Magnitude-based, like V2/V4 --
+                                        # a noise-cancellation score is a
+                                        # SUM of per-home "other sentences
+                                        # that don't already know this
+                                        # candidate" counts (see noise.py),
+                                        # so its raw scale grows with
+                                        # corpus size and how many homes a
+                                        # context token has, unlike the
+                                        # bounded 0/1 layers (V3/V5/V6/V7/
+                                        # V8/V9). Kept small BY DESIGN, same
+                                        # rule as V1/V2/V4: it can only ever
+                                        # nudge a decision V3 left open,
+                                        # never override one V3 already made.
+
+
+class NoiseConfig:
+    """
+    Whether ImportanceVoteMatrix.build() (see ivm.py) should EAGERLY
+    force-build model.token_vocab -- noise.py's TokenVocabularyMatrix,
+    V10's data source, covering the ENTIRE vocabulary -- every single
+    time an IVM gets built. And an IVM gets built on every train(),
+    train_incremental(), merge, and load(), via _rebuild_open_engine()
+    (see model.py) -- whether or not V10 (or /noise, /focus, /row,
+    /combine, or their server.py/analyse.py equivalents) is ever
+    actually going to be used this session.
+
+    Building it touches every (token, home) pair in the corpus once
+    (see noise.py's TokenVocabularyMatrix.build()) -- on a real corpus
+    this was measured taking as long as the REST of training put
+    together, paid by every caller regardless of whether they wanted
+    V10 at all. OFF by default: V10 simply contributes 0 (see
+    ivm.py's _noise_vote()) until something actually asks for
+    noise.py's evidence -- model.build_token_vocab(),
+    ivm.attach_noise_layer(model), or any of the /noise-family
+    commands, all of which build it lazily, once, on first real use,
+    and cache it on the model from then on (see model.token_vocab).
+    Set True to restore the old always-on-every-build behavior.
+    """
+    EAGER_BUILD = False
+    VOTE_WEIGHT = 1
 
 
 class ScoresDisplayConfig:
@@ -164,7 +218,7 @@ class TrainCorpusConfig:
     # into the graph per train_incremental() step. 1 is the safest
     # default (smallest per-step memory footprint), not the fastest --
     # see train_corpus.py's own module docstring for the cost tradeoff.
-    DEFAULT_BATCH_SIZE = 10
+    DEFAULT_BATCH_SIZE = 1
 
 
 class ServerConfig:

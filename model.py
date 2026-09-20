@@ -8,7 +8,8 @@ Two inference modes, one set of graphs -- there is no separate
             two-stage lineage-vote pipeline (default)
   open    — InferenceEngine(E, B, R, mode="open", vocab=<all tokens>)
             candidates are the ENTIRE vocabulary every step, scored
-            by IVM's V1-V6 weighted voting (see ivm.py)
+            by IVM's V1-V10 weighted voting (see ivm.py), including
+            noise.py's noise-cancellation signal as V10
 
 Both engines are built automatically as soon as the model is trained
 or loaded -- there is no separate "build Open Mode" step anymore.
@@ -17,16 +18,16 @@ or loaded -- there is no separate "build Open Mode" step anymore.
 import json
 import os
 
-from tokenizer import BPETokenizer, split_sentences
+from tokenizer import split_sentences, CharWordTokenizer
 from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
 from inference import InferenceEngine
-from config import TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfig
+from config import TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfig, PAD, UNK, BOS
 
 
 class MSEGraphLanguageModel:
 
     def __init__(self, vocab_size=TokenizerConfig.DEFAULT_VOCAB_SIZE):
-        self.tokenizer   = BPETokenizer(vocab_size=vocab_size)
+        self.tokenizer   = CharWordTokenizer(vocab_size=vocab_size)
         self.edges       = EdgeMatrix()
         self.bridges     = BridgeMatrix()
         self.rels        = RelationshipMatrix()
@@ -35,22 +36,53 @@ class MSEGraphLanguageModel:
         self.ctm         = None   # ContextTriggerMatrix — None until built
         self.ivm         = None   # ImportanceVoteMatrix — Strict Mode legacy tie-break, opt-in
         self.open_ctm    = None   # ImportanceVoteMatrix — Open Mode PRIMARY mechanism, auto-built
+        self.noise_index = None  # NoiseCancellationIndex — see noise.py
+        self.token_vocab = None  # TokenVocabularyMatrix — permanent per-token vocab rows, see noise.py
 
     # ─── training ─────────────────────────────────────────────────────────
 
     def train(self, corpus):
-        self.tokenizer.train(corpus)
-        seqs = [self.tokenizer.encode_for_training(s)
-                for s in split_sentences(corpus)]
+        """
+        Segments each sentence exactly ONCE and reuses that same word
+        list for both vocabulary counting and encoding -- segment()
+        (tokenizer.py's punctuation-isolating regex pass) was
+        previously paid twice per sentence: once inside
+        tokenizer.train()'s own word-frequency count, and again inside
+        encode_for_training() right below it, re-segmenting the exact
+        same text. Profiling on a real corpus showed segment()'s regex
+        substitutions as the single largest remaining cost after V10's
+        eager build was fixed (see config.NoiseConfig.EAGER_BUILD) --
+        this halves that cost outright rather than tuning it.
+        """
+        from collections import Counter
+        from tokenizer import segment
+
+        sentences = split_sentences(corpus)
+        segmented = [segment(s) for s in sentences]
+        word_freq = Counter()
+        for words in segmented:
+            for w in words:
+                word_freq[w] += 1
+        self.tokenizer._train_from_word_freq(word_freq)
+        seqs = [self.tokenizer.encode_for_training_words(words) for words in segmented]
         self._build_graphs(seqs)
 
     def train_from_file(self, path):
-        self.tokenizer.train_from_file(path)
+        """
+        Delegates to train() on the file's full contents. The old
+        separate streamed-word-count pass here bought nothing in
+        practice: this method already had to read the whole file into
+        memory anyway for the encoding pass right after it, so
+        streaming just the FIRST pass never actually avoided holding
+        the full text in memory -- it just paid segment() twice on it
+        instead of once (see train()'s docstring). Genuinely streamed,
+        never-fully-materialized training across many files is still
+        available -- see train_corpus.py, which uses
+        tokenizer.stream_word_freq() directly for exactly that case.
+        """
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
-        seqs = [self.tokenizer.encode_for_training(s)
-                for s in split_sentences(text)]
-        self._build_graphs(seqs)
+        self.train(text)
 
     def train_incremental(self, corpus, extend_vocab=False, target_vocab_size=None):
         """
@@ -63,7 +95,7 @@ class MSEGraphLanguageModel:
         so every previously-built triple stays valid unchanged. Pass
         extend_vocab=True (with target_vocab_size > current vocab_size)
         to also grow the vocabulary from this new corpus first -- see
-        BPETokenizer.extend_vocab for what that does and doesn't
+        CharWordTokenizer.extend_vocab for what that does and doesn't
         guarantee.
 
         The Edge, Bridge, and Relationship matrices are then rebuilt
@@ -120,15 +152,23 @@ class MSEGraphLanguageModel:
 
         before = self.stats()
 
+        from tokenizer import segment
+        sentences = split_sentences(corpus)
+        segmented = [segment(s) for s in sentences]
+
         added_vocab = 0
         if extend_vocab:
             if not target_vocab_size:
                 raise ValueError(
                     "extend_vocab=True requires target_vocab_size > current vocab_size")
-            added_vocab = self.tokenizer.extend_vocab(corpus, target_vocab_size)
+            from collections import Counter
+            word_freq = Counter()
+            for words in segmented:
+                for w in words:
+                    word_freq[w] += 1
+            added_vocab = self.tokenizer.extend_vocab_from_word_freq(word_freq, target_vocab_size)
 
-        new_seqs = [self.tokenizer.encode_for_training(s)
-                    for s in split_sentences(corpus)]
+        new_seqs = [self.tokenizer.encode_for_training_words(words) for words in segmented]
         had_ctm = self.ctm is not None
         self._merge_graphs(new_seqs)
 
@@ -255,6 +295,8 @@ class MSEGraphLanguageModel:
         # built from the pre-merge triple/relationship structure.
         self.ctm = None
         self.ivm = None
+        self.noise_index = None
+        self.token_vocab = None
 
     def _rebuild_open_engine(self):
         """
@@ -315,6 +357,82 @@ class MSEGraphLanguageModel:
     def has_importance_votes(self):
         return self.ivm is not None
 
+    def build_noise_index(self):
+        """
+        Build and cache a NoiseCancellationIndex (see noise.py) --
+        cross-sentence gated voting, no Bridge-Matrix clustering
+        needed: for one anchor token sitting in one home sentence,
+        every OTHER training sentence that doesn't also contain the
+        anchor votes on which of the home sentence's other words are
+        worth attention (lacking a word = voting for it; already
+        having it = staying quiet). Read-only analysis, same as
+        build_context_triggers() -- doesn't change generate()'s
+        behavior. Returns the built index (also stored on
+        self.noise_index).
+        """
+        from noise import NoiseCancellationIndex
+        self.noise_index = NoiseCancellationIndex.build(self)
+        return self.noise_index
+
+    def noise_scores(self, anchor_word, home_relationship_id=None):
+        """
+        Thin wrapper -- see noise.noise_scores() for the full
+        contract (auto-builds self.noise_index on first use; requires
+        home_relationship_id if anchor_word appears in more than one
+        training sentence -- see noise.find_homes() to list them).
+        """
+        from noise import noise_scores as _noise_scores
+        return _noise_scores(self, anchor_word, home_relationship_id=home_relationship_id)
+
+    def focus_scores(self, anchor_word):
+        """
+        Global, cross-sentence version of noise_scores() -- see
+        noise.focus_scores()'s docstring. Sums the per-home
+        noise-cancellation table across EVERY training sentence
+        anchor_word appears in, so the result is a property of the
+        TOKEN ("wherever this appears, focus on these"), not of one
+        sentence.
+        """
+        from noise import focus_scores as _focus_scores
+        return _focus_scores(self, anchor_word)
+
+    def build_token_vocab(self):
+        """
+        Build and cache a TokenVocabularyMatrix (see noise.py) --
+        every token's PERMANENT (for this model's lifetime; not
+        persisted, same as ctm/ivm/noise_index) vocabulary row,
+        precomputed once by summing focus_scores() for every token
+        that has one. After this call, row()/combine() queries never
+        touch a literal training sentence again -- the sentence was
+        only ever the training mechanism. Read-only analysis; doesn't
+        change generate()'s behavior. Returns the built matrix (also
+        stored on self.token_vocab).
+        """
+        from noise import TokenVocabularyMatrix
+        self.token_vocab = TokenVocabularyMatrix.build(self)
+        return self.token_vocab
+
+    def token_row(self, word):
+        """Thin wrapper -- see noise.vocabulary_row()'s docstring."""
+        from noise import vocabulary_row
+        return vocabulary_row(self, word)
+
+    def combine_context(self, words):
+        """Thin wrapper -- see noise.combine_context()'s docstring."""
+        from noise import combine_context as _combine_context
+        return _combine_context(self, words)
+
+    def noise_why(self, anchor_word, home_relationship_id, candidate_word):
+        """
+        The independent follow-up to noise_scores()/focus_scores()/
+        token_row(): which specific relationship_ids voted yes for
+        candidate_word, given this anchor+home? See noise.why()'s
+        docstring -- never computed as part of the bulk/bulk-summing
+        paths, only on demand for one candidate at a time.
+        """
+        from noise import why as _why
+        return _why(self, anchor_word, home_relationship_id, candidate_word)
+
     # ─── generate ─────────────────────────────────────────────────────────
 
     def bigram_witness_sentences(self, prev_id, curr_id):
@@ -346,10 +464,9 @@ class MSEGraphLanguageModel:
         computed once whenever the graphs (re)build and reused from
         there. <EOS> is deliberately kept IN this set (not excluded as
         reserved) so the model can still choose to end generation on
-        IVM's own evidence (V1-V6, see ivm.py) rather than only ever
+        IVM's own evidence (V1-V10, see ivm.py) rather than only ever
         stopping via a successors gate -- Open Mode has none anymore.
         """
-        from tokenizer import PAD, UNK, BOS
         return sorted(t for t in self.tokenizer.token_to_id.values()
                       if t not in (PAD, UNK, BOS))
 
@@ -373,7 +490,7 @@ class MSEGraphLanguageModel:
             # its prompt-bigram legality check entirely for Open Mode
             # (see inference.py), so any prompt is accepted here, even
             # one containing a transition the model has genuinely never
-            # seen. IVM's nine vote layers (V1-V9) score the full
+            # seen. IVM's ten vote layers (V1-V10) score the full
             # candidate set directly, every step.
             ids, trace = engine.generate(
                 self.tokenizer.encode(prompt), max_tokens=max_tokens,
@@ -410,8 +527,9 @@ class MSEGraphLanguageModel:
         V2 ("influence_vote") + V3 ("context_vote") + V4
         ("context_influence_vote") + V5 ("bigram_witness_vote") + V6
         ("adjacency_vote") + V7 ("prev_current_vote") + V8
-        ("triple_vote") + V9 ("whole_context_vote") -- nine independent
-        vote layers, summed, each exposed separately so all nine stay
+        ("triple_vote") + V9 ("whole_context_vote") + V10
+        ("noise_vote", see noise.py) -- ten independent
+        vote layers, summed, each exposed separately so all ten stay
         independently auditable.
         "winner" and
         "tie_break_stage" report what select() actually returned and
@@ -468,6 +586,7 @@ class MSEGraphLanguageModel:
             "prev_current_vote": {dec(c): v for c, v in trace["prev_current_vote"].items()},
             "triple_vote": {dec(c): v for c, v in trace["triple_vote"].items()},
             "whole_context_vote": {dec(c): v for c, v in trace["whole_context_vote"].items()},
+            "noise_vote": {dec(c): v for c, v in trace["noise_vote"].items()},
             "scores": {dec(c): v for c, v in trace["scores"].items()},
             "winner": dec(winner) if winner is not None else None,
             "tie_break_stage": tie_break_stage,
@@ -646,7 +765,7 @@ class MSEGraphLanguageModel:
     @classmethod
     def load(cls, folder):
         m = cls()
-        m.tokenizer = BPETokenizer.load(os.path.join(folder, "vocabulary.json"))
+        m.tokenizer = CharWordTokenizer.load(os.path.join(folder, "vocabulary.json"))
         with open(os.path.join(folder, "edges.json"))         as f: m.edges   = EdgeMatrix.from_dict(json.load(f))
         with open(os.path.join(folder, "bridges.json"))       as f: m.bridges = BridgeMatrix.from_dict(json.load(f))
         with open(os.path.join(folder, "relationships.json")) as f: m.rels    = RelationshipMatrix.from_dict(json.load(f))

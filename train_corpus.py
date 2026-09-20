@@ -52,9 +52,9 @@ import sys
 import time
 from collections import Counter
 
-from tokenizer import BPETokenizer, split_sentences, stream_word_freq
+from tokenizer import split_sentences, CharWordTokenizer, stream_word_freq
 from model import MSEGraphLanguageModel
-from config import TokenizerConfig, TrainCorpusConfig
+from config import TokenizerConfig, TrainCorpusConfig, SPECIAL_TOKENS
 
 
 def discover_txt_files(folder, recursive=True):
@@ -120,10 +120,11 @@ def train_from_folder(folder, out_path, vocab_size=TokenizerConfig.DEFAULT_VOCAB
     if not quiet:
         print()
 
-    tok = BPETokenizer(vocab_size=vocab_size)
+    tok = CharWordTokenizer(vocab_size=vocab_size)
     tok._train_from_word_freq(word_freq)
     log(f"  {_green('✓')}  vocabulary: {tok.vocab_size_actual:,} tokens"
-        f"  ({len(tok.merges):,} merges)  {_dim(f'{time.time()-t0:.2f}s')}")
+        f"  ({tok.chars.vocab_size:,} characters, {tok.words.vocab_size - len(SPECIAL_TOKENS):,} pre-defined words)"
+        f"  {_dim(f'{time.time()-t0:.2f}s')}")
     log("")
 
     # ── Pass 2: graph, in batches, reusing incremental-training merge ─

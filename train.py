@@ -2,10 +2,10 @@
 train.py  —  MSE-GLM Training Pipeline with full per-step live display.
 
 Shows exactly what is being added at every training step:
-  - Edge phase:        E  the → cat   ✦ new
+  - Edge phase:        E  the → cat    new
   - Bridge phase:      B  the →[cat]→ sat   cluster:0
   - Cluster phase:     cluster 1  [bridge]  the→__→sat  {cat,dog,boy}
-  - Rel phase:         R  triple_3  sat→on→the  → rel:2   ✦ shared
+  - Rel phase:         R  triple_3  sat→on→the  → rel:2    shared
 
 Usage:
     python3 train.py --text "the cat sat on the mat." --out runs/demo
@@ -45,7 +45,7 @@ def purple(t): return _c(t, "35")
 def cyan(t):   return _c(t, "96")
 
 PHASES = [
-    ("tokenize", "Tokenizer  (BPE)    "),
+    ("tokenize", "Tokenizer (2-stage) "),
     ("edges",    "Edge Matrix (E)     "),
     ("bridges",  "Bridge Matrix (B)   "),
     ("clusters", "Cluster Assignment  "),
@@ -255,36 +255,31 @@ class Display:
 
 def train_with_display(model, corpus_text=None, corpus_file=None,
                        vocab_size=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE, display=None, out_path="runs/model"):
-    from tokenizer import BPETokenizer, split_sentences, normalize, stream_word_freq
+    from tokenizer import split_sentences, segment, stream_word_freq, CharWordTokenizer
+    from config import SPECIAL_TOKENS, WORD_BOUND
     from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
     from inference import InferenceEngine
     from array import array
 
-    tok = BPETokenizer(vocab_size=vocab_size)
+    tok = CharWordTokenizer(vocab_size=vocab_size)
     D   = display or Display(quiet=True)
 
     # ══ Phase 1: Tokenizer ════════════════════════════════════════════════════
     D.phase = "tokenize"; D.phase_label = PHASES[0][1]
-    D.phase_t0 = time.time(); D.next_phase = "Edge Matrix"; D.rate_unit = "merge"
+    D.phase_t0 = time.time(); D.next_phase = "Edge Matrix"; D.rate_unit = "word"
     D.update(step=0, total=vocab_size,
-             stats={"vocab":4,"edges":0,"bridges":0,"clusters":0,"rels":0})
+             stats={"vocab": len(SPECIAL_TOKENS), "edges": 0, "bridges": 0, "clusters": 0, "rels": 0})
 
     if corpus_file:
-        # Word counting delegates to tokenizer.py's own stream_word_freq()
-        # instead of hand-rolling a second copy of normalize()/split_sentences()
-        # here. This used to be a standalone reimplementation (a bare
-        # `[^a-z0-9\s]` regex that silently dropped every punctuation
-        # character -- quotes, commas, parens, etc. -- from the vocab while
-        # the sentence strings it built still carried that punctuation
-        # through to encode_for_training() later in this function, which
-        # DOES preserve it via the real normalize(). The two disagreeing
-        # about which characters exist meant any such character was never
-        # seeded into the vocab but still got encoded against it, always
-        # resolving to <UNK>. See test.py's
-        # test_train_py_corpus_file_matches_model_api for a regression
-        # test covering exactly this.) Re-reading the file for
-        # split_sentences() afterward mirrors model.py's train_from_file(),
-        # which takes the same two-pass approach for the same reason.
+        # Word counting delegates to tokenizer.py's own
+        # stream_word_freq() instead of hand-rolling a second copy of
+        # segment()/split_sentences() here -- same reasoning as
+        # model.py's train_from_file(): two independently-maintained
+        # copies of "which characters/words exist" is exactly how a
+        # silent <UNK>-collision drift bug happens (see this file's
+        # git history / test.py's train.py-vs-model.py regression
+        # tests). Re-reading the file for split_sentences() afterward
+        # mirrors that same two-pass approach.
         wf = Counter()
         stream_word_freq(corpus_file, wf, TokenizerConfig.STREAM_CHUNK_SIZE)
         with open(corpus_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -293,51 +288,51 @@ def train_with_display(model, corpus_text=None, corpus_file=None,
         sentences = split_sentences(corpus_text)
         wf = Counter()
         for s in sentences:
-            for w in normalize(s).split():
-                if w: wf[w] += 1
+            for w in segment(s):
+                wf[w] += 1
 
-    # char init
-    chars = set()
-    for w in wf: chars.update(w)
-    for c in sorted(chars):
-        if c not in tok.token_to_id:
-            nid = max(tok.token_to_id.values()) + 1
-            tok.token_to_id[c] = nid; tok.id_to_token[nid] = c
+    # Stage 1: characters -- delegates to CharacterVocabulary's own
+    # build() instead of hand-rolling a second copy of it here.
+    chars_before = tok.chars.vocab_size
+    tok.chars.build(wf.keys(), min_next_id=tok._next_free_id())
+    D.update(stats={"vocab": tok.chars.vocab_size})
+    D.item(dim(f"stage 1: learned {tok.chars.vocab_size - chars_before} base characters"))
 
-    D.update(stats={"vocab": len(tok.token_to_id)})
-    D.item(dim(f"initialized {len(chars)} base characters"))
+    # Stage 2: pre-define words -- delegates to TokenVocabulary's own
+    # build() (most-frequent-first, capped to vocab_size -- long tail
+    # falls back to live stage-1 spelling at encode() time, never
+    # <UNK>, see tokenizer.py's module docstring) instead of
+    # hand-rolling a second copy of that sort/assign loop here, same
+    # "don't duplicate the algorithm" reasoning the old BPE-merge
+    # delegation used to follow. Word pre-definition is a single fast
+    # pass, not an iterative merge loop -- nothing here to animate
+    # step-by-step the way BPE's merges once were, so this phase
+    # reports its result once rather than live per-word.
+    multi_char = {w: c for w, c in wf.items() if len(w) > 1}
+    requested = len(multi_char)
+    if requested > vocab_size:
+        keep = dict(sorted(multi_char.items(), key=lambda kv: (-kv[1], kv[0]))[:vocab_size])
+    else:
+        keep = multi_char
+    D.update(step=len(keep), total=max(len(keep), 1), stats={"vocab": tok.chars.vocab_size})
+    tok.words.build(keep)
+    top_preview = sorted(keep, key=lambda w: (-keep[w], w))[:5]
+    overflow = f"  ·  {requested - len(keep):,} more fall back to stage-1 spelling" if requested > len(keep) else ""
+    D.item(dim(f"stage 2: pre-defined {len(keep):,} words  ·  top: {', '.join(top_preview)}{overflow}"))
 
-    # BPE merges -- delegates to BPETokenizer's own (incremental, not
-    # full-rescan-per-merge) merge loop instead of hand-rolling a second
-    # copy of the algorithm here. This used to be a standalone reimplementation
-    # of tokenizer.py's BPE loop, kept in sync by hand -- exactly the kind of
-    # duplication that once let train.py's EdgeMatrix.count go unset for a
-    # whole release (see test.py's test_train_py_cli_path_matches_model_api).
-    # A callback drives the live display without needing its own copy of the
-    # merge algorithm, so this path gets tokenizer.py's incremental pair-count
-    # maintenance for free and can never again drift from it.
-    word_syms     = {w: list(w) for w in wf}
-    total_merges  = max(vocab_size - len(tok.token_to_id), 0)
-    merge_done    = 0
-    next_id       = max(tok.token_to_id.values()) + 1
-
-    def _on_merge(a, b, merged, cnt, vocab_len):
-        nonlocal merge_done
-        merge_done += 1
-        D.update(step=merge_done, total=total_merges, stats={"vocab": vocab_len})
-        D.item(
-            f"{amber('merge')}  {teal(repr(a))} + {teal(repr(b))}"
-            f"  →  {white(repr(merged))}"
-            f"  {dim(f'(freq {cnt}  vocab {vocab_len})')}"
-        )
-
-    tok._run_bpe_merges(wf, word_syms, next_id, vocab_size, on_merge=_on_merge)
-
-    D.phase_done(PHASES[0][1], f"{len(tok.token_to_id):,} tokens  ·  {len(tok.merges):,} merges")
+    D.phase_done(PHASES[0][1], f"{tok.vocab_size_actual:,} tokens total  ·  "
+                                f"{tok.chars.vocab_size:,} chars  ·  "
+                                f"{tok.words.vocab_size - len(SPECIAL_TOKENS):,} pre-defined words")
 
     sequences        = [tok.encode_for_training(s) for s in sentences]
-    vocab_size_actual = len(tok.token_to_id)
-    def dec(i): return tok.id_to_token.get(i, f"#{i}")
+    vocab_size_actual = tok.vocab_size_actual
+
+    def dec(i):
+        if i == WORD_BOUND:
+            return ""
+        if tok.chars.is_char_id(i):
+            return tok.chars.decode_id(i) or f"#{i}"
+        return tok.words.decode_id(i) or f"#{i}"
 
     # ══ Phase 2: Edge Matrix ══════════════════════════════════════════════════
     D.phase = "edges"; D.phase_label = PHASES[1][1]

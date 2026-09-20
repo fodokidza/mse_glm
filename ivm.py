@@ -13,48 +13,56 @@ Two entry points, two different roles:
       PRIMARY Open Mode mechanism. Called on the FULL legal candidate
       set every step, not just on ties -- this is what decides Open
       Mode generation now, replacing Stage 2's lineage tie-break
-      entirely (see inference.py). NINE INDEPENDENT vote layers,
+      entirely (see inference.py). TEN INDEPENDENT vote layers,
       summed -- not one formula where a factor multiplies another.
       An important token is ALSO a context token (I ⊆ P), so it casts
-      up to six of the nine votes: V1 and V2 because it's important,
-      PLUS its own V3, V4, V5, and V6 votes as an ordinary context
+      up to seven of the ten votes: V1 and V2 because it's important,
+      PLUS its own V3, V4, V5, V6, and V10 votes as an ordinary context
       member -- it never loses those for being important, V1/V2 are
-      additive bonuses. V7 and V8 are different from all six -- neither
+      additive bonuses. V7 and V8 are different from all these -- neither
       is "every context token votes," each is a single fixed-pair (V7)
       or fixed-triple (V8) check on `previous`/`current` specifically
       (see below). V9 is different again -- it's the only layer that
       requires EVERY context token to agree, not just one (V3) or a
-      fixed pair (V7/V8).
+      fixed pair (V7/V8). V10 (see noise.py) is a context-token sum
+      like V3/V4/V6, but the per-token contribution comes from a
+      DIFFERENT, precomputed source (TokenVocabularyMatrix) rather
+      than from this module's own _token_rels/_adjacent state.
 
   The gate (co-occurrence index, `_co_occurring` -- see build())
-      V1-V6 and V9 all reduce, ultimately, to the same underlying
+      V1-V6, V9, and V10 all reduce, ultimately, to the same underlying
       question for a given (context token t, candidate C) pair: "did t
       and C ever appear in the same training sentence at all?" A
       candidate C that no context token has EVER co-occurred with is
-      therefore guaranteed a zero vote from every one of those six
+      therefore guaranteed a zero vote from every one of those eight
       layers -- not approximately, exactly, by construction (see
-      score_candidates()'s docstring for the proof). `_co_occurring`
-      precomputes, once per model, exactly which OTHER tokens each
-      token has ever shared a training sentence with -- the same
-      reverse-index trick build_cache() already used for its sparse
-      cache, generalized to the WHOLE vocabulary (not just one
-      candidate set) and computed once so both the live scoring path
-      and build_cache() itself can reuse it instead of each
-      recomputing their own version. score_candidates()'s live path
-      uses it to skip straight to a zero score for any candidate no
-      context token has ever heard of, instead of testing it against
-      every layer in turn.
+      score_candidates()'s docstring for the proof; V10's proof is the
+      same shape as V9's, since a nonzero noise.py row entry for C
+      implies C appeared in one of that context token's home
+      sentences). `_co_occurring` precomputes, once per model, exactly
+      which OTHER tokens each token has ever shared a training
+      sentence with -- the same reverse-index trick build_cache()
+      already used for its sparse cache, generalized to the WHOLE
+      vocabulary (not just one candidate set) and computed once so
+      both the live scoring path and build_cache() itself can reuse it
+      instead of each recomputing their own version. score_candidates()'s
+      live path uses it to skip straight to a zero score for any
+      candidate no context token has ever heard of, instead of testing
+      it against every layer in turn.
 
   build_cache(candidates) / enable_cache(candidates=None) / disable_cache()
       Opt-in sparse per-token cache for V1/V2/V3/V4/V6 -- each is a sum
       over context tokens of a (t, c)-only contribution, so it's
       precomputable once and reused every step instead of recomputed
-      from scratch. V5/V7/V8 stay live always (see build_cache()'s own
-      comment for why). Stores only nonzero (t, c) entries, never a
-      dense |vocab| x |vocab| table. Off by default; NOT serialized by
-      to_dict/from_dict (fully re-derivable from state that is). See
-      score_candidates()'s "cache_used" trace field and
-      benchmark_cache.py to compare cached vs. live directly.
+      from scratch. V5/V7/V8/V9/V10 stay live always (see build_cache()'s
+      own comment for why -- V10 in particular draws from a different
+      precomputed source, noise.py's TokenVocabularyMatrix, not from
+      this cache's _token_rels/_important/_adjacent state, so it isn't
+      a candidate for folding into it). Stores only nonzero (t, c)
+      entries, never a dense |vocab| x |vocab| table. Off by default;
+      NOT serialized by to_dict/from_dict (fully re-derivable from
+      state that is). See score_candidates()'s "cache_used" trace
+      field and benchmark_cache.py to compare cached vs. live directly.
 
         V1(C) = important_weight × Σ_{t∈I} 1[knowledge(t, C) > 0]
             Important tokens (I = cluster members present in context)
@@ -219,10 +227,10 @@ Two entry points, two different roles:
                                           t ∈ P, t ≠ C, satisfies
                                           knowledge(t, C) > 0]
             "Whole context" / UNANIMOUS vote -- the odd one out among
-            the nine: every other layer either sums a per-token
-            contribution over context (V1-V6) or checks one FIXED pair
-            (V7) or triple (V8); V9 instead asks whether the WHOLE of
-            context agrees at once. V3 already asks "does at least one
+            the ten: every other layer either sums a per-token
+            contribution over context (V1-V6, V10) or checks one FIXED
+            pair (V7) or triple (V8); V9 instead asks whether the
+            WHOLE of context agrees at once. V3 already asks "does at least one
             context token know C" -- V9 asks the strictly harder
             question "do ALL of them" (excluding C itself, if C
             happens to already be a context token -- same "a token
@@ -238,7 +246,34 @@ Two entry points, two different roles:
             either. Default weight 2.5 -- see config.py's
             WHOLE_CONTEXT_WEIGHT for why it's set a notch above V8.
 
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C)
+        V10(C) = noise_weight × Σ_{t∈P} noise_row(t)[C]
+            "Noise cancellation" vote (see noise.py) -- back to a
+            per-context-token SUM, like V3/V4/V6, but the per-(t, C)
+            contribution comes from a different, PRECOMPUTED source:
+            noise.py's TokenVocabularyMatrix, not this module's own
+            _token_rels/_adjacent state. noise_row(t)[C] is "how many
+            OTHER training sentences don't already know C, summed
+            across every sentence t itself appears in" (see noise.py's
+            module docstring for the full rule) -- a token that keeps
+            showing up as noise-worthy alongside t, across many of t's
+            sentences, earns C a bigger contribution here than a token
+            t only ever saw once. This is an IDF-flavored signal,
+            distinct from every other layer: V3/V4/V6 ask "did t and C
+            ever share evidence," V10 asks "how UNUSUAL is C, relative
+            to what t's other sentences already knew, everywhere t
+            appears." A context token with no precomputed row (never
+            trained, or trained but never had an eligible home)
+            contributes nothing. Magnitude-based and potentially
+            large-scale (see config.py's NOISE_WEIGHT), so kept small
+            BY DESIGN, same rule as V1/V2/V4: it can only ever nudge a
+            decision V3 left open, never override one V3 already made.
+            Contributes nothing at all if no TokenVocabularyMatrix was
+            ever attached to this instance (see build()/
+            attach_noise_layer()) -- the same "None means zero, not an
+            error" contract this module already applies to Strict
+            Mode's optional add-ons.
+
+        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C) + V10(C)
 
       This deliberately reopens the door rule 24 shut ("unclustered
       tokens contribute 0 votes") -- V3/V4 are a considered exception,
@@ -351,7 +386,7 @@ from collections import Counter, defaultdict
 
 from ctm import RESERVED, token_to_relationships
 from importance import _trigger_for_triple
-from config import IVMConfig
+from config import IVMConfig, NoiseConfig
 
 
 def important_member_tokens(model, mode="strict"):
@@ -576,6 +611,13 @@ class ImportanceVoteMatrix:
         self._prev_current_weight = IVMConfig.PREV_CURRENT_WEIGHT  # V7's flat weight -- see score_candidates()
         self._triple_weight = IVMConfig.TRIPLE_WEIGHT  # V8's flat weight -- see score_candidates()
         self._whole_context_weight = IVMConfig.WHOLE_CONTEXT_WEIGHT  # V9's flat weight -- see score_candidates()
+        self._noise_weight = IVMConfig.NOISE_WEIGHT  # V10's per-token weight -- see score_candidates()
+        # V10's data source (see noise.py's TokenVocabularyMatrix). None
+        # until build() attaches it (or attach_noise_layer() is called
+        # explicitly, e.g. after from_dict()) -- a missing token_vocab
+        # means V10 contributes nothing, not an error, same contract as
+        # Strict Mode's optional context_triggers/importance_votes args.
+        self._token_vocab = None
         self._bigram_freq = {}  # (token, candidate) -> count, from bigram_frequencies()
         self._bigram_rels = {}  # (token, candidate) -> set(rel_id), from bigram_relationships()
         self._adjacent = set()  # {(from_token, to_token), ...}, from adjacent_pairs() -- directed
@@ -608,7 +650,8 @@ class ImportanceVoteMatrix:
               adjacency_weight=IVMConfig.ADJACENCY_WEIGHT,
               prev_current_weight=IVMConfig.PREV_CURRENT_WEIGHT,
               triple_weight=IVMConfig.TRIPLE_WEIGHT,
-              whole_context_weight=IVMConfig.WHOLE_CONTEXT_WEIGHT, use_cache=False):
+              whole_context_weight=IVMConfig.WHOLE_CONTEXT_WEIGHT,
+              noise_weight=IVMConfig.NOISE_WEIGHT, use_cache=False):
         ivm = cls()
         ivm._token_rels = token_to_relationships(model)
         ivm._important = important_member_tokens(model, mode=mode)
@@ -621,6 +664,7 @@ class ImportanceVoteMatrix:
         ivm._prev_current_weight = prev_current_weight
         ivm._triple_weight = triple_weight
         ivm._whole_context_weight = whole_context_weight
+        ivm._noise_weight = noise_weight
         ivm._bigram_freq = bigram_frequencies(model, mode=mode)
         ivm._bigram_rels = bigram_relationships(model)
         ivm._adjacent = adjacent_pairs(model)
@@ -630,6 +674,22 @@ class ImportanceVoteMatrix:
         # reused by build_cache() below AND by score_candidates()'s
         # live path, instead of each recomputing its own version.
         ivm._co_occurring = co_occurrence_index(ivm._token_rels, adjacent=ivm._adjacent)
+        # V10's data source (see noise.py) -- OPT-IN by default (see
+        # config.NoiseConfig.EAGER_BUILD's docstring for why): reuse
+        # model.token_vocab if it's already been built by something
+        # that actually wanted it, but do NOT force a fresh build here
+        # on every single call -- a full TokenVocabularyMatrix build
+        # touches every (token, home) pair in the corpus once, paid on
+        # every train()/train_incremental()/merge/load() regardless of
+        # whether V10 was ever going to be used this session. Local
+        # import: noise.py imports token_to_relationships from this
+        # module at its own top level, so importing it back up there
+        # would be circular -- same reason model.py imports ctm/ivm/
+        # noise lazily inside methods instead of at module scope.
+        if NoiseConfig.EAGER_BUILD:
+            ivm.attach_noise_layer(model)
+        else:
+            ivm._token_vocab = model.token_vocab
         if use_cache:
             # Open Mode always scores the FULL vocabulary as candidates
             # (see model.all_candidate_tokens()/model.py's
@@ -637,6 +697,23 @@ class ImportanceVoteMatrix:
             # cache is actually built and validated against.
             ivm.enable_cache(model.all_candidate_tokens())
         return ivm
+
+    def attach_noise_layer(self, model):
+        """
+        (Re)attach V10's data source -- noise.py's TokenVocabularyMatrix
+        -- from `model`. build() already calls this automatically, so
+        you only need it yourself after from_dict() (which can't
+        restore _token_vocab on its own -- see to_dict()'s docstring)
+        or if `model`'s graphs changed and you want V10's evidence
+        refreshed without a full rebuild. Reuses model.token_vocab if
+        already built, else builds it fresh (and caches it back onto
+        `model`, same as model.build_token_vocab() would). Returns the
+        attached TokenVocabularyMatrix.
+        """
+        if model.token_vocab is None:
+            model.build_token_vocab()
+        self._token_vocab = model.token_vocab
+        return self._token_vocab
 
     # ── sparse per-token score cache (V1/V2/V3/V4/V6 only) ─────────────────
     #
@@ -651,18 +728,24 @@ class ImportanceVoteMatrix:
     # _adjacency_vote -- plus _knows_rels' own O(|important present| x
     # |candidates|) loop) on every single call.
     #
-    # V5, V7, V8, and V9 are deliberately NOT part of this cache: V5's
-    # vote for (t, c) also depends on `current` (a different `current`
-    # means a different witness set for the same t/c); V7/V8 aren't a
-    # per-token contribution at all -- each is a single fixed-pair
-    # (V7) or fixed-triple (V8) check on (previous, current), not a
-    # sum over context tokens; V9 is a conjunction ACROSS every
-    # context token for one candidate, not a sum of independent
-    # per-(t, c) terms, so it can't be decomposed into per-token rows
-    # the way V1-V4/V6 can either. All four are still fast, though --
-    # V5/V7/V8 are cheap sparse set/tuple lookups (over _bigram_rels /
-    # _token_rels / _triples), and V9 reuses this same instance's
-    # _co_occurring gate (see score_candidates()) -- so they're
+    # V5, V7, V8, V9, and V10 are deliberately NOT part of this cache:
+    # V5's vote for (t, c) also depends on `current` (a different
+    # `current` means a different witness set for the same t/c); V7/V8
+    # aren't a per-token contribution at all -- each is a single
+    # fixed-pair (V7) or fixed-triple (V8) check on (previous,
+    # current), not a sum over context tokens; V9 is a conjunction
+    # ACROSS every context token for one candidate, not a sum of
+    # independent per-(t, c) terms, so it can't be decomposed into
+    # per-token rows the way V1-V4/V6 can either; V10 IS a per-(t, c)
+    # sum like V1-V4/V6, but its values live in a wholly separate
+    # precomputed structure (noise.py's TokenVocabularyMatrix, built
+    # and owned outside this cache), so folding it in here would mean
+    # this cache duplicating state that structure already IS the cache
+    # for. All five are still fast, though -- V5/V7/V8 are cheap
+    # sparse set/tuple lookups (over _bigram_rels / _token_rels /
+    # _triples), V9 reuses this same instance's _co_occurring gate
+    # (see score_candidates()), and V10 reads directly from
+    # TokenVocabularyMatrix's own precomputed rows -- so all five are
     # computed live whether or not the V1-V4/V6 cache is enabled.
     #
     # Only ONE raw quantity actually varies per (t, c) pair here:
@@ -1048,6 +1131,39 @@ class ImportanceVoteMatrix:
                 votes[c] += 1.0
         return dict(votes)
 
+    def _noise_vote(self, context_tokens, candidates):
+        """
+        V10: noise-cancellation vote (see noise.py). For each
+        candidate C, sum every context token's PRECOMPUTED
+        TokenVocabularyMatrix row value for C -- exactly
+        noise.combine_context()'s bulk-accumulation step, exposed here
+        as a tenth independent vote layer instead of a standalone
+        analysis query. A context token with no row at all (never
+        trained, or trained but never had an eligible home -- see
+        TokenVocabularyMatrix.row()) contributes nothing for any
+        candidate, same "missing means zero" rule V1-V6 already
+        follow for a token _token_rels has nothing on.
+
+        Returns {} immediately if no TokenVocabularyMatrix has been
+        attached to this instance yet (see build()/
+        attach_noise_layer()) -- V10 contributing nothing is not an
+        error, same contract every other opt-in signal in this module
+        follows.
+
+        `candidates` is expected to already be gate-restricted (see
+        score_candidates()) -- filtering combine()'s full output down
+        to just `candidates` here, rather than only summing the
+        candidates actually wanted, is what keeps this O(context x
+        rows-per-token) instead of O(context x |candidates|) for a
+        large candidate set like Open Mode's full vocabulary.
+        """
+        if self._token_vocab is None:
+            return {}
+        candidates = set(candidates)
+        combined = self._token_vocab.combine(
+            t for t in (context_tokens or []) if t not in RESERVED)
+        return {c: v for c, v in combined.items() if c in candidates}
+
     def votes(self, candidates, context_tokens):
         """
         Full working, exposed for inspection/tracing (not just the
@@ -1110,13 +1226,13 @@ class ImportanceVoteMatrix:
     def score_candidates(self, candidates, context_tokens, current=None, previous=None):
         """
         Open Mode's primary scoring pass -- evaluates EVERY candidate
-        given, not just a pre-existing tie. NINE independent vote
+        given, not just a pre-existing tie. TEN independent vote
         layers, summed (see the module docstring for the full
         rationale). An important token is ALSO a context token
         (I ⊆ P), so it votes in every context-token layer it
-        qualifies for -- V3, V4, and V6 as a plain context member,
+        qualifies for -- V3, V4, V6, and V10 as a plain context member,
         PLUS V1 and V2 because it's important. Non-important context
-        tokens cast V3/V4/V6. V7 and V8 are separate from all of
+        tokens cast V3/V4/V6/V10. V7 and V8 are separate from all of
         that -- neither iterates over context at all, only `previous`
         and `current` specifically (see below and _prev_current_vote).
         V9 is separate again -- it's the only layer that requires
@@ -1250,11 +1366,11 @@ class ImportanceVoteMatrix:
         evidence, and by default can each outweigh V3 on its own
         (weight >= 1.0, same as or greater than V3).
 
-        THE GATE: V1, V2, V3, V4, V6, and V9 all reduce to sums or
+        THE GATE: V1, V2, V3, V4, V6, V9, and V10 all reduce to sums or
         conjunctions of "did t and C ever co-occur" (self._co_occurring
         -- see co_occurrence_index()) -- so if NO context token has
         EVER co-occurred with a given candidate C, every one of those
-        six layers is guaranteed 0 for C, by construction, not by
+        seven layers is guaranteed 0 for C, by construction, not by
         approximation:
           - V1/V2 only consider important tokens, a SUBSET of context.
           - V3/V4 sum over exactly the tokens the gate checks.
@@ -1264,6 +1380,12 @@ class ImportanceVoteMatrix:
             gate-eligible.
           - V9 requires ALL context tokens to co-occur with C, which
             trivially implies at least one does.
+          - V10 draws from noise.py's TokenVocabularyMatrix, a
+            DIFFERENT precomputed source than _co_occurring, but a
+            nonzero row entry for C still implies C appeared in one of
+            that context token's home sentences -- i.e. co-occurred --
+            so it's gate-eligible by the same argument, just proven
+            against different underlying state.
         V5 sums over context tokens too (checking a stronger,
         bigram-specific condition), so the same argument applies to it
         UNCONDITIONALLY. V7 and V8 check `previous`/`current` directly
@@ -1286,8 +1408,9 @@ class ImportanceVoteMatrix:
         "context_influence_vote": {C: V4}, "bigram_witness_vote":
         {C: V5}, "adjacency_vote": {C: V6}, "prev_current_vote":
         {C: V7}, "triple_vote": {C: V8}, "whole_context_vote": {C: V9},
-        "scores": {C: V1+V2+...+V9}, "cache_used": bool}.
-        "scores" is the one that actually drives select(); the nine
+        "noise_vote": {C: V10},
+        "scores": {C: V1+V2+...+V9+V10}, "cache_used": bool}.
+        "scores" is the one that actually drives select(); the ten
         components are exposed separately (already weighted, so they
         sum directly to "scores") so each stays independently
         auditable. Every candidate in `candidates` gets a "scores"
@@ -1308,8 +1431,10 @@ class ImportanceVoteMatrix:
         the candidates it's KNOWN to co-occur with (self._co_occurring
         row) are ever visited, so the loop's real cost tracks actual
         co-occurrence in the corpus, not vocabulary size. V5, V7, V8,
-        and V9 are always computed live either way, each restricted to
-        the gate-derived candidate set per the paragraph above.
+        V9, and V10 are always computed live either way, each
+        restricted to the gate-derived candidate set per the paragraph
+        above (V10 additionally has its own separate, always-live
+        precomputed source -- see _noise_vote()).
         "cache_used" in the returned trace reports which path actually
         ran, so cached vs. live runs stay easy to compare/verify
         against each other. A candidate-set mismatch (e.g. Strict Mode
@@ -1502,12 +1627,24 @@ class ImportanceVoteMatrix:
         whole_context_vote = {c: self._whole_context_weight * v
                                for c, v in raw_whole_context_vote.items()}
 
+        # V10 -- noise-cancellation vote (see noise.py/_noise_vote()):
+        # every context token sums its precomputed TokenVocabularyMatrix
+        # row for C. Gated the same way as V5/V9 -- a nonzero row entry
+        # for C implies C appeared in one of that context token's home
+        # sentences, i.e. co-occurred with it, so restricting to
+        # gate_candidates never drops a candidate that could have
+        # scored nonzero here anyway. Contributes nothing (not an
+        # error) if no TokenVocabularyMatrix was ever attached -- see
+        # build()/attach_noise_layer().
+        raw_noise_vote = self._noise_vote(context_tokens, gate_candidates)
+        noise_vote = {c: self._noise_weight * v for c, v in raw_noise_vote.items()}
+
         final_scores = {
             c: important_vote.get(c, 0) + influence_vote.get(c, 0)
                + context_vote.get(c, 0) + context_influence_vote.get(c, 0)
                + bigram_witness_vote.get(c, 0) + adjacency_vote.get(c, 0)
                + prev_current_vote.get(c, 0) + triple_vote.get(c, 0)
-               + whole_context_vote.get(c, 0)
+               + whole_context_vote.get(c, 0) + noise_vote.get(c, 0)
             for c in candidates
         }
 
@@ -1522,6 +1659,7 @@ class ImportanceVoteMatrix:
                 "prev_current_vote": prev_current_vote,
                 "triple_vote": triple_vote,
                 "whole_context_vote": whole_context_vote,
+                "noise_vote": noise_vote,
                 "scores": final_scores,
                 "cache_used": use_cache}
 
@@ -1536,7 +1674,7 @@ class ImportanceVoteMatrix:
     def select(self, candidates, context_tokens, current=None, previous=None):
         """
         Deterministic winner among `candidates` by the combined score
-        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9, see
+        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10, see
         score_candidates), with a three-stage deterministic tie-break
         cascade when the combined score itself doesn't discriminate:
 
@@ -1594,6 +1732,7 @@ class ImportanceVoteMatrix:
             "prev_current_weight": self._prev_current_weight,
             "triple_weight": self._triple_weight,
             "whole_context_weight": self._whole_context_weight,
+            "noise_weight": self._noise_weight,
             "bigram_freq": {f"{t}:{c}": n for (t, c), n in self._bigram_freq.items()},
             "bigram_rels": {f"{t}:{c}": sorted(r) for (t, c), r in self._bigram_rels.items()},
             "adjacent": [list(pair) for pair in self._adjacent],
@@ -1614,6 +1753,15 @@ class ImportanceVoteMatrix:
         ivm._prev_current_weight = d.get("prev_current_weight", IVMConfig.PREV_CURRENT_WEIGHT)
         ivm._triple_weight = d.get("triple_weight", IVMConfig.TRIPLE_WEIGHT)
         ivm._whole_context_weight = d.get("whole_context_weight", IVMConfig.WHOLE_CONTEXT_WEIGHT)
+        ivm._noise_weight = d.get("noise_weight", IVMConfig.NOISE_WEIGHT)
+        # V10's data source (noise.py's TokenVocabularyMatrix) is NOT
+        # serialized here -- like _co_occurring and the sparse V1-V6
+        # cache, it's fully re-derivable, but only from the original
+        # model's training sentences, which this dict doesn't carry.
+        # V10 contributes nothing until attach_noise_layer(model) is
+        # called explicitly -- same "rebuild after load if you want
+        # it" treatment noise.py's own noise_index/token_vocab get.
+        ivm._token_vocab = None
         ivm._bigram_freq = {}
         for key, n in d.get("bigram_freq", {}).items():
             t, c = key.split(":")
