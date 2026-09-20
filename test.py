@@ -294,12 +294,17 @@ the pig sat on the rug.
     m_imp = MSEGraphLanguageModel(vocab_size=200)
     m_imp.train(CORPUS_IMP)
     tok_imp = m_imp.tokenizer
+    from config import WORD_BOUND
     def dec_imp(t): return tok_imp.id_to_token.get(t, t) if t in (0, 1, 2, 3) else tok_imp.decode([t])
 
     # Sequence reconstruction must exactly match the original sentence.
+    # <WORD_BOUND> markers (tokenizer.py's CharWordTokenizer -- precede a
+    # single-character or fallback-spelled word, see its module
+    # docstring) render to nothing on their own; skip them here rather
+    # than have dec_imp() mis-render one as if it were content.
     seq0 = sequence_for_relationship(m_imp, 0)
     check("sequence_for_relationship reconstructs rel_id=0 exactly",
-          [dec_imp(t) for t in seq0] ==
+          [dec_imp(t) for t in seq0 if t != WORD_BOUND] ==
           ["<BOS>", "the", "cat", "sat", "on", "the", "mat", ".", "<EOS>"], seq0)
 
     # A rel_id beyond range must return [] rather than raise.
@@ -785,7 +790,7 @@ a piglet is like a pig.
                                 "context_vote", "context_influence_vote",
                                 "bigram_witness_vote", "adjacency_vote",
                                 "prev_current_vote", "triple_vote",
-                                "whole_context_vote",
+                                "whole_context_vote", "noise_vote",
                                 "scores", "winner", "tie_break_stage",
                                 "cache_used"}, info)
     check("open_mode_candidate_scores always covers the entire vocabulary now",
@@ -796,13 +801,13 @@ a piglet is like a pig.
     # evidence alone.
     check("chair is still the top-scoring candidate in open mode",
           max(info["scores"], key=info["scores"].get) == "chair", info["scores"])
-    check("scores equal the sum of the nine independent vote layers",
+    check("scores equal the sum of the ten independent vote layers",
           all(abs(info["scores"][c] -
                   (info["important_vote"].get(c, 0) + info["influence_vote"].get(c, 0)
                    + info["context_vote"].get(c, 0) + info["context_influence_vote"].get(c, 0)
                    + info["bigram_witness_vote"].get(c, 0) + info["adjacency_vote"].get(c, 0)
                    + info["prev_current_vote"].get(c, 0) + info["triple_vote"].get(c, 0)
-                   + info["whole_context_vote"].get(c, 0))) < 1e-9
+                   + info["whole_context_vote"].get(c, 0) + info["noise_vote"].get(c, 0))) < 1e-9
               for c in info["candidates"]),
           info)
 
@@ -1355,12 +1360,14 @@ def test_bigram_witness_vote_and_vocab_candidates():
           trace_without.get("adjacency_vote"))
     check("bigram_witness_vote key present and non-empty when current is given",
           any(v > 0 for v in trace_with["bigram_witness_vote"].values()), trace_with)
-    check("omitting current reproduces the old 4-layer score exactly",
+    check("omitting current reproduces the old 4-layer score plus V10 "
+          "(noise-cancellation doesn't depend on current either)",
           all(abs(trace_without["scores"][c] -
                   (trace_without["important_vote"].get(c, 0)
                    + trace_without["influence_vote"].get(c, 0)
                    + trace_without["context_vote"].get(c, 0)
-                   + trace_without["context_influence_vote"].get(c, 0))) < 1e-9
+                   + trace_without["context_influence_vote"].get(c, 0)
+                   + trace_without["noise_vote"].get(c, 0))) < 1e-9
               for c in [mat, carpet, chair, road]),
           trace_without)
     check("supplying current can only raise or hold a candidate's score, never lower it",
@@ -1445,7 +1452,8 @@ def test_bigram_witness_vote_and_vocab_candidates():
               (trace_v6["important_vote"].get(sat, 0) + trace_v6["influence_vote"].get(sat, 0)
                + trace_v6["context_vote"].get(sat, 0) + trace_v6["context_influence_vote"].get(sat, 0)
                + trace_v6["bigram_witness_vote"].get(sat, 0) + trace_v6["adjacency_vote"].get(sat, 0)
-               + trace_v6["whole_context_vote"].get(sat, 0))) < 1e-9,
+               + trace_v6["whole_context_vote"].get(sat, 0)
+               + trace_v6["noise_vote"].get(sat, 0))) < 1e-9,
           trace_v6["scores"])
 
     # to_dict/from_dict must round-trip V6's index and weight too
@@ -1613,7 +1621,9 @@ def test_prev_current_co_occurrence_vote():
               (trace_v7["important_vote"].get(mat, 0) + trace_v7["influence_vote"].get(mat, 0)
                + trace_v7["context_vote"].get(mat, 0) + trace_v7["context_influence_vote"].get(mat, 0)
                + trace_v7["bigram_witness_vote"].get(mat, 0) + trace_v7["adjacency_vote"].get(mat, 0)
-               + trace_v7["prev_current_vote"].get(mat, 0))) < 1e-9,
+               + trace_v7["prev_current_vote"].get(mat, 0)
+               + trace_v7["whole_context_vote"].get(mat, 0)
+               + trace_v7["noise_vote"].get(mat, 0))) < 1e-9,
           trace_v7["scores"])
 
     trace_no_prev = ivm.score_candidates([mat, carpet, chair, road], [cat, dog], current=on)
@@ -1776,7 +1786,9 @@ def test_triple_witness_vote():
               (trace_v8["important_vote"].get(mat, 0) + trace_v8["influence_vote"].get(mat, 0)
                + trace_v8["context_vote"].get(mat, 0) + trace_v8["context_influence_vote"].get(mat, 0)
                + trace_v8["bigram_witness_vote"].get(mat, 0) + trace_v8["adjacency_vote"].get(mat, 0)
-               + trace_v8["prev_current_vote"].get(mat, 0) + trace_v8["triple_vote"].get(mat, 0))) < 1e-9,
+               + trace_v8["prev_current_vote"].get(mat, 0) + trace_v8["triple_vote"].get(mat, 0)
+               + trace_v8["whole_context_vote"].get(mat, 0)
+               + trace_v8["noise_vote"].get(mat, 0))) < 1e-9,
           trace_v8["scores"])
 
     trace_no_prev8 = ivm.score_candidates([mat, carpet, chair, road], [cat, dog], current=the)
@@ -2132,8 +2144,8 @@ def test_cluster_axis_indexed_lookup():
     # used directly (nothing has queried cluster_axis() yet) -- the full
     # model pipeline above always triggers it internally via open_ctm.
     from graph import BridgeMatrix
-    from tokenizer import BPETokenizer
-    tok = BPETokenizer(vocab_size=400)
+    from tokenizer import CharWordTokenizer
+    tok = CharWordTokenizer(vocab_size=400)
     tok.train(CORPUS)
     from tokenizer import split_sentences
     seqs = [tok.encode_for_training(s) for s in split_sentences(CORPUS)]
