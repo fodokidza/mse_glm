@@ -286,6 +286,14 @@ class MSEGraphLanguageModel:
         rm.build(old_sequences + new_seqs, bm)
 
         self.edges, self.bridges, self.rels = em, bm, rm
+        # noise.py's index/vocabulary matrix feed V10 (see
+        # _ensure_noise_layer()), so they must be dropped BEFORE the open
+        # engine is rebuilt below -- ImportanceVoteMatrix.build() copies
+        # whatever model.token_vocab currently is, and a pre-merge one
+        # (with its cached per-token rows) would otherwise keep scoring
+        # V10 from the old graphs.
+        self.noise_index = None
+        self.token_vocab = None
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
         self._rebuild_open_engine()
 
@@ -295,8 +303,29 @@ class MSEGraphLanguageModel:
         # built from the pre-merge triple/relationship structure.
         self.ctm = None
         self.ivm = None
-        self.noise_index = None
-        self.token_vocab = None
+
+    def _ensure_noise_layer(self):
+        """
+        Make sure Open Mode's ImportanceVoteMatrix has V10's data source
+        (noise.py's TokenVocabularyMatrix, whose per-token rows hold the
+        three-stage AVERAGE noise-cancellation scores) attached -- called
+        at the top of every Open Mode inference entry point below
+        (generate(), explain_step(), open_mode_candidate_scores()).
+
+        Lazy on purpose (see config.NoiseConfig.EAGER_BUILD): nothing is
+        built at train()/train_incremental()/load() time, so a model that
+        never runs Open Mode inference never pays for it. The first Open
+        Mode call builds model.token_vocab (instant -- its rows are
+        computed per token on first use and cached) and hands it to
+        open_ctm; every later call is a no-op identity check. Also
+        re-attaches if open_ctm is holding a different matrix than the
+        model currently has, so V10 can't keep scoring from a stale one.
+        """
+        ivm = self.open_ctm
+        if ivm is None:
+            return
+        if ivm._token_vocab is None or ivm._token_vocab is not self.token_vocab:
+            ivm.attach_noise_layer(self)
 
     def _rebuild_open_engine(self):
         """
@@ -318,6 +347,10 @@ class MSEGraphLanguageModel:
         self.edges.build(seqs, vsz)
         self.bridges.build(seqs, vsz)
         self.rels.build(seqs, self.bridges)
+        # Same reason as _merge_graphs(): V10's data source is derived
+        # from the graphs just rebuilt, so any earlier one is stale.
+        self.noise_index = None
+        self.token_vocab = None
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
         self._rebuild_open_engine()
 
@@ -357,7 +390,7 @@ class MSEGraphLanguageModel:
     def has_importance_votes(self):
         return self.ivm is not None
 
-    def build_noise_index(self):
+    def build_noise_index(self, token_rels=None):
         """
         Build and cache a NoiseCancellationIndex (see noise.py) --
         cross-sentence gated voting, no Bridge-Matrix clustering
@@ -367,11 +400,15 @@ class MSEGraphLanguageModel:
         worth attention (lacking a word = voting for it; already
         having it = staying quiet). Read-only analysis, same as
         build_context_triggers() -- doesn't change generate()'s
-        behavior. Returns the built index (also stored on
-        self.noise_index).
+        behavior by itself (V10's data source is the token_vocab built
+        on top of it -- see build_token_vocab()). Returns the built
+        index (also stored on self.noise_index). `token_rels` is an
+        optional precomputed token -> {relationship_id} map (what
+        ivm.token_to_relationships() returns) to reuse instead of
+        recomputing it.
         """
         from noise import NoiseCancellationIndex
-        self.noise_index = NoiseCancellationIndex.build(self)
+        self.noise_index = NoiseCancellationIndex.build(self, token_rels=token_rels)
         return self.noise_index
 
     def noise_scores(self, anchor_word, home_relationship_id=None):
@@ -404,9 +441,13 @@ class MSEGraphLanguageModel:
         precomputed once by summing focus_scores() for every token
         that has one. After this call, row()/combine() queries never
         touch a literal training sentence again -- the sentence was
-        only ever the training mechanism. Read-only analysis; doesn't
-        change generate()'s behavior. Returns the built matrix (also
-        stored on self.token_vocab).
+        only ever the training mechanism. This matrix is also Open
+        Mode's V10 data source: each row value is the three-stage
+        AVERAGE score, and generate(mode="open") sums the context
+        tokens' rows into V10 (see ivm.py's _noise_vote()). You never
+        need to call this for that -- _ensure_noise_layer() does it on
+        first Open Mode use. Returns the built matrix (also stored on
+        self.token_vocab).
         """
         from noise import TokenVocabularyMatrix
         self.token_vocab = TokenVocabularyMatrix.build(self)
@@ -474,6 +515,7 @@ class MSEGraphLanguageModel:
                  use_context_triggers=False, use_importance_votes=False):
         engine = self._engine(mode)
         if mode == "open":
+            self._ensure_noise_layer()   # V10's data source -- see above
             # Open Mode's CTM/IVM weighted voting is the PRIMARY
             # candidate-selection mechanism -- always wired in, auto-
             # built alongside self._open as soon as the model is
@@ -510,6 +552,7 @@ class MSEGraphLanguageModel:
         prev     = prev_ids[-1] if prev_ids else None
         curr     = curr_ids[-1]
         if mode == "open":
+            self._ensure_noise_layer()
             token, trace = engine.step(prev, curr, importance_votes=self.open_ctm)
         else:
             token, trace = engine.step(prev, curr)
@@ -550,6 +593,7 @@ class MSEGraphLanguageModel:
         """
         if self.open_ctm is None or self._open is None:
             return None
+        self._ensure_noise_layer()
         ids = self.tokenizer.encode(prompt)
         current = ids[-1]
         previous = ids[-2] if len(ids) >= 2 else None

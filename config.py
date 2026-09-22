@@ -79,9 +79,9 @@ class IVMConfig:
     retune these, that ratio is a property you need to preserve
     yourself, not something enforced automatically."""
     IMPORTANT_WEIGHT = 0.4            # V1
-    INFLUENCE_WEIGHT = 0.0003           # V2
+    INFLUENCE_WEIGHT = 0.0           # V2
     CONTEXT_WEIGHT = 1.0              # V3
-    CONTEXT_INFLUENCE_WEIGHT = 0.0003   # V4
+    CONTEXT_INFLUENCE_WEIGHT = 0.0   # V4
     BIGRAM_WITNESS_WEIGHT = 0.7       # V5
     ADJACENCY_WEIGHT = 0.6            # V6
     PREV_CURRENT_WEIGHT = 1.7         # V7
@@ -138,13 +138,18 @@ class NoiseConfig:
     (see noise.py's TokenVocabularyMatrix.build()) -- on a real corpus
     this was measured taking as long as the REST of training put
     together, paid by every caller regardless of whether they wanted
-    V10 at all. OFF by default: V10 simply contributes 0 (see
-    ivm.py's _noise_vote()) until something actually asks for
-    noise.py's evidence -- model.build_token_vocab(),
-    ivm.attach_noise_layer(model), or any of the /noise-family
-    commands, all of which build it lazily, once, on first real use,
-    and cache it on the model from then on (see model.token_vocab).
-    Set True to restore the old always-on-every-build behavior.
+    V10 at all. OFF by default: nothing is built at train/merge/load
+    time. Instead model.py's _ensure_noise_layer() attaches V10's
+    data source lazily, once, at the top of the first Open Mode
+    inference call (generate(mode="open"), explain_step(),
+    open_mode_candidate_scores() -- and therefore chat.py, server.py
+    and analyse.py's open-scores), caching it on the model from then
+    on (see model.token_vocab); a Strict-Mode-only session never
+    pays for it. (A bare ImportanceVoteMatrix driven directly, without
+    going through the model, still contributes 0 for V10 until
+    ivm.attach_noise_layer(model) is called -- see ivm.py's
+    _noise_vote().) Set True to instead attach it during every
+    IVM build, as before.
     """
     EAGER_BUILD = False
     VOTE_WEIGHT = 1
@@ -218,7 +223,7 @@ class TrainCorpusConfig:
     # into the graph per train_incremental() step. 1 is the safest
     # default (smallest per-step memory footprint), not the fastest --
     # see train_corpus.py's own module docstring for the cost tradeoff.
-    DEFAULT_BATCH_SIZE = 1
+    DEFAULT_BATCH_SIZE = 10
 
 
 class ServerConfig:

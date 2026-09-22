@@ -2181,6 +2181,197 @@ def test_cluster_axis_indexed_lookup():
           indexed_ids == post_merge_ids, (indexed_ids, post_merge_ids))
 
 
+def test_noise_vote_wired_into_inference():
+    """
+    V10 -- noise.py's three-stage AVERAGE noise-cancellation score as
+    Open Mode's tenth IVM vote layer, wired into inference by
+    model.py's _ensure_noise_layer(). The layer itself (ivm.py's
+    _noise_vote()) predates the wiring; what this section proves is
+    that it is actually LIVE when a model generates -- it used to
+    contribute 0 to every real generate()/open_mode_candidate_scores()
+    call, because nothing ever attached its data source -- and that the
+    data source can't go stale across a merge, a retrain, or a reload.
+    """
+    section("V10: noise-cancellation average wired into Open Mode inference")
+
+    from noise import combine_context
+    from config import IVMConfig
+
+    m = MSEGraphLanguageModel(vocab_size=300)
+    m.train(CORPUS)
+    check("nothing noise-related is built at train time (lazy by default)",
+          m.token_vocab is None and m.open_ctm._token_vocab is None,
+          (m.token_vocab, m.open_ctm._token_vocab))
+
+    m.generate("the cat", max_tokens=6, mode="strict")
+    check("Strict Mode never triggers the noise layer",
+          m.token_vocab is None and m.open_ctm._token_vocab is None)
+
+    info = m.open_mode_candidate_scores("the boy sat on the")
+    check("the first Open Mode call attaches V10's data source to open_ctm",
+          m.token_vocab is not None and m.open_ctm._token_vocab is m.token_vocab)
+    nz = {c: v for c, v in info["noise_vote"].items() if v}
+    check("V10 is live: nonzero for at least one candidate", len(nz) > 0, info["noise_vote"])
+
+    # V10 must be exactly NOISE_WEIGHT x noise.py's own averaged scores,
+    # summed over the context words -- not a re-derived approximation.
+    w = m.open_ctm._noise_weight
+    check("open_ctm carries IVMConfig.NOISE_WEIGHT by default",
+          w == IVMConfig.NOISE_WEIGHT, w)
+    expected = combine_context(m, ["boy", "sat", "on", "the"])
+    off = [c for c, v in nz.items() if abs(v - w * expected.get(c, 0)) > 1e-9]
+    check("V10 == NOISE_WEIGHT x noise.combine_context() (the three-stage "
+          "average, summed over context)", not off, off[:5])
+
+    check("V10 is part of the final score (scores == sum of all ten layers)",
+          all(abs(info["scores"][c] -
+                  sum(info[k].get(c, 0) for k in (
+                      "important_vote", "influence_vote", "context_vote",
+                      "context_influence_vote", "bigram_witness_vote",
+                      "adjacency_vote", "prev_current_vote", "triple_vote",
+                      "whole_context_vote", "noise_vote"))) < 1e-9
+              for c in info["candidates"]))
+
+    _, _, trace = m.generate("the dog", max_tokens=8, mode="open")
+    check("generate()'s per-step trace exposes noise_vote",
+          all("noise_vote" in t for t in trace
+              if t.get("rule") == "ctm_weighted_vote"), trace[:1])
+    runs = {m.generate("the dog", max_tokens=8, mode="open")[0] for _ in range(4)}
+    check("Open Mode generation with V10 live is still deterministic",
+          len(runs) == 1, runs)
+
+    m.open_ctm._noise_weight = 0.0
+    zero = m.open_mode_candidate_scores("the boy sat on the")
+    check("NOISE_WEIGHT = 0 switches V10 off entirely",
+          all(v == 0 for v in zero["noise_vote"].values()), zero["noise_vote"])
+    m.open_ctm._noise_weight = w
+
+    # ── never stale ─────────────────────────────────────────────────────
+    m2 = MSEGraphLanguageModel(vocab_size=300)
+    m2.train(CORPUS)
+    m2.open_mode_candidate_scores("the boy sat on the")
+    tv_before = m2.token_vocab
+    rels_before = m2.rels._n_rels
+    m2.train_incremental("the pig sat on the rug. the pig sat on the log.")
+    check("train_incremental() drops the pre-merge noise matrix -- open_ctm "
+          "is not left holding it",
+          m2.token_vocab is None and m2.open_ctm._token_vocab is None,
+          (m2.token_vocab, m2.open_ctm._token_vocab))
+    m2.open_mode_candidate_scores("the pig sat on the")
+    check("after a merge V10 re-attaches to a NEW matrix built from the "
+          "merged graphs",
+          m2.token_vocab is not tv_before
+          and m2.open_ctm._token_vocab is m2.token_vocab
+          and m2.noise_index._n_rels == m2.rels._n_rels > rels_before,
+          (m2.noise_index._n_rels, rels_before))
+
+    m3 = MSEGraphLanguageModel(vocab_size=300)
+    m3.train(CORPUS)
+    m3.open_mode_candidate_scores("the cat sat")
+    tv3 = m3.token_vocab
+    m3.train("the pig sat on the rug. the pig sat on the log. the cow sat on the rug.")
+    check("re-train()ing a model object in place drops the stale noise state",
+          m3.token_vocab is None and m3.noise_index is None)
+    m3.open_mode_candidate_scores("the pig sat")
+    check("...and V10 re-attaches to a fresh matrix afterwards",
+          m3.token_vocab is not tv3 and m3.open_ctm._token_vocab is m3.token_vocab)
+
+    m4 = MSEGraphLanguageModel(vocab_size=300)
+    m4.train(CORPUS)
+    tv4 = m4.build_token_vocab()
+    m4.generate("the dog", max_tokens=3, mode="open")
+    check("a token_vocab the caller already built is reused, not rebuilt",
+          m4.token_vocab is tv4 and m4.open_ctm._token_vocab is tv4)
+
+    tmp = tempfile.mkdtemp(prefix="mse_v10_test_")
+    try:
+        m.save(tmp)
+        m_reload = MSEGraphLanguageModel.load(tmp)
+        check("a freshly loaded model starts with V10 dormant",
+              m_reload.open_ctm._token_vocab is None)
+        again = m_reload.open_mode_candidate_scores("the boy sat on the")
+        check("...and once used, V10 and the winner match the original model",
+              again["noise_vote"] == info["noise_vote"]
+              and again["winner"] == info["winner"],
+              (again["winner"], info["winner"]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_score_candidates_speed_optimizations_agree_with_naive():
+    """
+    score_candidates() got several speed passes (see ivm.py's
+    _context_accumulators(), _adjacent_from()/_bigrams_from()/
+    _triples_from()/_rel_tokens(), and noise.py's per-candidate
+    NoiseCancellationIndex.candidate_average()) that change HOW each
+    layer is computed but must never change WHAT it computes. This
+    doesn't re-derive independent expected values (test_bigram_witness_*,
+    test_triple_witness_*, etc. already pin each layer's literal meaning);
+    it instead checks the two documented ways the speed passes could go
+    wrong: (a) list-context input, which _context_accumulators() does
+    NOT handle and must fall back on, still gives exactly the old
+    per-candidate values, and (b) a context that GROWS step by step (the
+    incremental accumulator's actual use case) agrees with the same
+    context scored fresh, at every step -- not just the final one, which
+    would hide a bug in the incremental-add path.
+    """
+    section("score_candidates() speed passes agree with naive evaluation")
+
+    m = MSEGraphLanguageModel(vocab_size=300)
+    m.train(CORPUS)
+    ivm = m.open_ctm
+    vocab = m.all_candidate_tokens()
+    enc = m.tokenizer.encode
+
+    prev = enc("boy")[-1]
+    cur = enc("sat")[-1]
+    ctx_words = ["boy", "sat", "on", "the"]
+    ids = [enc(w)[-1] for w in ctx_words]
+
+    as_set = ivm.score_candidates(vocab, set(ids), current=cur, previous=prev)
+    as_list = ivm.score_candidates(vocab, list(ids), current=cur, previous=prev)
+    LAYERS = ["important_vote", "influence_vote", "context_vote",
+              "context_influence_vote", "bigram_witness_vote", "adjacency_vote",
+              "prev_current_vote", "triple_vote", "whole_context_vote",
+              "noise_vote", "scores"]
+    check("set-context (fast/incremental path) and list-context (the "
+          "pre-existing per-candidate fallback) agree on every layer",
+          all(as_set[L].keys() == as_list[L].keys()
+              and all(abs(as_set[L][c] - as_list[L][c]) < 1e-9 for c in as_set[L])
+              for L in LAYERS),
+          {L: (as_set[L], as_list[L]) for L in LAYERS if as_set[L] != as_list[L]})
+
+    # incremental growth: score a context that grows one token at a time
+    # (what real generation does) and check each prefix against a FRESH
+    # ImportanceVoteMatrix instance (no accumulator state at all) scoring
+    # that exact prefix from scratch.
+    from ivm import ImportanceVoteMatrix
+    growing = ImportanceVoteMatrix.build(m)
+    fresh_ids = [enc("the")[-1], enc("cat")[-1], enc("sat")[-1], enc("on")[-1], enc("the")[-1]]
+    all_ok = True
+    for i in range(1, len(fresh_ids) + 1):
+        prefix = fresh_ids[:i]
+        ctx = set(prefix)
+        c, p = prefix[-1], (prefix[-2] if i > 1 else None)
+        incremental = growing.score_candidates(vocab, ctx, current=c, previous=p)
+        fresh = ImportanceVoteMatrix.build(m).score_candidates(vocab, ctx, current=c, previous=p)
+        if not all(abs(incremental["scores"][cand] - fresh["scores"][cand]) < 1e-9
+                   for cand in incremental["scores"]):
+            all_ok = False
+    check("scoring a context that grows one token at a time (the same "
+          "ImportanceVoteMatrix instance reused, as generate() does) "
+          "matches a fresh instance scoring each prefix from scratch, "
+          "at every step -- not just the last one",
+          all_ok)
+
+    winner_inc = growing.select(vocab, set(fresh_ids), current=fresh_ids[-1],
+                                 previous=fresh_ids[-2])[0]
+    winner_fresh = ImportanceVoteMatrix.build(m).select(
+        vocab, set(fresh_ids), current=fresh_ids[-1], previous=fresh_ids[-2])[0]
+    check("select()'s winner after incremental growth matches a fresh build",
+          winner_inc == winner_fresh, (winner_inc, winner_fresh))
+
+
 if __name__ == "__main__":
     main()
     test_prompt_seeding_and_mode_boundaries()
@@ -2192,6 +2383,8 @@ if __name__ == "__main__":
     test_sparse_token_score_cache()
     test_relationship_matrix_dedup()
     test_cluster_axis_indexed_lookup()
+    test_noise_vote_wired_into_inference()
+    test_score_candidates_speed_optimizations_agree_with_naive()
     print(f"\n{PASS} passed, {FAIL} failed (grand total)")
     if FAIL: sys.exit(1)
 

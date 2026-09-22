@@ -471,7 +471,7 @@ class Analyser:
         inference.py's _bigram_tie_break.
 
         Open Mode's rule is almost always 'ctm_weighted_vote' (the
-        V1-V9 primary selection scored the full legal candidate set,
+        V1-V10 primary selection scored the full legal candidate set,
         with its own internal bigram/global-frequency tie-break
         cascade if the score itself ties -- see ivm.py's select()).
         'ctm_unavailable_deterministic_fallback' only appears if no
@@ -497,21 +497,23 @@ class Analyser:
 
     def open_mode_scores(self, prompt: str) -> dict:
         """
-        Full auditable V1-V9 score breakdown for the NEXT token given
+        Full auditable V1-V10 score breakdown for the NEXT token given
         `prompt`, under Open Mode's primary selection mechanism (see
         ivm.py's score_candidates()/select()): which tokens are
-        important, their influence (breadth), what each of the NINE
+        important, their influence (breadth), what each of the TEN
         layers (important vote / influence vote / context vote /
         context-influence vote / bigram-witness vote / adjacency
         vote / prev+current co-occurrence vote / triple witness vote /
-        whole-context unanimous vote) contributed per candidate, the
+        whole-context unanimous vote / noise-cancellation vote)
+        contributed per candidate, the
         final combined score, and -- critically -- which stage
         actually decided the winner ("score", "bigram_frequency",
         "global_frequency", or "lowest_token_id"). The final "score"
-        is the sum of all nine layers, including bigram_witness_vote
+        is the sum of all ten layers, including bigram_witness_vote
         (V5), adjacency_vote (V6), prev_current_vote (V7), triple_vote
-        (V8), and whole_context_vote (V9) -- don't add up just the
-        other four expecting it to match; V5/V6/V7/V8/V9 are usually
+        (V8), whole_context_vote (V9), and noise_vote (V10, noise.py's
+        averaged noise-cancellation scores, weighted small) -- don't add
+        up just the other four expecting it to match; V5/V6/V7/V8/V9 are usually
         the largest single contributors (V5 when the exact bigram was
         literally witnessed, V6 when the context token was ever
         directly, immediately followed by the candidate --
@@ -532,7 +534,7 @@ class Analyser:
     def cache_control(self, action: str = "status") -> dict:
         """
         Toggle or inspect model.open_ctm's opt-in sparse per-token
-        score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8/V9 always stay
+        score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8/V9/V10 always stay
         live, see ivm.py's build_cache()). `action`:
           "on"     -- (re)build the cache for the full vocabulary
                       (model.all_candidate_tokens()) and enable it
@@ -806,12 +808,13 @@ def main():
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("open-scores",
-                        help="Open Mode only: full V1-V9 weighted-vote breakdown "
+                        help="Open Mode only: full V1-V10 weighted-vote breakdown "
                              "for the next token given a prompt -- important tokens, "
                              "influence, per-layer contributions (including V5's "
                              "bigram-witness vote, V6's adjacency vote, V7's "
-                             "prev+current co-occurrence vote, and V8's triple "
-                             "witness vote), the final "
+                             "prev+current co-occurrence vote, V8's triple "
+                             "witness vote, V9's whole-context vote, and V10's "
+                             "noise-cancellation vote), the final "
                              "score, and which tie-break stage (if any) decided the winner. "
                              "This is Open Mode's PRIMARY selection mechanism, not a "
                              "tie-breaker; use this to audit why it picked what it picked. "
@@ -837,7 +840,7 @@ def main():
 
     p = sub.add_parser("cache",
                         help="Toggle or inspect model.open_ctm's opt-in sparse "
-                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8 "
+                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8/V9/V10 "
                              "always stay live). Same scores either way; this is "
                              "purely a speed optimization -- see benchmark_cache.py "
                              "to actually measure the difference.")
@@ -1211,6 +1214,7 @@ def main():
                         round(r["prev_current_vote"].get(c, 0), 2),
                         round(r["triple_vote"].get(c, 0), 2),
                         round(r["whole_context_vote"].get(c, 0), 2),
+                        round(r["noise_vote"].get(c, 0), 4),
                         round(r["scores"][c], 2),
                         tag)
 
@@ -1221,7 +1225,7 @@ def main():
                 rows,
                 ["candidate", "V1 (important)", "V2 (influence)", "V3 (context)",
                  "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)",
-                 "V7 (prev+curr)", "V8 (triple)", "V9 (unanimous)", "score", ""],
+                 "V7 (prev+curr)", "V8 (triple)", "V9 (unanimous)", "V10 (noise)", "score", ""],
             )
             print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']}"
                   f"  ·  cache: {'on' if r['cache_used'] else 'off'})")

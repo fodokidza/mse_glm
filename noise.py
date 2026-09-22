@@ -204,6 +204,10 @@ from ivm import token_to_relationships
 
 _STRUCTURAL = RESERVED | {EOS}
 
+# Number of set bits in a non-negative int. int.bit_count() needs Python
+# 3.10+; the fallback keeps this module's "Python 3 only" promise.
+_popcount = int.bit_count if hasattr(int, "bit_count") else (lambda x: bin(x).count("1"))
+
 
 class NoiseCancellationIndex:
     """
@@ -221,10 +225,17 @@ class NoiseCancellationIndex:
     re-passed on every individual counts()/score() call.
     """
 
-    def __init__(self, model, vote_weight=NoiseConfig.VOTE_WEIGHT):
+    def __init__(self, model, vote_weight=NoiseConfig.VOTE_WEIGHT, token_rels=None):
         self.model = model
         self.vote_weight = vote_weight
-        self.token_rels = token_to_relationships(model)   # token -> {relationship_id, ...} -- reused, not recomputed
+        # token -> {relationship_id, ...}. `token_rels` lets a caller that already
+        # holds this exact map (ImportanceVoteMatrix does -- see
+        # ivm.attach_noise_layer()) hand it over instead of paying for a second
+        # full pass over every triple; it is only ever READ here.
+        self.token_rels = token_rels if token_rels is not None else token_to_relationships(model)
+        self._rel_mask_cache = {}       # token -> int bitmask over relationship ids (see _rel_mask())
+        self._stage_cache = {}          # candidate -> (stage1, stage2, stage3) -- see candidate_stages()
+        self._average_cache = {}        # candidate -> final averaged score, or None if unscorable -- see candidate_average()
         self._rel_tokens_cache = {}
         self._global_reach_cache = {}   # token -> every token it has ever shared a sentence with
         self._knowing_rids_cache = {}   # token -> every relationship_id that knows it (stage 2's cache)
@@ -235,8 +246,101 @@ class NoiseCancellationIndex:
         self._all_rids = frozenset(range(self._n_rels))
 
     @classmethod
-    def build(cls, model, vote_weight=NoiseConfig.VOTE_WEIGHT):
-        return cls(model, vote_weight=vote_weight)
+    def build(cls, model, vote_weight=NoiseConfig.VOTE_WEIGHT, token_rels=None):
+        return cls(model, vote_weight=vote_weight, token_rels=token_rels)
+
+    # ── fast per-candidate scoring (what V10 / TokenVocabularyMatrix use) ──
+    #
+    # Working through TokenVocabularyMatrix's cross-home "vote once"
+    # formula shows a candidate's averaged score does NOT depend on which
+    # anchor token it is being scored against:
+    #     stage1 = n_rels - |rels(c)|
+    #     stage2 = n_rels - |rels sharing any token with c|
+    #     stage3 = |other_vocab| - |other_vocab & reach(c)|
+    # and stage3's pool other_vocab = V_all - excl (excl = the tokens that
+    # live ONLY in the anchor/candidate shared homes) obeys excl <= reach(c)
+    # -- every such token sits in a sentence that also holds c -- so the
+    # excl terms cancel and stage3 = |V_all| - |reach(c)|. Everything is a
+    # property of the candidate alone. That lets one cheap per-candidate
+    # computation replace the old per-(anchor, candidate) work, which built
+    # a fresh vocabulary-sized frozenset for nearly every pair (O(V^2)
+    # memory, and minutes of CPU on a real model). noise_scores()/
+    # counts_detailed() (the per-home analysis views) are untouched;
+    # TokenVocabularyMatrix._row_for_reference() keeps the literal
+    # per-pair algorithm, and the test suite checks the two agree.
+
+    def _rel_mask(self, token):
+        """Bitmask (Python int) with bit r set for every relationship r the
+        token appears in -- lets 'union of many tokens' relationship sets'
+        be a handful of big-int ORs instead of millions of set inserts."""
+        cached = self._rel_mask_cache.get(token)
+        if cached is None:
+            rels = self.token_rels.get(token)
+            if not rels:
+                cached = 0
+            else:
+                buf = bytearray((self._n_rels >> 3) + 1)
+                for r in rels:
+                    buf[r >> 3] |= 1 << (r & 7)
+                cached = int.from_bytes(buf, "little")
+            self._rel_mask_cache[token] = cached
+        return cached
+
+    def candidate_stages(self, cand):
+        """
+        (stage1, stage2, stage3) integer counts for one candidate token,
+        cached after the first call (three ints per candidate -- nothing
+        vocabulary-sized is ever stored). See the block comment above for
+        why these need no anchor. Cost of a first call is roughly one
+        pass over the sentences `cand` appears in, plus a few big-int ORs.
+        """
+        cached = self._stage_cache.get(cand)
+        if cached is not None:
+            return cached
+        rels = self.token_rels.get(cand) or ()
+        tokens_for = self.tokens_for
+        reach = set()                       # every token cand has ever shared a sentence with
+        for r in rels:
+            reach |= tokens_for(r)
+        stage1 = self._n_rels - len(rels)
+        # rels that contain at least one token of `reach` (== the old
+        # _knowing_rids(cand)), via bitmask ORs. Visit the most widespread
+        # tokens first and stop the moment every relationship is covered --
+        # for a common candidate that is usually within a few dozen ORs.
+        order = reach
+        if len(reach) > 64:
+            order = sorted(reach, key=lambda u: -len(self.token_rels.get(u) or ()))
+        full = (1 << self._n_rels) - 1
+        knowing = 0
+        for u in order:
+            knowing |= self._rel_mask(u)
+            if knowing == full:
+                break
+        stage2 = self._n_rels - _popcount(knowing)
+        stage3 = len(self._vocab_all()) - len(reach)
+        cached = (stage1, stage2, stage3)
+        self._stage_cache[cand] = cached
+        return cached
+
+    def candidate_average(self, cand):
+        """
+        The three-stage AVERAGE noise-cancellation score of `cand`
+        (vote_weight * (stage1 + stage2 + stage3) / 3 -- the same
+        expression counts_detailed() uses), or None for a token that
+        can't be scored: structural markers (never in any home's word
+        set) and tokens that appear in no relationship.
+        """
+        try:
+            return self._average_cache[cand]
+        except KeyError:
+            pass
+        if cand in _STRUCTURAL or not self.token_rels.get(cand):
+            value = None
+        else:
+            s1, s2, s3 = self.candidate_stages(cand)
+            value = self.vote_weight * (s1 + s2 + s3) / 3
+        self._average_cache[cand] = value
+        return value
 
     def tokens_for(self, rid):
         cached = self._rel_tokens_cache.get(rid)
@@ -787,18 +891,69 @@ class TokenVocabularyMatrix:
         """
         return cls(model)
 
+    def _index(self):
+        m = self.model
+        return m.noise_index if m.noise_index is not None else m.build_noise_index()
+
+    def candidate_average(self, cand):
+        """Anchor-independent averaged score for one candidate (None if
+        unscorable) -- see NoiseCancellationIndex.candidate_average()."""
+        return self._index().candidate_average(cand)
+
+    def weighted_counts(self, counts):
+        """
+        {candidate: candidate_average(candidate) * n} for a {candidate: n}
+        map, skipping unscorable candidates. With n = the number of context
+        tokens whose row contains the candidate, this IS combine() over
+        that context -- every row entry for a candidate carries the same
+        anchor-independent value, so summing rows is multiplying by a
+        count. ivm.py's V10 feeds it V3's raw context counts, which
+        avoids materializing any per-token row (each up to vocabulary
+        size) at inference time.
+        """
+        idx = self._index()
+        average = idx._average_cache
+        out = {}
+        for c, n in counts.items():
+            try:
+                g = average[c]
+            except KeyError:
+                g = idx.candidate_average(c)
+            if g is not None:
+                out[c] = g * n
+        return out
+
     def _row_for(self, token):
         """
         The single per-token cache lookup/fill that row() and
         combine() both go through. Each candidate is scored ONCE (see
         module docstring's "VOTE ONCE PER PAIR (ALL THREE STAGES)") --
         no per-home summing for any of the three stages -- cached
-        forever after under this exact token id.
+        forever after under this exact token id. Values come from
+        NoiseCancellationIndex.candidate_average() (the per-candidate
+        closed form -- see the comment block in that class).
         """
         cached = self._rows.get(token)
         if cached is not None:
             return cached
-        idx = self.model.noise_index if self.model.noise_index is not None else self.model.build_noise_index()
+        idx = self._index()
+        neighbours = set()               # every token sharing a home sentence with `token`
+        for home in idx.homes(token):
+            neighbours |= idx.tokens_for(home)
+        neighbours.discard(token)
+        row = {cand: idx.candidate_average(cand) for cand in neighbours}
+        self._rows[token] = row
+        return row
+
+    def _row_for_reference(self, token):
+        """
+        The original literal per-(anchor, candidate) algorithm, kept ONLY
+        as the ground truth the fast _row_for() is tested against
+        (test.py). Slow and memory-hungry on any real corpus -- its
+        stage-3 pool is a fresh vocabulary-sized set per pair -- and
+        never cached or used at runtime.
+        """
+        idx = self._index()
         t_homes = {}
         for home in idx.homes(token):
             for cand in idx.tokens_for(home) - {token}:
@@ -812,7 +967,6 @@ class TokenVocabularyMatrix:
             other_vocab = idx._other_vocab_multi(homes_set)
             stage3 = len(other_vocab) - len(other_vocab & idx.global_reach(cand))
             row[cand] = idx.vote_weight * (stage1 + stage2 + stage3) / 3
-        self._rows[token] = row
         return row
 
     def row(self, token):

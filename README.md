@@ -34,6 +34,7 @@ The optional `server.py` HTTP server additionally needs `flask`
 ## Contents
 
 - [File overview](#file-overview)
+- [0. The tokenizer](#0-the-tokenizer)
 - [1. Train from scratch](#1-train-from-scratch)
 - [2. Continue training on new data](#2-continue-training-on-new-data)
 - [3. Train from a folder of .txt files](#3-train-from-a-folder-of-txt-files)
@@ -41,7 +42,8 @@ The optional `server.py` HTTP server additionally needs `flask`
 - [5. Run the HTTP API server](#5-run-the-http-api-server)
 - [6. Analyse a trained model](#6-analyse-a-trained-model)
 - [7. Cluster Interpreter Matrix (naming clusters)](#7-cluster-interpreter-matrix-naming-clusters)
-- [8. Open Mode's primary mechanism: IVM weighted voting (V1-V9)](#8-open-modes-primary-mechanism-ivm-weighted-voting-v1-v9)
+- [8. Open Mode's primary mechanism: IVM weighted voting (V1-V10)](#8-open-modes-primary-mechanism-ivm-weighted-voting-v1-v10)
+- [8.5. Inspecting noise.py's evidence](#85-inspecting-noisepys-evidence-noise---token-row--combine)
 - [9. Context Trigger Matrix (contextual disambiguation)](#9-context-trigger-matrix-contextual-disambiguation)
 - [10. Token Importance / Trigger analysis (Python API only)](#10-token-importance--trigger-analysis-python-api-only)
 - [11. Analyse raw text with no trained model](#11-analyse-raw-text-with-no-trained-model)
@@ -55,11 +57,12 @@ The optional `server.py` HTTP server additionally needs `flask`
 
 | File                  | What it's for                                                          |
 |-----------------------|--------------------------------------------------------------------------|
-| `tokenizer.py`        | From-scratch BPE tokenizer                                              |
+| `tokenizer.py`        | Two-stage character/word tokenizer (BPE retired for good — see section 0) |
 | `graph.py`            | Edge / Bridge / Relationship matrices + dual-axis clustering            |
 | `model.py`            | `MSEGraphLanguageModel` — orchestrates everything, save/load            |
 | `inference.py`        | Deterministic inference engine — Strict Mode's two-stage lineage-vote pipeline and Open Mode's IVM-scored candidate selection |
-| `ivm.py`               | Importance Vote Matrix — Open Mode's PRIMARY candidate-scoring mechanism (V1-V9 weighted voting, see section 8); also Strict Mode's legacy opt-in tie-break |
+| `ivm.py`               | Importance Vote Matrix — Open Mode's PRIMARY candidate-scoring mechanism (V1-V10 weighted voting, see section 8); also Strict Mode's legacy opt-in tie-break |
+| `noise.py`            | Noise-cancellation scoring — V10's data source, plus the `noise-*`/`token-row`/`combine` analysis commands (see section 8.5) |
 | `interpret.py`        | Cluster Interpreter Matrix — names clusters, mines the zero-cluster bucket |
 | `importance.py`       | Sequence reconstruction + per-triple importance/trigger tagging (Python API only) |
 | `ctm.py`               | Context Trigger Matrix — contextual disambiguation among cluster members |
@@ -70,6 +73,68 @@ The optional `server.py` HTTP server additionally needs `flask`
 | `server.py`           | Optional Flask HTTP API + web UI over a trained model (needs `flask`)   |
 | `benchmark_cache.py`  | Standalone script: times Open Mode's sparse score cache vs. live scoring, confirms they agree, on your own trained model (section 8) |
 | `test.py`             | Full regression suite (all features, 340+ checks)                       |
+
+---
+
+## 0. The tokenizer
+
+`tokenizer.py`'s `CharWordTokenizer` is a from-scratch two-stage
+character/word design — **not** BPE. An earlier BPE tokenizer existed
+and has been deleted outright, not just replaced; the merge-pair scan
+that BPE needs was, on the corpus this was measured against, the
+single slowest step in training (~25 minutes). The design below does
+the same job in ~47 seconds — a different algorithm, not a tuning
+change.
+
+- **Stage 1 (`CharacterVocabulary`)** learns every unique *character*
+  in the corpus, each with its own id. Case-sensitive — `'a'` and
+  `'A'` are different ids.
+- **Stage 2 (`TokenVocabulary`)** pre-defines an id for common
+  *words* — capped by `vocab_size` — so the model isn't forced to
+  spell `"the"` out character-by-character every time. A word's
+  "definition" is the *recipe* of stage-1 character ids that spells
+  it, not a copy of the string. Stage 2 is an optimization on top of
+  stage 1, never a requirement. **Stage 2 is case-INSENSITIVE** —
+  `"The"`/`"the"`/`"THE"` share one entry, so decoding a stage-2 id
+  always gives back that one lowercase spelling (see `decode()`'s
+  docstring); stage 1 stays fully case-sensitive throughout. A
+  single-character "word" never gets its own stage-2 entry — it's
+  just its stage-1 id.
+- **One shared id space** for both stages, right after the reserved
+  specials (`<PAD>`/`<UNK>`/`<BOS>`/`<EOS>`/`<WORD_BOUND>`) — every id
+  in an encoded stream means one thing to `decode()`, whichever stage
+  minted it.
+- **True zero vocabulary loss for any word built from known
+  characters.** A word stage 2 has no entry for isn't lost — it's
+  spelled out live through stage 1, with `<WORD_BOUND>` inserted
+  first so a flat id stream can tell where a fallback-spelled word
+  starts. `<UNK>` is only ever reached for a genuinely unseen
+  *character*, never an unseen word.
+
+```python
+from tokenizer import CharWordTokenizer
+
+tok = CharWordTokenizer(vocab_size=8000)
+tok.train("the cat sat on the mat.")             # or tok.train_from_file(path, chunk_size=...)
+ids = tok.encode("the cat sat")                   # BOS-prepended, no EOS
+ids_train = tok.encode_for_training("the cat sat.")  # EOS-appended, used by train()
+tok.decode(ids)
+tok.vocab_size_actual                              # actual ids in use (<= vocab_size)
+
+# Grow an already-trained tokenizer's vocabulary without retokenizing
+# from scratch -- what model.train_incremental() uses under the hood
+tok.extend_vocab("more corpus text", target_vocab_size=12000)
+```
+
+`normalize()` and `segment()` (also in this file) are the two word-
+segmentation rules the rest of the codebase shares: `normalize()` is
+case-folding (used by `analyse.py`'s own word-frequency analysis,
+independent of this tokenizer), `segment()` is case-preserving (what
+stage 2 itself uses) — otherwise the same punctuation-isolation rule.
+`split_sentences()` and `stream_word_freq()` (sentence splitting and
+chunked frequency counting for `train_from_file()`) live here too,
+since they were always generic, not specific to any one vocabulary
+algorithm.
 
 ---
 
@@ -188,7 +253,7 @@ REPL commands once inside:
 | `<any text>`                 | Generate a continuation in the current mode        |
 | `/mode strict` / `/mode open`| Switch modes (Open Mode is always ready — no separate build step) |
 | `/explain <prev> \| <curr>`  | Explain one inference step                         |
-| `/scores <prompt>`           | Open Mode only: full V1-V9 IVM score breakdown for the next token (see section 8), plus which tie-break stage (if any) decided the winner. Prints only the top N by score by default (`--top <n>` / `--all` to change) |
+| `/scores <prompt>`           | Open Mode only: full V1-V10 IVM score breakdown for the next token (see section 8), plus which tie-break stage (if any) decided the winner. Prints only the top N by score by default (`--top <n>` / `--all` to change) |
 | `/bigram <prev> <curr>`      | Bigram evidence for a pair — training/total counts (Strict Mode's tie-break and Open Mode's first tie-break stage), plus how many distinct training sentences literally witnessed the bigram (V5's evidence set) |
 | `/cache on\|off\|status`     | Toggle/inspect Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see section 8) — same scores either way, purely a speed optimization; `/scores` shows whether it was used for the last breakdown |
 | `/shared <tok1> <tok2> ...`  | `infer_shared_role()` across a token set           |
@@ -242,7 +307,7 @@ Endpoints:
 | POST   | `/generate` | `{"prompt", "session_id"?, "max_tokens"?}`           | One-shot generation for a session (stateless per call; session only tracks chat history + current mode) |
 | POST   | `/stream`   | same as `/generate`                                 | Server-Sent Events token-by-token replay of the (already fully computed, deterministic) generation, each event carrying the trace rule that chose it |
 | POST   | `/mode`     | `{"session_id", "mode"}` — `mode` is `strict`\|`open`\|`open_ctm` | Switch a session's mode preset |
-| POST   | `/scores`   | `{"prompt"}`                                         | Open Mode only, read-only: full V1-V9 IVM score breakdown for the next token, over the entire vocabulary (see section 8) — mirrors `chat.py`'s `/scores` |
+| POST   | `/scores`   | `{"prompt"}`                                         | Open Mode only, read-only: full V1-V10 IVM score breakdown for the next token, over the entire vocabulary (see section 8) — mirrors `chat.py`'s `/scores` |
 | POST   | `/bigram`   | `{"prev", "curr", "mode"?}`                          | Read-only: raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) — mirrors `chat.py`'s `/bigram` |
 | POST   | `/reset`    | `{"session_id"}`                                     | Clear a session's chat history |
 | GET    | `/sessions` | —                                                   | Active session count/ids |
@@ -293,14 +358,28 @@ python3 analyse.py --model runs/model --json out.json clusters
 | `cluster`        | `... cluster 3`                                         | full detail for one cluster_id |
 | `relationships`  | `... relationships`                                     | Relationship Matrix summary |
 | `relationship`   | `... relationship 2`                                    | full detail for one training sentence |
+| `edges`          | `... edges --source cat --sort count --limit 20`         | raw EdgeMatrix rows (source, dst, count), paged; filter by `--source`/`--target` |
+| `bridges`        | `... bridges --clustered-only --limit 20`                 | raw BridgeMatrix rows (source, bridge, target, cluster_id), paged; filter by `--source`/`--bridge`/`--target` |
+| `rel-rows`       | `... rel-rows --relationship 2`                          | raw RelationshipMatrix rows (relationship_id, triple_id, decoded source/bridge/target), paged; filter by `--relationship` or `--triple` (mutually exclusive) |
 | `token`          | `... token cat`                                         | successors, bridge triples, clusters for one token |
 | `similarity`     | `... similarity cat dog`                                | cluster-overlap similarity between two tokens |
 | `shared`         | `... shared cat dog pig`                                | `infer_shared_role()` across 2+ tokens |
+| `ask`            | `... ask who smiled`                                     | Layer 2 query (`products.py`); reports an explicit *ambiguous* result — every tied candidate — rather than silently picking one. Run with no `anchor_word` to list implemented question types |
+| `why`            | `... why who smiled cat`                                 | follow-up to `ask`: per-vote-layer breakdown for ANY candidate (not just the winner), with the exact `relationship_id`s behind each yes |
 | `trace`          | `... trace "the cat" --max-tokens 10`                   | step-by-step generation trace (stage/rule/lineage per token) |
-| `open-scores`    | `... open-scores "the cat sat"`                          | Open Mode only: full V1-V9 IVM score breakdown for the next token, over the entire vocabulary (see section 8); add `--cache` to enable the sparse cache first, `--top-n <n>`/`--top-n 0` to change how many rows print |
+| `open-scores`    | `... open-scores "the cat sat"`                          | Open Mode only: full V1-V10 IVM score breakdown for the next token, over the entire vocabulary (see section 8); add `--cache` to enable the sparse cache first, `--top-n <n>`/`--top-n 0` to change how many rows print |
 | `cache`          | `... cache on`                                          | Toggle/inspect Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see section 8) — `on`, `off`, or `status` (default) |
 | `bigram`         | `... bigram the mat --mode open`                        | raw bigram evidence for one pair, including `witness_sentences` (V5's evidence set) |
 | `report`         | `... report --top 10`                                   | combined stats + topology + clusters + relationships |
+
+`ask`/`why` import from `products.py` (Layer 2 query support) at call
+time, not from anything in this repo's own file list above — if
+that module isn't present alongside the rest, those two subcommands
+will fail to import; every other subcommand has no such dependency.
+
+See section 7 for `interpret`/`interpretations`/`interpreter-matrix`/
+`zero-cluster`, and section 8.5 for the `noise-*`/`token-row`/
+`combine` family.
 
 ---
 
@@ -334,7 +413,7 @@ identical clusters and evidence for all four subcommands.
 
 ---
 
-## 8. Open Mode's primary mechanism: IVM weighted voting (V1-V9)
+## 8. Open Mode's primary mechanism: IVM weighted voting (V1-V10)
 
 The Bridge Matrix answers "which tokens are structurally related
 here?" Open Mode's **Importance Vote Matrix** (`ivm.py`) answers
@@ -345,7 +424,7 @@ any prompt is accepted, even one containing a transition the model
 has genuinely never seen; there's simply nothing after that first
 step for a "was this ever literally seen" check to protect, since
 every step already scores the whole vocabulary regardless. Every
-step, the ENTIRE vocabulary is scored by summing nine independent,
+step, the ENTIRE vocabulary is scored by summing ten independent,
 weighted vote layers:
 
 | Layer | What it measures | Default weight | Role |
@@ -359,8 +438,9 @@ weighted vote layers:
 | V7 `prev_current_vote` | Binary, a SINGLE flat check (not summed per context token): did `previous`, `current`, AND this candidate ever all three share one training sentence together, no adjacency required between any of them? | 1.7 | Peer-weighted with V3/V5/V6 — a fixed-pair question about the two most recent tokens specifically, narrower than V3 (needs both tokens, not just one) but broader than V5 (no adjacency required) |
 | V8 `triple_vote` | Binary, a SINGLE flat check (not summed per context token): was `(previous, current, candidate)` ever literally ONE consecutive trained Bridge Matrix triple, in that exact order? | 2.0 | Peer-weighted with V3/V5/V6/V7, a notch above — the strictest, most positionally exact single-triple evidence |
 | V9 `whole_context_vote` | Binary, UNANIMOUS: does EVERY non-reserved context token (not just one, V3's question), excluding the candidate itself if it's already in context, co-occur with this candidate? | 2.5 | Peer-weighted with V3/V5/V6/V7/V8, a further notch above V8 — the strictest CONSENSUS evidence, harder to satisfy the larger the context gets |
+| V10 `noise_vote` | Per context token, that token's precomputed `noise.py` row value for the candidate — the three-stage AVERAGE noise-cancellation score (how many OTHER sentences/tokens don't already know the candidate, an IDF-flavored signal) — summed over context. Attached automatically on the first Open Mode call (no build step) | 0.0001 | Small, same role as V2/V4 — magnitude-based, so its raw scale grows with corpus size (see the gotcha below) |
 
-`score(candidate) = V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9`,
+`score(candidate) = V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10`,
 highest score
 wins; a genuine tie falls to a deterministic cascade (bigram
 frequency, then global frequency, then lowest token id — never
@@ -392,7 +472,7 @@ easier.
 
 ### The co-occurrence gate
 
-V1, V3, V4, V6, and V9 all reduce to sums or conjunctions over the
+V1, V3, V4, V6, V9, and V10 all reduce to sums or conjunctions over the
 same underlying fact: did token *t* and candidate *C* ever co-occur
 in a training relationship? (V5 sums over context too, checking a
 stronger, bigram-specific version of the same fact.) `ivm.py`
@@ -454,18 +534,20 @@ separate pass — building the cache and skipping ungated candidates
 live are the same underlying optimization, applied in two different
 places.
 
-V5, V7, V8, and V9 are deliberately **not** part of this cache and are
+V5, V7, V8, V9, and V10 are deliberately **not** part of this cache and are
 always
 computed live: V5's vote also depends on `current` (a different
 `current` means a different witness set for the same pair); V7/V8
 aren't a per-token contribution at all — each is a single fixed-pair
 (V7) or fixed-triple (V8) check on `(previous, current)`; V9 is a
 conjunction ACROSS every context token for one candidate, not a sum
-of independent per-`(token, candidate)` terms. All four are still
-fast, though — V5/V7/V8 are cheap sparse
-lookups, and V9 reuses the same co-occurrence gate as the cache
-itself, so all four run live whether or not the V1-V4/V6 cache is
-enabled.
+of independent per-`(token, candidate)` terms; V10 is a per-token sum
+like V1-V4/V6, but its values live in `noise.py`'s own precomputed
+`TokenVocabularyMatrix`, so folding it in here would just duplicate
+that structure. All five are still fast, though — V5/V7/V8 are cheap
+sparse lookups, V9 reuses the same co-occurrence gate as the cache
+itself, and V10 reads `noise.py`'s cached per-token rows, so all five
+run live whether or not the V1-V4/V6 cache is enabled.
 
 ```python
 model = MSEGraphLanguageModel.load("runs/model")
@@ -514,6 +596,114 @@ Strict Mode's Stage 2 lineage tie-break when explicitly passed to
 object/build than Open Mode's `model.open_ctm` (which is auto-built
 alongside training/loading); Strict Mode's is built separately via
 `model.build_importance_votes()` and is `None` unless you call it.
+
+### Performance
+
+Open Mode generation calls `score_candidates()` once per generated
+token, over the **entire vocabulary**, so its per-step cost is what
+you feel as "chat speed" — most acutely on a big model. A few things
+keep that cheap without changing a single score:
+
+- **V1/V3/V4/V6 (and the important-token evidence behind V1/V2) are
+  accumulated incrementally**, not recomputed from scratch every step.
+  `model.open_ctm` remembers what the last context it scored looked
+  like and, when the new context is that one plus newly-added tokens
+  (exactly what generation does — the context only ever grows), adds
+  just the new tokens' evidence instead of re-summing the whole
+  context's co-occurrence rows again. A context that isn't a simple
+  extension (a fresh prompt, a different candidate set) is detected
+  automatically and falls back to a full rebuild — never a wrong
+  answer, only a missed shortcut.
+- **V5/V7/V8/V9 walk only the tokens that can actually vote**, instead
+  of testing every vocabulary candidate and rejecting almost all of
+  them. Each reads its own small pool (the literal successors of the
+  current token, the sentences shared by `previous`+`current`, etc.)
+  and intersects that against the candidate set, rather than the other
+  way around.
+- **V10 (`noise.py`) is now anchor-independent.** The three-stage
+  average that used to be computed per `(anchor token, candidate)`
+  pair — rebuilding a vocabulary-sized set for nearly every pair — is
+  provably the same number regardless of which context token is
+  asking (see the comment above `NoiseCancellationIndex.candidate_average()`
+  in `noise.py`), so it's now computed once per candidate and reused.
+  The old per-pair algorithm is kept as `_row_for_reference()`
+  (`noise.py`) purely as the correctness check `test.py` runs the fast
+  path against — it's never used at runtime.
+- These are all **speed-only**: every score, every winner, and every
+  `/scores` breakdown is unchanged (`test.py`'s
+  `test_score_candidates_speed_optimizations_agree_with_naive()`
+  checks the fast and naive paths agree, including step-by-step during
+  incremental growth, not just at the end). `server.py` shares one
+  `model.open_ctm` across every session (see section 5); the
+  incremental cache updates that shared state as a single, atomic
+  swap-in, so concurrent requests can at worst duplicate a rebuild,
+  never see or produce a wrong score.
+- None of this replaces the opt-in V1/V2/V3/V4/V6 cache
+  (`model.open_ctm.enable_cache()`, above) — that cache trades memory
+  for skipping the accumulation entirely; these changes make the
+  accumulation itself cheap whether or not that cache is on.
+
+---
+
+## 8.5. Inspecting noise.py's evidence (`noise-*` / `token-row` / `combine`)
+
+V10 (above) is the inference-time *sum* of noise.py's per-candidate
+evidence over a context, but that sum by itself doesn't show *why* a
+candidate scored the way it did. These `analyse.py` subcommands walk
+the same three-stage scoring the fast V10 path runs, at three
+different levels of aggregation, entirely on-demand — none of it
+builds or touches `model.noise_index`/`model.token_vocab` at import
+time, only on first use of one of these commands (or of Open Mode
+inference — see section 8).
+
+Each stage answers "does this voter already know the candidate?" and
+counts a "no" as evidence to pay attention to it — no stopword list;
+a common word like "the" naturally lands at 0 on every stage because
+it already co-occurs with almost everything:
+
+- **stage1** — literal sentence membership (does the anchor's home
+  sentence itself contain the candidate?)
+- **stage2** — sentence-level global co-occurrence (does ANY sentence
+  containing the anchor also contain the candidate?)
+- **stage3** — token-level global co-occurrence, deduped
+
+```bash
+# A word can be the anchor of more than one training sentence --
+# find its candidate home_relationship_ids first
+python3 analyse.py --model runs/model noise-homes cat
+
+# Score every OTHER word in ONE home sentence against the anchor,
+# stage-by-stage plus their average (4 columns)
+python3 analyse.py --model runs/model noise-scores cat --home 0
+
+# Same three stages, but summed across EVERY sentence the anchor
+# appears in -- "wherever this token shows up, focus on these"
+python3 analyse.py --model runs/model focus-scores cat
+
+# The permanent, precomputed row for one token (noise.py's
+# TokenVocabularyMatrix) -- built once, never re-reads a training
+# sentence after that
+python3 analyse.py --model runs/model token-row cat
+
+# Sum several tokens' precomputed rows into one combined score per
+# target -- the actual inference-time step V10 sums over a context
+python3 analyse.py --model runs/model combine cat dog boy
+
+# Independent follow-up: which SPECIFIC relationship_ids voted "no,
+# I don't already know this candidate" for stage 2, given an
+# anchor+home? Not computed by any of the bulk/fast paths above --
+# only here, on demand
+python3 analyse.py --model runs/model noise-why cat 0 pig
+```
+
+`token-row` and `combine` are the literal, per-pair breakdown
+(`noise.vocabulary_row_detailed()` / `combine_context_detailed()`) —
+useful for auditing exactly how a score was built, one stage at a
+time. Section 8's V10 vote itself does NOT run this per-pair
+algorithm at inference time; it uses the mathematically-equivalent
+but much cheaper per-candidate closed form
+(`NoiseCancellationIndex.candidate_average()`), which `test.py`
+checks agrees with this literal version exactly.
 
 ---
 
@@ -604,8 +794,9 @@ No flags. Runs the full regression suite (tokenizer, graph
 construction, generation determinism, Open Mode's vocabulary-as-
 candidates architecture and any-prompt-accepted behavior, IVM
 weighted voting incl. V5 bigram-witness, V6 adjacency, V7
-prev+current co-occurrence, V8 triple witness, and V9 whole-context
-unanimous vote, the co-occurrence gate, the sparse per-token
+prev+current co-occurrence, V8 triple witness, V9 whole-context
+unanimous vote, and V10 noise-cancellation wiring (lazy attach, no
+stale data after a merge/retrain/reload), the co-occurrence gate, the sparse per-token
 score cache, Cluster Interpreter, zero-cluster mining, Token
 Importance analysis, Context Trigger Matrix, incremental training,
 large-corpus pipeline, save/load round-trips) and prints a final
@@ -718,7 +909,19 @@ python3 train.py --continue-from runs/model --corpus more_data.txt \
   `model.open_ctm.enable_cache(model.all_candidate_tokens())` (or
   `analyse.py cache on` / `chat.py`'s `/cache on`) once per session
   if you want it. It only covers V1/V2/V3/V4/V6 (see section 8); V5,
-  V7, and V8 are always computed live, cached or not.
+  V7, V8, V9, and V10 are always computed live, cached or not.
+- **V10 (noise) is attached lazily and scales with corpus size.** Nothing
+  noise-related is built at train/merge/load time; the first Open Mode
+  call (`generate`, `explain_step`, `open_mode_candidate_scores` — so
+  also `chat.py`, `server.py`, `analyse.py open-scores`) builds
+  `model.token_vocab` and attaches it to `model.open_ctm`, and
+  `train_incremental()`/retraining drop it so it can't go stale. Strict
+  Mode never triggers it. Set `IVMConfig.NOISE_WEIGHT = 0` to switch V10
+  off. Its per-token contribution is `NOISE_WEIGHT` × the raw three-stage
+  average (roughly the sentence count for a rare candidate), so on a
+  large corpus the default `0.0001` stops being a small nudge next to
+  V3's 1.0 per token — retune `NOISE_WEIGHT` (or normalize) when you
+  scale up, and check `/scores` to see how much V10 is contributing.
 - **`use_context_triggers=True` only ever changes behavior at a
   genuine tie.** It never overrides a unique, structurally-determined
   answer, and it falls back to the deterministic bigram-frequency

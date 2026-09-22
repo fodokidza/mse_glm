@@ -47,8 +47,10 @@ once at construction (see model.py's all_candidate_tokens()) — not
 narrowed by whether a bigram was ever literally observed. EVERY
 candidate is scored — via `importance_votes.select()` (ivm.py's
 PRIMARY, not legacy, API) — using cluster-membership-derived
-"important" context tokens plus eight other independent vote layers
-(V1-V9, see ivm.py), and the highest scorer wins. This is deterministic
+"important" context tokens plus nine other independent vote layers
+(V1-V10, see ivm.py -- V10 is noise.py's noise-cancellation average,
+attached lazily by model.py on first Open Mode use), and the highest
+scorer wins. This is deterministic
 by construction (ties broken by lowest token id inside select()); if no
 importance_votes object is supplied, or `self.vocab` is empty, the
 fallback is ALSO deterministic — lowest token id in `self.vocab` — never
@@ -225,8 +227,8 @@ class InferenceEngine:
         bigram was ever literally observed — every one of them is
         scored here, this is not a tie-break inserted after some
         other mechanism narrows things down. See ivm.py's
-        select()/score_candidates() for the nine-layer weighted-
-        voting formula (V1-V9; V1/V2/V4 deliberately weighted small
+        select()/score_candidates() for the ten-layer weighted-
+        voting formula (V1-V10; V1/V2/V4/V10 deliberately weighted small
         so they can only nudge a tie V3 left open, never override it;
         V5/V6/V7/V8/V9 peer-weighted with V3, V8/V9 a notch above) and for
         the bigram-frequency →
@@ -263,7 +265,8 @@ class InferenceEngine:
                                  "candidates": candidates, "scores": trace["scores"],
                                  "important_vote": trace.get("important_vote", {}),
                                  "influence_vote": trace.get("influence_vote", {}),
-                                 "context_vote": trace.get("context_vote", {})}
+                                 "context_vote": trace.get("context_vote", {}),
+                                 "noise_vote": trace.get("noise_vote", {})}
         # No CTM/IVM object supplied at all, or `candidates` was
         # somehow empty (can't happen here — _successors already
         # checked nonempty before this method is called). Deterministic
@@ -282,7 +285,7 @@ class InferenceEngine:
         # ── OPEN MODE: candidates are ALWAYS the full vocabulary ───────────
         # No successor gating at all -- self.vocab (set once at construction,
         # see model.all_candidate_tokens()) is the entire candidate universe
-        # every step, scored by IVM's V1-V9 weighted voting (ivm.py). Not an
+        # every step, scored by IVM's V1-V10 weighted voting (ivm.py). Not an
         # opt-in: any engine constructed with mode="open" behaves this way
         # unconditionally. Strict Mode engines never reach this branch.
         if self.mode == "open":

@@ -268,10 +268,10 @@ Two entry points, two different roles:
             BY DESIGN, same rule as V1/V2/V4: it can only ever nudge a
             decision V3 left open, never override one V3 already made.
             Contributes nothing at all if no TokenVocabularyMatrix was
-            ever attached to this instance (see build()/
-            attach_noise_layer()) -- the same "None means zero, not an
-            error" contract this module already applies to Strict
-            Mode's optional add-ons.
+            ever attached to this instance (see attach_noise_layer(),
+            which model.py calls on first Open Mode use) -- the same
+            "None means zero, not an error" contract this module
+            already applies to Strict Mode's optional add-ons.
 
         score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C) + V10(C)
 
@@ -600,6 +600,9 @@ class ImportanceVoteMatrix:
     """
 
     def __init__(self):
+        self._memos = {}        # derived lookup structures (see _memo()) -- never serialized
+        self._ctx_state = None  # last context's accumulated evidence -- see _context_accumulators()
+        self._cand_memo = None  # (source list, len, first, last, sorted list, set) -- see _prepare_candidates()
         self._token_rels = {}   # token -> set(rel_id), from ctm.token_to_relationships
         self._important = set()  # token ids eligible to cast V1/V2 votes under this mode
         self._important_weight = IVMConfig.IMPORTANT_WEIGHT  # V1's per-token weight -- see score_candidates()
@@ -613,10 +616,13 @@ class ImportanceVoteMatrix:
         self._whole_context_weight = IVMConfig.WHOLE_CONTEXT_WEIGHT  # V9's flat weight -- see score_candidates()
         self._noise_weight = IVMConfig.NOISE_WEIGHT  # V10's per-token weight -- see score_candidates()
         # V10's data source (see noise.py's TokenVocabularyMatrix). None
-        # until build() attaches it (or attach_noise_layer() is called
-        # explicitly, e.g. after from_dict()) -- a missing token_vocab
-        # means V10 contributes nothing, not an error, same contract as
-        # Strict Mode's optional context_triggers/importance_votes args.
+        # until attached: by build() when NoiseConfig.EAGER_BUILD is on,
+        # otherwise lazily by model.py's _ensure_noise_layer() on the
+        # first Open Mode inference call (or explicitly via
+        # attach_noise_layer(), e.g. after from_dict()). A bare instance
+        # with no token_vocab means V10 contributes nothing, not an
+        # error, same contract as Strict Mode's optional
+        # context_triggers/importance_votes args.
         self._token_vocab = None
         self._bigram_freq = {}  # (token, candidate) -> count, from bigram_frequencies()
         self._bigram_rels = {}  # (token, candidate) -> set(rel_id), from bigram_relationships()
@@ -701,16 +707,23 @@ class ImportanceVoteMatrix:
     def attach_noise_layer(self, model):
         """
         (Re)attach V10's data source -- noise.py's TokenVocabularyMatrix
-        -- from `model`. build() already calls this automatically, so
-        you only need it yourself after from_dict() (which can't
-        restore _token_vocab on its own -- see to_dict()'s docstring)
-        or if `model`'s graphs changed and you want V10's evidence
-        refreshed without a full rebuild. Reuses model.token_vocab if
-        already built, else builds it fresh (and caches it back onto
-        `model`, same as model.build_token_vocab() would). Returns the
-        attached TokenVocabularyMatrix.
+        -- from `model`. model.py's _ensure_noise_layer() calls this
+        for you on the first Open Mode inference call (and build() does
+        too when NoiseConfig.EAGER_BUILD is on), so you only need it
+        yourself when driving an ImportanceVoteMatrix directly -- e.g.
+        after from_dict() (which can't restore _token_vocab on its own
+        -- see to_dict()'s docstring) or if `model`'s graphs changed and
+        you want V10's evidence refreshed without a full rebuild. Reuses
+        model.token_vocab if already built, else builds it fresh (and
+        caches it back onto `model`, same as model.build_token_vocab()
+        would). Returns the attached TokenVocabularyMatrix.
         """
         if model.token_vocab is None:
+            if model.noise_index is None:
+                # This instance already holds token -> relationship ids from
+                # the same graphs; hand them over instead of re-deriving
+                # them in a second full pass over every triple.
+                model.build_noise_index(token_rels=self._token_rels)
             model.build_token_vocab()
         self._token_vocab = model.token_vocab
         return self._token_vocab
@@ -848,6 +861,179 @@ class ImportanceVoteMatrix:
 
     # ── queries ──────────────────────────────────────────────────────────
 
+    # ── derived lookup structures (speed only -- never change a score) ─────
+    #
+    # score_candidates() runs once per generated token. Several of its
+    # inner loops asked a per-candidate question by building a tuple key
+    # ((t, c), (current, c), (previous, current, c)) for EVERY candidate --
+    # O(vocabulary) allocations per step for answers that are almost
+    # always "no". The helpers below regroup the same underlying data
+    # (_adjacent, _bigram_rels, _triples, _token_rels) by their leading
+    # token(s) once, so a step only touches entries that can actually
+    # vote. Each is rebuilt automatically if the underlying container is
+    # swapped for another object or changes size (test.py hand-builds
+    # instances that way), so they can never serve stale data.
+
+    def _memo(self, key, source, builder):
+        m = self._memos.get(key)
+        if m is not None and m[0] is source and m[1] == len(source):
+            return m[2]
+        value = builder(source)
+        self._memos[key] = (source, len(source), value)
+        return value
+
+    def _adjacent_from(self):
+        """{t: {c, ...}} view of self._adjacent -- 'was t ever immediately
+        followed by c' as one set-membership per (t, c) instead of building
+        a (t, c) tuple for it."""
+        def build(adjacent):
+            out = {}
+            for t, c in adjacent:
+                out.setdefault(t, set()).add(c)
+            return out
+        return self._memo("adjacent_from", self._adjacent, build)
+
+    def _bigrams_from(self):
+        """{a: {b: witness_rels}} view of self._bigram_rels -- only the
+        successors `a` was ever literally seen with."""
+        def build(bigram_rels):
+            out = {}
+            for (a, b), rels in bigram_rels.items():
+                out.setdefault(a, {})[b] = rels
+            return out
+        return self._memo("bigrams_from", self._bigram_rels, build)
+
+    def _triples_from(self):
+        """{(previous, current): {c, ...}} view of self._triples."""
+        def build(triples):
+            out = {}
+            for a, b, c in triples:
+                out.setdefault((a, b), set()).add(c)
+            return out
+        return self._memo("triples_from", self._triples, build)
+
+    def _rel_tokens(self):
+        """{rel_id: {token, ...}} -- the inverse of self._token_rels."""
+        def build(token_rels):
+            out = {}
+            for tok, rels in token_rels.items():
+                for r in rels:
+                    out.setdefault(r, set()).add(tok)
+            return out
+        return self._memo("rel_tokens", self._token_rels, build)
+
+    def _positive_row(self, t, row):
+        """frozenset of {c : row[c] > 0} for context token t's
+        _co_occurring row (rows also carry shared == 0 adjacency-only
+        entries, which must not count as 'knows'), cached per token and
+        re-derived if that row object is ever replaced."""
+        cache = self._memos.setdefault("positive_rows", {})
+        hit = cache.get(t)
+        if hit is not None and hit[0] is row and hit[1] == len(row):
+            return hit[2]
+        pos = frozenset(c for c, shared in row.items() if shared > 0)
+        cache[t] = (row, len(row), pos)
+        return pos
+
+    def _prepare_candidates(self, candidates):
+        """(sorted list, set) for `candidates`. The Open Mode engine hands
+        score_candidates() the very same vocabulary list every step, so for
+        list/tuple input the sort+dedupe is remembered (guarded by object
+        identity, length, and both end elements); anything else -- sets,
+        generators, a caller that rebuilds its list -- is just recomputed."""
+        if isinstance(candidates, (list, tuple)) and candidates:
+            memo = self._cand_memo
+            n = len(candidates)
+            if (memo is not None and memo[0] is candidates and memo[1] == n
+                    and memo[2] == candidates[0] and memo[3] == candidates[-1]):
+                return memo[4], memo[5]
+            ordered = sorted(set(candidates))
+            as_set = set(ordered)
+            self._cand_memo = (candidates, n, candidates[0], candidates[-1], ordered, as_set)
+            return ordered, as_set
+        ordered = sorted(set(candidates))
+        return ordered, set(ordered)
+
+    def _context_accumulators(self, context_set, candidates_set):
+        """
+        Per-candidate evidence from the (non-reserved) context tokens, as
+        exact integer counts, extended incrementally: if the context grew
+        since the previous call (same candidate universe, same underlying
+        data) only the NEW tokens' co-occurrence rows are added; anything
+        else rebuilds from scratch (== the cost of one old-style pass).
+
+        Returns a dict of:
+          n_ctx      {c: how many context tokens co-occurred with c}   (V3 / V10)
+          shared_sum {c: sum of shared-sentence counts}                 (V4)
+          adj_n      {c: how many context tokens were directly followed by c} (V6)
+          imp_n      {c: how many IMPORTANT context tokens know c}      (V1)
+          imp_infl   {c: sum of those tokens' influence}                (V2)
+          knows / influence  {important token: {c: shared}} / {token: count} (trace)
+        The returned dict is a published snapshot: never mutated after this
+        returns. Extending copies first and swaps the new snapshot in with
+        one assignment, so concurrent generations (server.py is threaded)
+        can at worst waste a rebuild -- never see a half-updated state.
+        """
+        important_set = self._important
+        adjacent_from = self._adjacent_from()
+        tokens = {t for t in context_set if t not in RESERVED}
+        st = self._ctx_state
+        reuse = (st is not None
+                 and st["cands"] is candidates_set
+                 and st["co"] is self._co_occurring and st["co_len"] == len(self._co_occurring)
+                 and st["rels"] is self._token_rels and st["rels_len"] == len(self._token_rels)
+                 and st["imp"] is important_set and st["imp_len"] == len(important_set)
+                 and st["adj"] is adjacent_from
+                 and st["tokens"] <= tokens)
+        if reuse:
+            new_tokens = tokens - st["tokens"]
+            if not new_tokens:
+                return st
+            n_ctx, shared_sum, adj_n = dict(st["n_ctx"]), dict(st["shared_sum"]), dict(st["adj_n"])
+            imp_n, imp_infl = dict(st["imp_n"]), dict(st["imp_infl"])
+            knows, influence = dict(st["knows"]), dict(st["influence"])
+        else:
+            new_tokens = tokens
+            n_ctx, shared_sum, adj_n, imp_n, imp_infl = {}, {}, {}, {}, {}
+            knows, influence = {}, {}
+
+        token_rels, co_occurring = self._token_rels, self._co_occurring
+        for t in new_tokens:
+            if not token_rels.get(t):
+                continue
+            row = co_occurring.get(t)
+            if not row:
+                continue
+            is_important = t in important_set
+            t_knows = {} if is_important else None
+            adj_t = adjacent_from.get(t)
+            for c, shared in row.items():
+                if c not in candidates_set:
+                    continue
+                if shared:
+                    n_ctx[c] = n_ctx.get(c, 0) + 1
+                    shared_sum[c] = shared_sum.get(c, 0) + shared
+                    if is_important:
+                        t_knows[c] = shared
+                if adj_t is not None and c in adj_t:
+                    adj_n[c] = adj_n.get(c, 0) + 1
+            if is_important and t_knows:
+                knows[t] = t_knows
+                inf = len(t_knows)
+                influence[t] = inf
+                for c in t_knows:
+                    imp_n[c] = imp_n.get(c, 0) + 1
+                    imp_infl[c] = imp_infl.get(c, 0) + inf
+
+        snapshot = {"cands": candidates_set, "co": co_occurring, "co_len": len(co_occurring),
+                    "rels": token_rels, "rels_len": len(token_rels),
+                    "imp": important_set, "imp_len": len(important_set), "adj": adjacent_from,
+                    "tokens": frozenset(tokens),
+                    "n_ctx": n_ctx, "shared_sum": shared_sum, "adj_n": adj_n,
+                    "imp_n": imp_n, "imp_infl": imp_infl, "knows": knows, "influence": influence}
+        self._ctx_state = snapshot
+        return snapshot
+
     def important_tokens_in(self, context_tokens):
         """Sorted subset of context_tokens that count as important."""
         return sorted(t for t in context_tokens
@@ -962,11 +1148,39 @@ class ImportanceVoteMatrix:
         votes = Counter()
         if current is None:
             return dict(votes)
-        for c in candidates:
+        if isinstance(candidates, (set, frozenset)):
+            # Fast path (score_candidates always passes a set): only the
+            # successors `current` was ever literally seen with can vote at
+            # all, so walk those instead of every candidate.
+            succ = self._bigrams_from().get(current)
+            if not succ:
+                return dict(votes)
+            items = [(c, rels) for c, rels in succ.items() if c in candidates]
+        else:
+            items = [(c, self._bigram_rels.get((current, c))) for c in candidates]
+        ctx_set = context_tokens if isinstance(context_tokens, (set, frozenset)) else None
+        rel_tokens = None
+        for c, witness_rels in items:
             if c in RESERVED:
                 continue
-            witness_rels = self._bigram_rels.get((current, c))
             if not witness_rels:
+                continue
+            if ctx_set is not None and len(witness_rels) * 4 < len(ctx_set):
+                # Few witnessing sentences, many context tokens: gather the
+                # tokens that appear in those sentences once and intersect
+                # with the context, instead of intersecting every context
+                # token's relationship set with witness_rels. Same count
+                # (a token votes iff it shares a witnessing sentence; not
+                # reserved, not c itself).
+                if rel_tokens is None:
+                    rel_tokens = self._rel_tokens()
+                pool = set()
+                for r in witness_rels:
+                    pool |= rel_tokens.get(r, ())
+                voters = (pool & ctx_set) - RESERVED
+                voters.discard(c)
+                if voters:
+                    votes[c] += float(len(voters))
                 continue
             for t in context_tokens or []:
                 if t in RESERVED or t == c:
@@ -1046,6 +1260,19 @@ class ImportanceVoteMatrix:
         shared_pc = rels_prev & rels_curr
         if not shared_pc:
             return dict(votes)
+        if isinstance(candidates, (set, frozenset)) and len(shared_pc) * 4 < len(candidates):
+            # Few shared sentences: the only tokens that can vote are the ones
+            # appearing in them, so read those off directly rather than
+            # intersecting every candidate's relationship set with shared_pc.
+            rel_tokens = self._rel_tokens()
+            pool = set()
+            for r in shared_pc:
+                pool |= rel_tokens.get(r, ())
+            for c in pool & candidates:
+                if c in RESERVED or c == previous or c == current:
+                    continue
+                votes[c] += 1.0
+            return dict(votes)
         for c in candidates:
             if c in RESERVED or c == previous or c == current:
                 continue
@@ -1079,6 +1306,11 @@ class ImportanceVoteMatrix:
         if previous is None or current is None:
             return dict(votes)
         if previous in RESERVED or current in RESERVED:
+            return dict(votes)
+        if isinstance(candidates, (set, frozenset)):
+            for c in self._triples_from().get((previous, current), ()):
+                if c in candidates and c not in RESERVED and c != previous and c != current:
+                    votes[c] += 1.0
             return dict(votes)
         for c in candidates:
             if c in RESERVED or c == previous or c == current:
@@ -1121,6 +1353,31 @@ class ImportanceVoteMatrix:
         required_all = [t for t in (context_tokens or []) if t not in RESERVED]
         if not required_all:
             return dict(votes)
+        if isinstance(candidates, (set, frozenset)):
+            # Set form of the same test: c is unanimous iff, for EVERY required
+            # token t other than c itself, c is in t's positive row. That is
+            # c in the intersection of (positive_row(t) | {t}) over all t
+            # (t == c is exempt), minus the case where c is the only required
+            # token (nobody left to vouch -> no vote, as below).
+            distinct = set(required_all)
+            pools = []
+            for t in distinct:
+                row = self._co_occurring.get(t)
+                pos = self._positive_row(t, row) if row else frozenset()
+                pools.append(pos | {t})
+            pools.sort(key=len)
+            unanimous = set(pools[0])
+            for pool in pools[1:]:
+                unanimous &= pool
+                if not unanimous:
+                    break
+            for c in unanimous & candidates:
+                if c in RESERVED:
+                    continue
+                if distinct == {c}:
+                    continue
+                votes[c] += 1.0
+            return dict(votes)
         for c in candidates:
             if c in RESERVED:
                 continue
@@ -1131,7 +1388,7 @@ class ImportanceVoteMatrix:
                 votes[c] += 1.0
         return dict(votes)
 
-    def _noise_vote(self, context_tokens, candidates):
+    def _noise_vote(self, context_tokens, candidates, counts=None):
         """
         V10: noise-cancellation vote (see noise.py). For each
         candidate C, sum every context token's PRECOMPUTED
@@ -1145,8 +1402,8 @@ class ImportanceVoteMatrix:
         follow for a token _token_rels has nothing on.
 
         Returns {} immediately if no TokenVocabularyMatrix has been
-        attached to this instance yet (see build()/
-        attach_noise_layer()) -- V10 contributing nothing is not an
+        attached to this instance yet (see attach_noise_layer()/
+        model.py's _ensure_noise_layer()) -- V10 contributing nothing is not an
         error, same contract every other opt-in signal in this module
         follows.
 
@@ -1159,6 +1416,16 @@ class ImportanceVoteMatrix:
         """
         if self._token_vocab is None:
             return {}
+        if counts is not None:
+            # Fast path (what score_candidates() uses). A candidate's noise
+            # score is the same in every context token's row (see
+            # noise.py's NoiseCancellationIndex.candidate_stages()), so
+            # summing the context tokens' rows is just that score times
+            # HOW MANY context tokens have the candidate in their row --
+            # exactly V3's raw per-candidate count. No per-token row (each
+            # up to vocabulary size) is ever built or walked.
+            return self._token_vocab.weighted_counts(
+                {c: n for c, n in counts.items() if c in candidates})
         candidates = set(candidates)
         combined = self._token_vocab.combine(
             t for t in (context_tokens or []) if t not in RESERVED)
@@ -1442,13 +1709,12 @@ class ImportanceVoteMatrix:
         back to the live path -- never a wrong answer, just not the
         fast one.
         """
-        candidates = sorted(set(candidates))
-        candidates_set = set(candidates)
+        candidates, candidates_set = self._prepare_candidates(candidates)
         context_tokens = context_tokens or []
         context_set = set(context_tokens)
         important = self.important_tokens_in(context_tokens)
         use_cache = (self._use_cache and self._cache_candidates is not None
-                     and self._cache_candidates == frozenset(candidates))
+                     and self._cache_candidates == candidates_set)
 
         if use_cache:
             knows = {}
@@ -1486,6 +1752,32 @@ class ImportanceVoteMatrix:
             context_vote = {c: self._context_weight * v for c, v in raw_context_vote.items()}
             context_influence_vote = dict(context_influence_vote)
             adjacency_vote = {c: self._adjacency_weight * v for c, v in raw_adjacency_vote.items()}
+        elif isinstance(context_tokens, (set, frozenset)):
+            # INCREMENTAL path -- what generation actually takes (model.py /
+            # inference.py always pass set(ids)). The live pass below walks
+            # EVERY context token's whole co-occurrence row on EVERY step
+            # (cost ~ |context| x row size, growing as the reply grows) even
+            # though only one token was added since the last step.
+            # _context_accumulators() keeps the per-candidate evidence
+            # (as exact integer counts) for the context it last saw and only
+            # adds the rows of tokens that are NEW; the weights are applied
+            # here, once, on the finished counts. Same evidence, same
+            # weights, same layers -- V1/V2/V4 are now weight x exact
+            # integer total instead of a float built by repeated addition in
+            # whatever order the context set happened to iterate, so they
+            # can differ from the old value in the last bit (and no longer
+            # depend on set iteration order at all).
+            acc = self._context_accumulators(context_set, candidates_set)
+            knows = dict(acc["knows"])
+            influence = dict(acc["influence"])
+            raw_context_vote = acc["n_ctx"]          # published state: read-only here
+            raw_adjacency_vote = acc["adj_n"]
+            ci_weight = self._context_influence_weight
+            context_vote = {c: self._context_weight * n for c, n in raw_context_vote.items()}
+            context_influence_vote = {c: ci_weight * n for c, n in acc["shared_sum"].items()}
+            adjacency_vote = {c: self._adjacency_weight * n for c, n in raw_adjacency_vote.items()}
+            important_vote = {c: self._important_weight * n for c, n in acc["imp_n"].items()}
+            influence_vote = {c: self._influence_weight * n for c, n in acc["imp_infl"].items()}
         else:
             # SINGLE merged pass for V1/V2/V3/V4/V6 -- the previous version
             # called _knows_rels() (for V1/V2, important tokens only), then
@@ -1521,6 +1813,8 @@ class ImportanceVoteMatrix:
             raw_adjacency_vote = Counter()
             context_influence_vote = Counter()
             important_set = self._important
+            adjacent_from = self._adjacent_from()
+            ci_weight = self._context_influence_weight
 
             for t in context_tokens:
                 if t in RESERVED:
@@ -1541,16 +1835,23 @@ class ImportanceVoteMatrix:
                 row = self._co_occurring.get(t)
                 if not row:
                     continue
+                # Same additions, in the same per-candidate order, as the
+                # Counter `+=` / `(t, c) in self._adjacent` version this
+                # replaces (so every float sum is bit-identical) -- just
+                # without a __missing__ call and a fresh (t, c) tuple per
+                # element.
+                adj_t = adjacent_from.get(t)
                 for c, shared in row.items():
                     if c not in candidates_set:
                         continue
                     if shared:
-                        raw_context_vote[c] += 1.0
-                        context_influence_vote[c] += self._context_influence_weight * shared
+                        raw_context_vote[c] = raw_context_vote.get(c, 0) + 1.0
+                        context_influence_vote[c] = (context_influence_vote.get(c, 0)
+                                                     + ci_weight * shared)
                         if is_important:
                             t_knows[c] = shared
-                    if (t, c) in self._adjacent:
-                        raw_adjacency_vote[c] += 1.0
+                    if adj_t is not None and c in adj_t:
+                        raw_adjacency_vote[c] = raw_adjacency_vote.get(c, 0) + 1.0
                 if is_important and t_knows:
                     knows[t] = t_knows
                     influence[t] = len(t_knows)
@@ -1635,18 +1936,26 @@ class ImportanceVoteMatrix:
         # gate_candidates never drops a candidate that could have
         # scored nonzero here anyway. Contributes nothing (not an
         # error) if no TokenVocabularyMatrix was ever attached -- see
-        # build()/attach_noise_layer().
-        raw_noise_vote = self._noise_vote(context_tokens, gate_candidates)
+        # attach_noise_layer()/model.py's _ensure_noise_layer().
+        raw_noise_vote = self._noise_vote(context_tokens, gate_candidates,
+                                          counts=raw_context_vote)
         noise_vote = {c: self._noise_weight * v for c, v in raw_noise_vote.items()}
 
-        final_scores = {
-            c: important_vote.get(c, 0) + influence_vote.get(c, 0)
-               + context_vote.get(c, 0) + context_influence_vote.get(c, 0)
-               + bigram_witness_vote.get(c, 0) + adjacency_vote.get(c, 0)
-               + prev_current_vote.get(c, 0) + triple_vote.get(c, 0)
-               + whole_context_vote.get(c, 0) + noise_vote.get(c, 0)
-            for c in candidates
-        }
+        # Sparse accumulation: start every candidate at 0 and add each layer
+        # only where it actually has an entry, in the SAME left-to-right layer
+        # order the old per-candidate `a.get(c, 0) + b.get(c, 0) + ...`
+        # expression used. Adding a missing layer's 0 never changes a float,
+        # so every score is bit-identical -- but the cost is proportional to
+        # the votes cast instead of ten dict lookups for each of the
+        # (vocabulary-sized) candidates.
+        final_scores = dict.fromkeys(candidates, 0)
+        for layer in (important_vote, influence_vote, context_vote,
+                      context_influence_vote, bigram_witness_vote,
+                      adjacency_vote, prev_current_vote, triple_vote,
+                      whole_context_vote, noise_vote):
+            for c, v in layer.items():
+                if c in final_scores:
+                    final_scores[c] += v
 
         return {"important_tokens": important, "knows": knows,
                 "influence": influence,
@@ -1678,7 +1987,7 @@ class ImportanceVoteMatrix:
         score_candidates), with a three-stage deterministic tie-break
         cascade when the combined score itself doesn't discriminate:
 
-            1. score (V1..V9)       -- primary, structural + contextual
+            1. score (V1..V10)      -- primary, structural + contextual
             2. bigram frequency     -- how often `candidate` literally
                                         followed `current` (requires
                                         `current`; skipped if not given)

@@ -148,7 +148,7 @@ def _startup(argv=None):
 # exposes: Strict Mode gates every step to literal training bigrams
 # (a two-stage lineage vote, tie-broken deterministically); Open Mode
 # has no successor gating at all -- candidates are the ENTIRE
-# vocabulary every step, chosen by IVM's nine-layer weighted voting
+# vocabulary every step, chosen by IVM's ten-layer weighted voting
 # (see ivm.py) rather than by whether a bigram was ever literally
 # observed.
 
@@ -161,7 +161,7 @@ MODE_PRESETS = {
 # Two OPTIONAL, read-only diagnostic endpoints sit alongside the mode
 # presets above -- neither mutates session state:
 #   /scores, /bigram (new routes below) -- read-only audit endpoints,
-#       not generation. /scores exposes the full V1-V9 weighted-vote
+#       not generation. /scores exposes the full V1-V10 weighted-vote
 #       breakdown IVM used to pick the next token (see ivm.py);
 #       /bigram exposes the raw evidence counts (including V5's
 #       literal witness-sentence count) for one (prev, curr) pair.
@@ -1562,7 +1562,7 @@ def mode_route():
 def scores():
     """
     Open Mode only, read-only, stateless (no session_id, no history
-    mutation) -- the full V1-V9 weighted-vote breakdown IVM used (or
+    mutation) -- the full V1-V10 weighted-vote breakdown IVM used (or
     would use) to pick the next token for `prompt` (see ivm.py's
     score_candidates()/select()). Mirrors chat.py's /scores REPL
     command and analyse.py's `open-scores` CLI subcommand.
@@ -1571,10 +1571,10 @@ def scores():
     Always scores the entire vocabulary -- Open Mode has no successor
     gating at all, so there is no narrower option anymore.
 
-    "scores" is the FINAL combined score -- the sum of ALL NINE
+    "scores" is the FINAL combined score -- the sum of ALL TEN
     layers (important_vote/influence_vote/context_vote/
     context_influence_vote/bigram_witness_vote/adjacency_vote/
-    prev_current_vote/triple_vote/whole_context_vote), each also
+    prev_current_vote/triple_vote/whole_context_vote/noise_vote), each also
     returned separately so the breakdown stays auditable. Don't
     expect the first four to sum to "scores" on their own --
     bigram_witness_vote (V5), adjacency_vote (V6), prev_current_vote
@@ -1591,7 +1591,10 @@ def scores():
     trained triple (stricter than V7 -- requires that exact order and
     adjacency, not just shared presence in a sentence), V9 whenever
     EVERY non-reserved context token, not just one, knows the
-    candidate at all (the strictest of the nine).
+    candidate at all (the strictest of the first nine). noise_vote (V10)
+    is noise.py's averaged noise-cancellation score summed over the
+    context tokens, weighted small; it is attached automatically on the
+    first Open Mode request (no build step).
 
     "cache_used" reports whether this breakdown was actually served
     from Open Mode's opt-in sparse V1/V2/V3/V4/V6 score cache (see
@@ -1753,7 +1756,7 @@ def main():
     print(f"    POST /generate")
     print(f"    POST /stream")
     print(f"    POST /mode")
-    print(f"    POST /scores   (Open Mode only -- full V1-V9 breakdown for a prompt)")
+    print(f"    POST /scores   (Open Mode only -- full V1-V10 breakdown for a prompt)")
     print(f"    POST /bigram   (raw bigram evidence incl. V5 witness_sentences)")
     print(f"    POST /cache    (toggle/inspect the sparse V1/V2/V3/V4/V6 score cache)")
     print(f"    POST /reset")
