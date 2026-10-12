@@ -91,6 +91,35 @@ class NoiseConfig:
     INFERENCE_WEIGHT when it adds it to ivm's score at inference."""
     INFERENCE_WEIGHT = 0.5
 
+    # Which of noise.py's four stages are ACTIVE. Flip any to False to switch
+    # that stage off:
+    #   stage1  literal sentence membership
+    #   stage2  sentence-global knowledge
+    #   stage3  token-global (deduped) knowledge
+    #   stage4  shared-knowledge attention
+    # A disabled stage is never computed (so turning off stage4 also skips
+    # building its whole-corpus tables), its raw value is 0 everywhere, and it
+    # is left out of the final average: final = mean of the ENABLED stages'
+    # percentages, so final stays on the same 0-100 scale whichever subset is on.
+    # If every stage is disabled, noise's final score is 0 for every candidate
+    # (i.e. noise contributes nothing and ivm decides alone).
+    #
+    # Read at call time (NoiseConfig.enabled_stages()), not copied at import.
+    # Cached rows are NOT recomputed if you change this mid-session: rebuild
+    # model.token_vocab / model.noise_index (or restart) after changing it.
+    STAGES_ENABLED = {
+        "stage1": True,
+        "stage2": True,
+        "stage3": True,
+        "stage4": False,
+    }
+
+    @classmethod
+    def enabled_stages(cls):
+        """Tuple of enabled stage keys, always in stage1..stage4 order."""
+        return tuple(k for k in ("stage1", "stage2", "stage3", "stage4")
+                     if cls.STAGES_ENABLED.get(k, False))
+
 
 class ScoresDisplayConfig:
     """

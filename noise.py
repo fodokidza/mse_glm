@@ -72,6 +72,10 @@ final is always an average over four. This final is THE noise score generation u
 TokenVocabularyMatrix.combine_final_score() and model.noise_final_scores()). One word on its
 own is the same thing with a single row.
 
+STAGE SWITCHES: config.NoiseConfig.STAGES_ENABLED turns each of the four stages on/off. A
+disabled stage is not computed, reads 0, and is dropped from the final average (the divisor
+becomes the number of enabled stages, not 4). Default: all four on, i.e. unchanged behavior.
+
 MIXING WEIGHT: noise has no internal weight. model.py scales the final by
 config.NoiseConfig.INFERENCE_WEIGHT when it adds it to ivm's score.
 
@@ -85,7 +89,7 @@ knowing-mask is cached), stage 4 is closed-form from corpus-wide co-occurrence c
 for. Nothing is built at train time.
 """
 
-from config import RESERVED, EOS, WORD_BOUND
+from config import RESERVED, EOS, WORD_BOUND, NoiseConfig
 
 _STRUCTURAL = RESERVED | {EOS}
 
@@ -194,13 +198,18 @@ class NoiseCancellationIndex:
         block comment above. Symmetric: pair_stages(a, c) == pair_stages(c, a). Both tokens must
         be tokens of the corpus; a token with no sentences simply knows nothing.
         """
+        en = NoiseConfig.enabled_stages()
         n = self._n_rels
-        ra = self.token_rels.get(anchor) or frozenset()
-        rc = self.token_rels.get(cand) or frozenset()
-        stage1 = n - (len(ra) + len(rc) - len(ra & rc))
-        stage2 = n - _popcount(self.knowing_mask(anchor) | self.knowing_mask(cand))
-        ga, gc = self.global_reach(anchor), self.global_reach(cand)
-        stage3 = len(self._vocab_all()) - (len(ga) + len(gc) - len(ga & gc))
+        stage1 = stage2 = stage3 = 0     # a disabled stage is never computed: it stays 0
+        if "stage1" in en:
+            ra = self.token_rels.get(anchor) or frozenset()
+            rc = self.token_rels.get(cand) or frozenset()
+            stage1 = n - (len(ra) + len(rc) - len(ra & rc))
+        if "stage2" in en:
+            stage2 = n - _popcount(self.knowing_mask(anchor) | self.knowing_mask(cand))
+        if "stage3" in en:
+            ga, gc = self.global_reach(anchor), self.global_reach(cand)
+            stage3 = len(self._vocab_all()) - (len(ga) + len(gc) - len(ga & gc))
         return stage1, stage2, stage3
 
     def stage4_tables(self):
@@ -657,11 +666,12 @@ def _focus_rows(model, anchor, weight_mode="count"):
     for cand in candidates:
         stage1, stage2, stage3 = idx.pair_stages(anchor, cand)
         rows[cand] = {"stage1": stage1, "stage2": stage2, "stage3": stage3, "stage4": 0}
-    for cand, weight in _stage4_by_id(model, idx, anchor, homes, weight_mode).items():
-        entry = rows.get(cand)
-        if entry is None:
-            entry = rows[cand] = {"stage1": 0, "stage2": 0, "stage3": 0, "stage4": 0}
-        entry["stage4"] = weight
+    if "stage4" in NoiseConfig.enabled_stages():   # disabled -> skip the whole stage-4 computation
+        for cand, weight in _stage4_by_id(model, idx, anchor, homes, weight_mode).items():
+            entry = rows.get(cand)
+            if entry is None:
+                entry = rows[cand] = {"stage1": 0, "stage2": 0, "stage3": 0, "stage4": 0}
+            entry["stage4"] = weight
     return homes, rows
 
 
@@ -1030,7 +1040,7 @@ def _shared_attention_literal(model, anchor_word, agg="sum", weight_mode="count"
     return {"anchor": anchor_word, "homes": homes, "scores": scores}
 
 
-def normalize_row(scores):
+def normalize_row(scores, stages=None):
     """
     Turn one query's raw {candidate: {"stage1","stage2","stage3","stage4"}}
     dict (from focus_scores_detailed() or combine_context_detailed())
@@ -1060,17 +1070,25 @@ def normalize_row(scores):
     a candidate scored by only some stages is averaged over four, not
     over however many it happens to have.
 
+    STAGE SWITCHES: `stages` is the tuple of stage keys that count toward "final"
+    (default: config.NoiseConfig.enabled_stages()). "final" is then the average over
+    ENABLED stages only -- sum / len(stages) instead of / 4 -- so it stays on a 0-100
+    scale. A disabled stage is reported as 0.0 and does not count. With no enabled
+    stage, "final" is 0.0 for everyone.
+
     Returns a new dict, same shape as `scores`, values replaced by
     percentages (0-100, not fractions), plus "final". There is no
     stage1-3 "average" field.
     """
     keys = ("stage1", "stage2", "stage3", "stage4")
-    totals = {k: sum(info.get(k, 0) for info in scores.values()) for k in keys}
+    enabled = tuple(stages) if stages is not None else NoiseConfig.enabled_stages()
+    totals = {k: (sum(info.get(k, 0) for info in scores.values()) if k in enabled else 0)
+              for k in keys}
     out = {}
     for cand, info in scores.items():
         row = {k: (info.get(k, 0) / totals[k] * 100) if totals[k] else 0.0
                for k in keys}
-        row["final"] = sum(row[k] for k in keys) / 4
+        row["final"] = (sum(row[k] for k in enabled) / len(enabled)) if enabled else 0.0
         out[cand] = row
     return out
 
