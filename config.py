@@ -1,3 +1,4 @@
+
 """
 config.py — single source of truth for every tunable constant in
 MSE-GLM: reserved token ids, IVM vote weights, default vocab/generation
@@ -18,7 +19,7 @@ important_weight=0.2)`); this file only fixes what a caller gets if
 they don't.
 """
 
-# ── Reserved / special token ids ────────────────────────────────────
+# ==== Reserved / special token ids ================================
 # Shared by tokenizer.py (which owns encode/decode), ctm.py/ivm.py
 # (which exclude these ids from every vote layer), and inference.py
 # (EOS as the termination sentinel). One definition, everyone else
@@ -72,87 +73,23 @@ class TokenizerConfig:
 
 
 class IVMConfig:
-    """Default weights for ivm.py's ten vote layers (V1-V10) -- see
-    ivm.py's module docstring for what each one means. important_weight,
-    influence_weight, and context_influence_weight are deliberately
-    smaller than context_weight BY DESIGN (see that docstring); if you
-    retune these, that ratio is a property you need to preserve
-    yourself, not something enforced automatically."""
-    IMPORTANT_WEIGHT = 0.4            # V1
-    INFLUENCE_WEIGHT = 0.0           # V2
-    CONTEXT_WEIGHT = 1.0              # V3
-    CONTEXT_INFLUENCE_WEIGHT = 0.0   # V4
-    BIGRAM_WITNESS_WEIGHT = 0.7       # V5
-    ADJACENCY_WEIGHT = 0.6            # V6
-    PREV_CURRENT_WEIGHT = 1.7         # V7
-    TRIPLE_WEIGHT = 2.0                # V8 -- see ivm.py; peer-weighted
-                                        # with V5/V6/V7 (independently
-                                        # strong, literal evidence), set
-                                        # a notch above them since it is
-                                        # the single strictest, most
-                                        # literal check of the eight:
-                                        # an exact trained (previous,
-                                        # current, candidate) triple.
-    WHOLE_CONTEXT_WEIGHT = 2.5         # V9 -- see ivm.py; UNANIMOUS
-                                        # agreement across every token
-                                        # currently in context, not just
-                                        # one (V3's question). Set above
-                                        # V8: unanimity gets strictly
-                                        # harder to satisfy as context
-                                        # grows, so when it does fire on
-                                        # a non-trivial context it is at
-                                        # least as specific as a single
-                                        # exact triple match, and it
-                                        # cannot fire at all unless V3
-                                        # already fired for every one of
-                                        # those tokens (see ivm.py's
-                                        # _whole_context_vote).
-    NOISE_WEIGHT = 0.0001               # V10 -- see ivm.py/noise.py.
-                                        # Magnitude-based, like V2/V4 --
-                                        # a noise-cancellation score is a
-                                        # SUM of per-home "other sentences
-                                        # that don't already know this
-                                        # candidate" counts (see noise.py),
-                                        # so its raw scale grows with
-                                        # corpus size and how many homes a
-                                        # context token has, unlike the
-                                        # bounded 0/1 layers (V3/V5/V6/V7/
-                                        # V8/V9). Kept small BY DESIGN, same
-                                        # rule as V1/V2/V4: it can only ever
-                                        # nudge a decision V3 left open,
-                                        # never override one V3 already made.
+    """Default mix weights for ivm.py's two SCORED questions, Q1 (co-occurrence)
+    and Q2 (witnessed legal bigram) -- see ivm.py's module docstring. Each
+    question's evidence is first normalized to a percentage over all
+    candidates, so these are MIX weights, not count scales. Q3/Q4 (legality
+    checks) carry no weight: they gate who may be picked, they don't score."""
+    Q1_WEIGHT = 0.5
+    Q2_WEIGHT = 0.0003
+    # How many of the top-scored candidates Q3/Q4 may work on. None = ALL of
+    # them; a positive int N = only the top N (ties at the cut-off stay in).
+    # If none of the window is a legal continuation the winner is <EOS>.
+    LEGALITY_TOP_K = None
 
 
 class NoiseConfig:
-    """
-    Whether ImportanceVoteMatrix.build() (see ivm.py) should EAGERLY
-    force-build model.token_vocab -- noise.py's TokenVocabularyMatrix,
-    V10's data source, covering the ENTIRE vocabulary -- every single
-    time an IVM gets built. And an IVM gets built on every train(),
-    train_incremental(), merge, and load(), via _rebuild_open_engine()
-    (see model.py) -- whether or not V10 (or /noise, /focus, /row,
-    /combine, or their server.py/analyse.py equivalents) is ever
-    actually going to be used this session.
-
-    Building it touches every (token, home) pair in the corpus once
-    (see noise.py's TokenVocabularyMatrix.build()) -- on a real corpus
-    this was measured taking as long as the REST of training put
-    together, paid by every caller regardless of whether they wanted
-    V10 at all. OFF by default: nothing is built at train/merge/load
-    time. Instead model.py's _ensure_noise_layer() attaches V10's
-    data source lazily, once, at the top of the first Open Mode
-    inference call (generate(mode="open"), explain_step(),
-    open_mode_candidate_scores() -- and therefore chat.py, server.py
-    and analyse.py's open-scores), caching it on the model from then
-    on (see model.token_vocab); a Strict-Mode-only session never
-    pays for it. (A bare ImportanceVoteMatrix driven directly, without
-    going through the model, still contributes 0 for V10 until
-    ivm.attach_noise_layer(model) is called -- see ivm.py's
-    _noise_vote().) Set True to instead attach it during every
-    IVM build, as before.
-    """
-    EAGER_BUILD = False
-    VOTE_WEIGHT = 1
+    """noise.py has no internal weight. model.py scales noise's final score by
+    INFERENCE_WEIGHT when it adds it to ivm's score at inference."""
+    INFERENCE_WEIGHT = 0.5
 
 
 class ScoresDisplayConfig:

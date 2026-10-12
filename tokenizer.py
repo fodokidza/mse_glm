@@ -419,7 +419,7 @@ class CharWordTokenizer:
         """
         return max(self.chars.max_id, max(self.words.token_to_id.values(), default=0)) + 1
 
-    # ---------------------------------------------------------------- train
+    # =================================================================== train
     def train(self, corpus: str):
         """
         Stage 1 first (every character across every word), then stage
@@ -548,7 +548,7 @@ class CharWordTokenizer:
                 word_freq[w] += 1
         return self.extend_vocab_from_word_freq(word_freq, target_vocab_size)
 
-    # ------------------------------------------------------------- encode
+    # ============================================================ encode
     def _encode_word(self, word):
         """
         One word -> a LIST of one or more token ids -- one id whenever
@@ -668,7 +668,7 @@ class CharWordTokenizer:
                 out += " " + w
         return out
 
-    # ------------------------------------------------------------ persist
+    # =============================================================== persist
     @property
     def vocab_size_actual(self):
         """

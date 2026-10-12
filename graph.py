@@ -124,6 +124,32 @@ class BridgeMatrix:
         self._cluster_members = None
         self._cluster_axis_cache = None  # cluster_id -> (axis, members), same lifetime
 
+        # Persistent, content-keyed clustering state -- lets
+        # merge_incremental() (below) extend the graph without redoing
+        # the full dual-axis clustering pass over every triple on
+        # every merge. None until first populated (by build() or, for
+        # a matrix that came from from_dict(), lazily on first
+        # merge_incremental() call); never touched by anything else,
+        # so it can't silently go stale.
+        #   _cluster_of : {(source,target,bridge): cluster_id}
+        #   _axis_of    : {(source,target,bridge): "bridge"|"target"}
+        #                 (only present for entries with cluster_id != 0;
+        #                 records WHICH axis a triple currently owes its
+        #                 cluster to, so a later merge can tell "won via
+        #                 the dominant bridge axis, never revert" apart
+        #                 from "via the target axis, revertible if the
+        #                 bridge axis later reclaims a groupmate" -- see
+        #                 merge_incremental()'s docstring)
+        #   _groups_by_st / _groups_by_sb : same grouping build() uses,
+        #                 kept keyed by triple CONTENT (not row index,
+        #                 which shifts every merge) so it stays valid
+        #                 across merges without remapping.
+        self._cluster_of = None
+        self._axis_of = None
+        self._groups_by_st = None
+        self._groups_by_sb = None
+        self._next_cluster = 1
+
     def _ensure_cluster_index(self):
         """
         Build (once) a cluster_id -> [triple_idx, ...] index, so
@@ -202,6 +228,33 @@ class BridgeMatrix:
                 t_index[t].add(c)
         self.t_index = {k: sorted(v) for k, v in t_index.items()}
 
+        # A from-scratch build already computed groups_by_st/groups_by_sb
+        # and next_cluster above -- reuse them directly (content-keyed,
+        # so a later merge_incremental() can extend them) instead of
+        # paying _rebuild_persistent_state()'s equivalent extra scan.
+        self._cluster_of = dict(zip(triples, cluster_id))
+        self._axis_of = {}
+        for key, idxs in groups_by_st.items():
+            if len(idxs) > 1:
+                for i in idxs:
+                    self._axis_of[triples[i]] = "bridge"
+        # Anything else with a nonzero cluster_id can only have gotten
+        # it from the target/SB pass (those are the only two ways a
+        # triple's cluster_id becomes nonzero) -- NOT
+        # `all(cluster_id[i] == 0 for i in idxs)` re-evaluated here,
+        # since cluster_id was already mutated by that same SB pass
+        # above and would make this condition vacuously false for
+        # every genuinely SB-clustered group.
+        for i, c in enumerate(cluster_id):
+            if c != 0 and triples[i] not in self._axis_of:
+                self._axis_of[triples[i]] = "target"
+        self._groups_by_st = defaultdict(set)
+        self._groups_by_sb = defaultdict(set)
+        for (s, t, b) in triples:
+            self._groups_by_st[(s, t)].add((s, t, b))
+            self._groups_by_sb[(s, b)].add((s, t, b))
+        self._next_cluster = next_cluster
+
     def triples_from_source(self, source: int):
         if source < 0 or source + 1 >= len(self.index):
             return []
@@ -229,6 +282,178 @@ class BridgeMatrix:
                 result = (None, members)
         self._cluster_axis_cache[cluster_id] = result
         return result
+
+    def _rebuild_persistent_state(self):
+        """
+        (Re)derive _cluster_of/_axis_of/_groups_by_st/_groups_by_sb/
+        _next_cluster from the current source/target/bridge/cluster_id
+        arrays. Only needed for a matrix that reached this point via
+        from_dict() (a fresh load never populates this state) -- a
+        matrix that came from build() already has it, and every
+        merge_incremental() call keeps it up to date itself. Paid at
+        most once per loaded model (the first merge_incremental() call
+        after a load), not once per merge.
+        """
+        self._cluster_of = {}
+        self._groups_by_st = defaultdict(set)
+        self._groups_by_sb = defaultdict(set)
+        max_cluster = 0
+        clustered = []
+        for s, t, b, c in zip(self.source, self.target, self.bridge, self.cluster_id):
+            entry = (s, t, b)
+            self._cluster_of[entry] = c
+            self._groups_by_st[(s, t)].add(entry)
+            self._groups_by_sb[(s, b)].add(entry)
+            if c:
+                max_cluster = max(max_cluster, c)
+                clustered.append((entry, c))
+        self._axis_of = {}
+        seen_clusters = set()
+        for entry, c in clustered:
+            if c in seen_clusters:
+                continue
+            seen_clusters.add(c)
+            axis, members = self.cluster_axis(c)
+            for m in members:
+                self._axis_of[m] = axis
+        self._next_cluster = max_cluster + 1
+
+    def merge_incremental(self, new_triples, vocab_size: int):
+        """
+        Extend the graph with new_triples (an iterable of (source,
+        target, bridge) tuples) WITHOUT rerunning the dual-axis
+        clustering pass over every triple seen so far -- only the
+        (source,target)/(source,bridge) groups actually touched by a
+        genuinely new triple are reprocessed. Replaces build()'s
+        "recompute everything from the merged set" approach for the
+        incremental-training/large-corpus path (see model.py's
+        _merge_graphs), which is what made batch N of a batched corpus
+        train cost roughly proportional to the TOTAL corpus seen so
+        far rather than just batch N's own size.
+
+        Why touching only the affected groups is enough: a group's
+        cluster assignment is a pure function of that group's OWN
+        current members (see build()'s docstring for the dual-axis
+        rule) -- nothing else. A (source,target)/(source,bridge) group
+        that gains no new member this call has the exact same members
+        it had before, so its assignment is provably unchanged and
+        doesn't need reprocessing.
+
+        One real subtlety this handles: the bridge axis (source,target)
+        is dominant over the target axis (source,bridge) -- a
+        from-scratch build() always runs the bridge-axis pass over the
+        WHOLE merged set before the target-axis pass even starts, so a
+        triple that only qualifies for a target-axis cluster in an
+        EARLIER merge can later be "reclaimed" by its bridge axis once
+        a new triple makes that (source,target) group qualify too --
+        and reclaiming it can retroactively disqualify the rest of its
+        old target-axis group (build()'s target-axis condition is
+        `all cluster_id == 0`, which now fails for that whole group).
+        This is handled below by tracking, for every entry, WHICH axis
+        it currently owes its cluster_id to (_axis_of), and cascading
+        any bridge-axis reclaim into a re-check of the reclaimed
+        entry's target-axis group -- reverting that group's other
+        members back to unclustered if the group no longer qualifies,
+        exactly matching what a full recompute would produce. This
+        cascade goes at most one hop: bridge-axis qualification depends
+        only on group SIZE, never on cluster_id, so reverting a
+        target-axis group can never itself trigger a new bridge-axis
+        claim elsewhere.
+        """
+        self._vocab_size = vocab_size
+        if self._cluster_of is None:
+            self._rebuild_persistent_state()
+
+        new_entries = []
+        touched_st = set()
+        for s, t, b in new_triples:
+            entry = (s, t, b)
+            if entry in self._cluster_of:
+                continue  # already known (exact dedup, same rule as build())
+            self._cluster_of[entry] = 0
+            self._groups_by_st[(s, t)].add(entry)
+            self._groups_by_sb[(s, b)].add(entry)
+            new_entries.append(entry)
+            touched_st.add((s, t))
+
+        # ── Bridge axis (dominant): unconditional for any touched group
+        #    that now qualifies, exactly like build()'s first pass ────
+        reclaimed_sb_keys = set()
+        for key in touched_st:
+            members = self._groups_by_st[key]
+            if len(members) <= 1:
+                continue
+            existing = {self._cluster_of[m] for m in members
+                        if self._axis_of.get(m) == "bridge"}
+            cid = min(existing) if existing else self._next_cluster
+            if not existing:
+                self._next_cluster += 1
+            for m in members:
+                if self._axis_of.get(m) == "target":
+                    # was target-axis clustered before -- bridge axis
+                    # now claims it, so its old target-axis group needs
+                    # re-checking (it may no longer qualify at all).
+                    reclaimed_sb_keys.add((m[0], m[2]))
+                self._cluster_of[m] = cid
+                self._axis_of[m] = "bridge"
+
+        # ── Target axis: groups literally touched by a new triple,
+        #    plus groups invalidated by a bridge-axis reclaim above ───
+        touched_sb = {(s, b) for (s, t, b) in new_entries} | reclaimed_sb_keys
+        for key in touched_sb:
+            members = self._groups_by_sb[key]
+            if len(members) <= 1:
+                continue
+            if any(self._axis_of.get(m) == "bridge" for m in members):
+                # disqualified -- a from-scratch rebuild's `all(...==0)`
+                # check would fail for this whole group too; revert any
+                # member that was previously clustered ONLY via this axis.
+                for m in members:
+                    if self._axis_of.get(m) == "target":
+                        self._cluster_of[m] = 0
+                        del self._axis_of[m]
+                continue
+            existing = {self._cluster_of[m] for m in members
+                        if self._axis_of.get(m) == "target"}
+            cid = min(existing) if existing else self._next_cluster
+            if not existing:
+                self._next_cluster += 1
+            for m in members:
+                self._cluster_of[m] = cid
+                self._axis_of[m] = "target"
+
+        self._flatten_arrays(vocab_size)
+
+    def _flatten_arrays(self, vocab_size: int):
+        """
+        Rebuild the public source/target/bridge/cluster_id/index/
+        t_index arrays from the current _cluster_of state. A single
+        O(total triples) layout pass (sort + CSR offsets) -- no
+        clustering logic runs here, so this is the same order of cost
+        EdgeMatrix already pays every merge for its own array layout.
+        """
+        triples = sorted(self._cluster_of.items(), key=lambda kv: kv[0][0])
+        self.source = array("i", [e[0] for e, _ in triples])
+        self.target = array("i", [e[1] for e, _ in triples])
+        self.bridge = array("i", [e[2] for e, _ in triples])
+        self.cluster_id = array("i", [c for _, c in triples])
+        self._vocab_size = vocab_size
+
+        self.index = array("i", [0] * (vocab_size + 1))
+        for s in self.source:
+            self.index[s + 1] += 1
+        for i in range(1, len(self.index)):
+            self.index[i] += self.index[i - 1]
+
+        t_index = defaultdict(set)
+        for s, t, b, c in zip(self.source, self.target, self.bridge, self.cluster_id):
+            if c != 0:
+                t_index[b].add(c)
+                t_index[t].add(c)
+        self.t_index = {k: sorted(v) for k, v in t_index.items()}
+
+        self._cluster_members = None
+        self._cluster_axis_cache = None
 
     def to_dict(self):
         return {
@@ -293,6 +518,18 @@ class RelationshipMatrix:
         self._n_rels = 0
         self._by_triple_rel = None    # lazily-built CSR keyed on triple_id
         self._by_triple_index = None  # (rel array, offset array)
+
+        # Persisted raw-content cache -- {sequence tuple: rel_id} and
+        # rel_id -> sequence (list) -- kept in sync by build() and
+        # merge_incremental() so a later merge never has to reconstruct
+        # an existing relationship's sequence by walking the Bridge
+        # Matrix (see importance.sequence_for_relationship). None until
+        # populated; a matrix that came from from_dict() has to pay for
+        # one reconstruction pass on its first merge (see
+        # _ensure_raw_cache()) since a save/load round trip doesn't
+        # persist raw sequences, only the (triple_id, rel_id) rows.
+        self._seq_to_rel_id = None
+        self._unique_seqs = None
 
     def _ensure_triple_index(self):
         """
@@ -359,6 +596,111 @@ class RelationshipMatrix:
         self.r_triple = array("i", [r[0] for r in rows])
         self.r_rel = array("i", [r[1] for r in rows])
 
+        self.index = array("i", [0] * (self._n_rels + 1))
+        for r in self.r_rel:
+            self.index[r + 1] += 1
+        for i in range(1, len(self.index)):
+            self.index[i] += self.index[i - 1]
+        self._by_triple_rel = None
+        self._by_triple_index = None
+
+        # build() already computed these locally -- keep them so a
+        # later merge_incremental() never needs to reconstruct anything.
+        self._seq_to_rel_id = seq_to_rel_id
+        self._unique_seqs = unique_seqs
+
+    def _reconstruct_sequence(self, rel_id: int, bridge: "BridgeMatrix"):
+        """
+        Chain rel_id's triples (via `bridge`) back into its ordered
+        token sequence. Same logic as importance.sequence_for_relationship
+        (kept here too, decoupled from needing a full `model` object,
+        so _ensure_raw_cache() below can call it directly) -- see that
+        function's docstring for the full explanation. Returns a tuple;
+        () if rel_id has no triples (sentence shorter than 3 tokens).
+        """
+        triple_ids = self.triples_for_relationship(rel_id)
+        if not triple_ids:
+            return ()
+        t0 = triple_ids[0]
+        seq = [bridge.source[t0], bridge.bridge[t0], bridge.target[t0]]
+        for tid in triple_ids[1:]:
+            if bridge.source[tid] != seq[-2] or bridge.bridge[tid] != seq[-1]:
+                raise ValueError(
+                    f"relationship {rel_id}: triple {tid} doesn't chain from "
+                    f"the previous triple -- Relationship/Bridge matrices are "
+                    f"out of sync")
+            seq.append(bridge.target[tid])
+        return tuple(seq)
+
+    def _ensure_raw_cache(self, bridge: "BridgeMatrix"):
+        """
+        Populate _seq_to_rel_id/_unique_seqs from the CURRENT (pre-merge)
+        triples/relationships, if not already populated. Must be called
+        with the bridge matrix as it stood when self.r_triple's
+        triple_id values were assigned -- i.e. BEFORE
+        BridgeMatrix.merge_incremental() rebuilds bridge's row order
+        for the merge in progress (see model.py's _merge_graphs).
+
+        A no-op after the first call on a given matrix -- build() and
+        merge_incremental() both leave this cache populated -- so the
+        reconstruction this replaces (previously paid on EVERY batch in
+        train_corpus.py's merge loop) now happens at most ONCE per
+        loaded model, only if that model came from from_dict().
+        """
+        if self._seq_to_rel_id is not None and self._unique_seqs is not None:
+            return
+        self._seq_to_rel_id = {}
+        self._unique_seqs = []
+        for rid in range(self._n_rels):
+            seq = self._reconstruct_sequence(rid, bridge)
+            self._seq_to_rel_id[seq] = rid
+            self._unique_seqs.append(list(seq))
+
+    def merge_incremental(self, new_seqs, bridge: "BridgeMatrix"):
+        """
+        Extend the matrix with new_seqs. Requires _ensure_raw_cache()
+        to already have been called (with the PRE-merge bridge matrix,
+        before its row order changed) -- this method itself never
+        walks the Bridge Matrix to reconstruct anything, only to
+        translate triple CONTENT into `bridge`'s (post-merge, already
+        rebuilt) triple_id numbering. That translation is the one part
+        that must still touch every relationship row, not just the new
+        ones: BridgeMatrix's row order can shift on every merge (a
+        triple's position depends on the full current triple set, see
+        its own merge_incremental()), so a triple_id recorded before
+        this merge may no longer point at the same content afterwards.
+        It's a flat dict build + one pass over already-known token
+        sequences though, not a graph-walk reconstruction -- cheap
+        relative to what it replaces.
+        """
+        for seq in new_seqs:
+            key = tuple(seq)
+            rid = self._seq_to_rel_id.get(key)
+            if rid is None:
+                rid = len(self._unique_seqs)
+                self._seq_to_rel_id[key] = rid
+                self._unique_seqs.append(list(seq))
+                self.rel_count.append(1)
+            else:
+                self.rel_count[rid] += 1
+
+        self._n_rels = len(self._unique_seqs)
+
+        triple_to_id = {}
+        for idx, (s, t, b) in enumerate(zip(bridge.source, bridge.target, bridge.bridge)):
+            triple_to_id[(s, t, b)] = idx
+
+        rows = []
+        for rel_id, seq in enumerate(self._unique_seqs):
+            for i in range(len(seq) - 2):
+                source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
+                triple_id = triple_to_id.get((source, target, bridge_tok))
+                if triple_id is not None:
+                    rows.append((triple_id, rel_id))
+        rows.sort(key=lambda r: r[1])
+
+        self.r_triple = array("i", [r[0] for r in rows])
+        self.r_rel = array("i", [r[1] for r in rows])
         self.index = array("i", [0] * (self._n_rels + 1))
         for r in self.r_rel:
             self.index[r + 1] += 1

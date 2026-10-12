@@ -1,878 +1,276 @@
 """
-ivm.py — Importance Vote Matrix (IVM) for MSE-GLM.
+ivm.py — token POSITIONING for MSE-GLM: which token may come after which.
 
-Two entry points, two different roles:
+(The class keeps its old name, ImportanceVoteMatrix, so existing imports keep
+working; it no longer has anything to do with "importance".)
 
-  resolve_tie(tied_candidates, context_tokens)
-      LEGACY Strict Mode tie-break. Only ever called on a set that
-      something else (Stage 1) has already narrowed to a tie. Formula:
-      score(C) = Σ influence(t) for every important t that knows C.
-      Opt-in only -- see inference.py's Strict Mode path.
+ivm.py answers ONE kind of question about every candidate C for the next token:
+"does the training data say C can follow here?"  It asks four of them, Q1-Q4,
+combines the answers into ONE final score per candidate, and stops there.  It knows
+nothing about noise.py (noise cancellation is a separate, independent scorer);
+model.py adds the two final scores together at inference.  What each question
+contributed is in the trace score_candidates() returns, and is queryable on
+demand (analyse.py open-scores, chat.py /scores, server.py /scores).
 
-  select(candidates, context_tokens, current=None, previous=None) / score_candidates(...)
-      PRIMARY Open Mode mechanism. Called on the FULL legal candidate
-      set every step, not just on ties -- this is what decides Open
-      Mode generation now, replacing Stage 2's lineage tie-break
-      entirely (see inference.py). TEN INDEPENDENT vote layers,
-      summed -- not one formula where a factor multiplies another.
-      An important token is ALSO a context token (I ⊆ P), so it casts
-      up to seven of the ten votes: V1 and V2 because it's important,
-      PLUS its own V3, V4, V5, V6, and V10 votes as an ordinary context
-      member -- it never loses those for being important, V1/V2 are
-      additive bonuses. V7 and V8 are different from all these -- neither
-      is "every context token votes," each is a single fixed-pair (V7)
-      or fixed-triple (V8) check on `previous`/`current` specifically
-      (see below). V9 is different again -- it's the only layer that
-      requires EVERY context token to agree, not just one (V3) or a
-      fixed pair (V7/V8). V10 (see noise.py) is a context-token sum
-      like V3/V4/V6, but the per-token contribution comes from a
-      DIFFERENT, precomputed source (TokenVocabularyMatrix) rather
-      than from this module's own _token_rels/_adjacent state.
+THE FOUR QUESTIONS            (P = tokens in context, `previous`/`current` = the
+                               last two tokens, C = the candidate)
 
-  The gate (co-occurrence index, `_co_occurring` -- see build())
-      V1-V6, V9, and V10 all reduce, ultimately, to the same underlying
-      question for a given (context token t, candidate C) pair: "did t
-      and C ever appear in the same training sentence at all?" A
-      candidate C that no context token has EVER co-occurred with is
-      therefore guaranteed a zero vote from every one of those eight
-      layers -- not approximately, exactly, by construction (see
-      score_candidates()'s docstring for the proof; V10's proof is the
-      same shape as V9's, since a nonzero noise.py row entry for C
-      implies C appeared in one of that context token's home
-      sentences). `_co_occurring` precomputes, once per model, exactly
-      which OTHER tokens each token has ever shared a training
-      sentence with -- the same reverse-index trick build_cache()
-      already used for its sparse cache, generalized to the WHOLE
-      vocabulary (not just one candidate set) and computed once so
-      both the live scoring path and build_cache() itself can reuse it
-      instead of each recomputing their own version. score_candidates()'s
-      live path uses it to skip straight to a zero score for any
-      candidate no context token has ever heard of, instead of testing
-      it against every layer in turn.
+  Q1  CO-OCCURRENCE (context-wide)
+        raw1(C) = Σ_{t∈P} 1[t and C ever shared a training sentence]
+        Q1(C)   = Q1_WEIGHT × 100 × raw1(C) / Σ_all raw1          (a percentage)
+      Every context token casts one binary vote for each candidate it has ever
+      appeared in a sentence with (either order, any distance).
 
-  build_cache(candidates) / enable_cache(candidates=None) / disable_cache()
-      Opt-in sparse per-token cache for V1/V2/V3/V4/V6 -- each is a sum
-      over context tokens of a (t, c)-only contribution, so it's
-      precomputable once and reused every step instead of recomputed
-      from scratch. V5/V7/V8/V9/V10 stay live always (see build_cache()'s
-      own comment for why -- V10 in particular draws from a different
-      precomputed source, noise.py's TokenVocabularyMatrix, not from
-      this cache's _token_rels/_important/_adjacent state, so it isn't
-      a candidate for folding into it). Stores only nonzero (t, c)
-      entries, never a dense |vocab| x |vocab| table. Off by default;
-      NOT serialized by to_dict/from_dict (fully re-derivable from
-      state that is). See score_candidates()'s "cache_used" trace
-      field and benchmark_cache.py to compare cached vs. live directly.
+  Q2  LEGAL BIGRAM, WITNESSED     (direction: current -> C only)
+        raw2(C) = Σ_{t∈P} 1[t was in a sentence where the bigram
+                            (current, C) actually occurred]
+        Q2(C)   = Q2_WEIGHT × 100 × raw2(C) / Σ_all raw2          (a percentage)
+      Votes only if (current -> C) is a legal bigram -- it was seen, in that
+      order, at least once.  Given a legal bigram, each context token then votes
+      if it was present in one of the sentences that bigram came from.
 
-        V1(C) = important_weight × Σ_{t∈I} 1[knowledge(t, C) > 0]
-            Important tokens (I = cluster members present in context)
-            cast their own vote, independently -- RAW/binary, one
-            vote per important token that knows C at all, NOT scaled
-            by how many relationships they co-occurred in (that
-            magnitude enters through V4 instead, for every context
-            token, not just important ones -- see below). Scaled down
-            (default weight 0.1). Deliberately SMALL and SUPPORTING,
-            not a competing independent channel -- see below.
+  score(C) = Q1(C) + Q2(C) (+ noise, added by select()).  EVERY candidate takes
+  part in this, equally -- nothing is excluded from the ranking.
 
-        V2(C) = influence_weight × Σ_{t∈I, knows C} influence(t)
-            Influence casts ITS OWN independent vote too -- not a
-            multiplier on V1. influence(t) (how many distinct
-            candidates t knows -- breadth) contributes its own small
-            term (default weight 0.1), once per important token that
-            knows C. Breadth (how many DIFFERENT candidates a token
-            knows) is a different quantity from "how many times it
-            knows THIS candidate" -- V4 covers the latter, for
-            everyone, not just important tokens.
+  Q3 and Q4 are NOT part of the score.  They are LEGALITY CHECKS applied at the
+  very end, to the ranked list, just before a token is picked:
 
-        V3(C) = context_weight × Σ_{t∈P} 1[knowledge(t,C) > 0]
-            EVERY token in context P (not just important members --
-            this is the one place non-important tokens get a say)
-            casts one full vote (default weight 1.0) for any
-            candidate it co-occurred with at least once. Binary, not
-            weighted by evidence count: a token either attests C or
-            it doesn't.
+  Q3  LEGAL BIGRAM               (direction: current -> C only)
+        legal3(C) = 1[(current, C) is a legal bigram]
+      Has `current` ever been immediately followed by C?  (cat sat) counts;
+      (sat cat) does not.
 
-        V4(C) = context_influence_weight × Σ_{t∈P} knowledge(t, C)
-            "Context token influence" -- one step up from V3's plain
-            presence check: EVERY context token P also votes
-            proportional to HOW MANY TIMES it co-occurred with C
-            specifically (the same knowledge(t,C) quantity V1 used to
-            use before it was made binary). Weighted very small
-            (default 0.01 -- smaller even than V1/V2's 0.1) so it can
-            only ever refine what V3 already decided, never compete
-            with it.
+  Q4  AGREEMENT OF previous AND current   (previous, current -> C)
+        legal4(C) = 1[(previous, current, C) is a trained consecutive triple]
+      Do `previous` and `current`, as a pair, know C as the next token?
+      "the cat sat on the mat because it was tired":  (the cat) knows -> sat;
+      (the mat) knows -> because.  Order matters, and the three tokens must have
+      been consecutive in one training sentence.
+      Q4 only STARTS at two context tokens.  An agreement needs two tokens, so with
+      only one real context token (a one-word prompt) Q4 is INACTIVE: it neither
+      fires nor blocks anything, and Q3 alone decides legality.  It becomes active
+      once `previous` and `current` are both real tokens (e.g. after the first
+      generated token of a one-word prompt).
 
-        V5(C) = bigram_witness_weight × Σ_{t∈P} 1[t was ever in a
-                                                     training sentence
-                                                     containing the
-                                                     literal bigram
-                                                     (current, C)]
-            "Bigram witness" vote -- a narrower, STRONGER claim than
-            V3. V3 asks "did t ever co-occur with C, anywhere, in any
-            sentence" -- V5 asks the sharper question "was t present
-            in one of the SPECIFIC sentences where current->C
-            actually occurred as a consecutive pair." Every context
-            token P casts one full binary vote per candidate: either
-            it was there when that exact transition happened ("I know
-            that connection") or it wasn't ("I have never seen that
-            connection"), regardless of how much unrelated evidence
-            it shares with C otherwise. Default weight 1.0 -- UNLIKE
-            V1/V2/V4, V5 is deliberately peer-weighted with V3, not
-            kept small beneath it: it is independently strong,
-            specific evidence in its own right (which sentences
-            witnessed THIS bigram), not a structural nudge riding on
-            top of a broader signal. See bigram_relationships() for
-            how the per-bigram witnessing sentence sets are built --
-            literal Bridge + Relationship Matrix only, same honesty
-            constraint as _token_rels (see notes below).
+  PICKING (select()): rank every candidate by its total score, then take the
+  highest-scored candidate that is legal.  Q3/Q4 work on the top
+  LEGALITY_TOP_K scored candidates only (None = ALL of them; ties at the cut-off are
+  kept): a candidate below that cut is never checked and never picked.  If the top candidate is not legal, try
+  the next highest, and so on (within that window).  ("tired 34, it 33, was 32.6": tired is not a legal
+  bigram after the current token, so "it" is picked.)  Legal means:
+      stage 1  Q3 AND Q4          (the normal case, once Q4 is active)
+      stage 2  Q3 only            (Q4 inactive -- one context token -- or NO candidate
+                                   passes Q4, e.g. the previous+current pair was
+                                   never seen together)
+      stage 3  <EOS>              (nothing in the window is even a legal bigram: there is
+                                   no legal continuation, so the model ends the text)
+  The stage used is reported as trace["legality"].  Ties among the eligible
+  candidates fall to the deterministic cascade (see choose()).
 
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C)
+  The PROMPT is never checked -- Q3/Q4 judge only the CONTINUATION.  Any prompt is
+  fine ("cat was on mat because"); with no usable `current`, Q3 passes for everyone,
+  and with fewer than two real context tokens Q4 is inactive (see above).
 
-      important_weight, influence_weight, and context_influence_weight
-      all default strictly SMALLER than context_weight (0.1, 0.1, 0.01
-      vs 1.0) BY DESIGN: important tokens (and raw evidence magnitude)
-      must not be able to override what context presence already
-      decided, only nudge a tie context itself left open. V1/V2/V4 are
-      a bonus riding on top of V3, not a competing signal of equal
-      standing -- an important token gets counted up to four times for
-      related evidence (once via V3 and V4 like everyone else, twice
-      more small because it's important), but those small votes still
-      can't outweigh a real V3 majority. If you change these weights,
-      that guarantee is a property of the ratios (important_weight,
-      influence_weight, context_influence_weight < context_weight),
-      not automatic -- verify it still holds. V5 and V6 are the two
-      layers deliberately exempted from that "stay small" rule -- see
-      above (V5) and below (V6).
+NORMALIZATION (same as noise.py's normalize_row()): inference never sees raw
+counts.  Each of Q1 and Q2 is turned into a percentage scoped to the query,
+over ALL candidates:
+    Qk%(C) = 100 × rawk(C) / Σ_{all candidates} rawk
+so a question's evidence adds up to exactly 100% (a candidate with raw 0 stays 0;
+if nobody has any, all stay 0).  Q1_WEIGHT / Q2_WEIGHT then scale those
+percentages; they are mix weights, not count scales.
 
-        V6(C) = adjacency_weight × Σ_{t∈P}
-                    1[t was ever DIRECTLY, immediately followed by C
-                      in training -- t->C specifically, not C->t]
-            "Adjacency" vote -- a different, WEAKER-in-one-sense,
-            STRONGER-in-another question than both V3 and V5. Every
-            context token P asks C: "were you ever the very next
-            token right after me, anywhere in training?" (see
-            adjacent_pairs()) -- strictly DIRECTIONAL, FROM t TO C
-            only; C having been immediately followed by t does NOT
-            count. Weaker than V5: the adjacency doesn't have to be
-            the SPECIFIC current->C transition being scored right
-            now -- any sentence counts, as long as the direction is
-            t->C. Stronger than V3: mere co-occurrence in the same
-            training sentence is NOT enough -- t must have actually
-            been immediately followed by C at some point, not just
-            present in the same sentence (in either order). Default
-            weight 1.0 -- PEER-weighted with V3/V5, same reasoning:
-            independently strong, bigram-level evidence, not a
-            structural nudge. Literal Edge Matrix only, same honesty
-            constraint as every other layer (see notes below).
+Rules shared by all four:
+  - "Legal bigram" has ONE definition everywhere: a directed pair (a, b) where
+    b immediately followed a at least once in training (adjacent_pairs()).
+  - Reserved tokens (<PAD>/<UNK>/<BOS>) never vote and are never voted for.
+  - A token never votes for itself: C == current is skipped in Q2 and Q3.
+  - Q2 needs `current`; with None it casts no votes.
+  - Evidence comes ONLY from the literal training sentences (model.token_relationships
+    for Q1, the adjacency/witness indexes for Q2-Q4).  No Experience data source.
 
-        V7(C) = prev_current_weight × 1[rels(previous) ∩ rels(current)
-                                          ∩ rels(C) ≠ ∅]
-            "Previous+current co-occurrence" vote -- UNLIKE every
-            other layer, this is NOT "every context token P casts a
-            vote"; it's a single fixed-pair question about the two
-            most recent tokens specifically: "was there ever ONE
-            training sentence that mentioned `previous`, `current`,
-            AND C together?" One flat binary vote per candidate, not
-            summed over context. Broader than V5 in one sense: V5
-            asks about the literal consecutive bigram (current, C) as
-            its own triple; V7 only asks whether all three of
-            previous, current, and C simply shared a sentence, no
-            adjacency required between any pair. Narrower than V3 in
-            another: V3 only needs ONE token to share a sentence with
-            C; V7 needs BOTH previous and current to share a sentence
-            with C and with each other, all at once. Default weight
-            1.0 -- PEER-weighted with V3/V5/V6, same reasoning:
-            specific, literal, sentence-level evidence, not a
-            structural nudge. No vote for C if `previous` or `current`
-            is None or reserved, or if C is `previous` or `current`
-            itself. Literal Relationship Matrix only (via
-            token_to_relationships, same source as every other layer).
+TIE-BREAK (choose()/select()): when the final scores tie, the winner is decided
+by, in order: how often C literally followed `current` (bigram frequency), then
+C's corpus-wide sentence count, then lowest token id.  Always deterministic.
 
-        V8(C) = triple_weight × 1[(previous, current, C) was ever a
-                                    literal, consecutive Bridge Matrix
-                                    triple in training]
-            "Triple witness" vote -- among the eight OTHER layers, the
-            single STRICTEST, most literal question (V9 is stricter
-            still, but strict in a different DIMENSION -- unanimity
-            across an arbitrary-size context, not positional
-            exactness): not "did these three
-            tokens ever share a sentence" (V7), not "was C ever
-            immediately preceded by current, in some sentence, for
-            some reason" (V5's bigram_relationships key is (source,
-            bridge), i.e. current->C as the first two slots of SOME
-            triple) -- V8 asks whether `previous`, `current`, and C
-            were ever literally seen back-to-back-to-back as ONE
-            EXACT trained triple: source=previous, bridge=current,
-            target=C. This is precisely the same literal-triple test
-            Strict Mode's Stage 2 already uses to decide legality
-            (see inference.py) -- V8 exposes it as a vote instead of a
-            hard filter, so Open Mode (whose candidates span the
-            whole vocabulary, not just literal successors) can reward
-            a candidate for being the EXACT literal continuation
-            without that candidate being the ONLY thing allowed to
-            win. One flat binary vote per candidate, not summed over
-            context -- same shape as V7, but a three-way EXACT MATCH
-            instead of a three-way SHARED-SENTENCE check. No vote for
-            C if `previous` or `current` is None or reserved, or if C
-            is `previous` or `current` itself. Literal Bridge Matrix
-            only (see literal_triples()) -- every triple there already
-            occurred at least once in training, same honesty
-            guarantee as every other layer. Default weight 2.0 --
-            PEER-weighted with V5/V6/V7 (independently strong, literal
-            evidence, not a structural nudge), set a notch above them
-            since an exact triple match is strictly more specific
-            evidence than any of V5/V6/V7 individually.
+MIXING WITH NOISE: select(..., extra_scores=...) accepts another scorer's final
+scores and adds them before choosing, so the tie-break sees the combined total.
+ivm itself never computes or inspects them.
 
-        V9(C) = whole_context_weight × 1[every non-reserved token
-                                          t ∈ P, t ≠ C, satisfies
-                                          knowledge(t, C) > 0]
-            "Whole context" / UNANIMOUS vote -- the odd one out among
-            the ten: every other layer either sums a per-token
-            contribution over context (V1-V6, V10) or checks one FIXED
-            pair (V7) or triple (V8); V9 instead asks whether the
-            WHOLE of context agrees at once. V3 already asks "does at least one
-            context token know C" -- V9 asks the strictly harder
-            question "do ALL of them" (excluding C itself, if C
-            happens to already be a context token -- same "a token
-            never has to vouch for itself" rule as every other layer,
-            just checked once per required token here instead of
-            skipped inside a sum). One flat binary vote per candidate,
-            not scaled by context size or evidence count -- unanimity
-            either holds or it doesn't. No vote for ANY candidate if
-            context has no qualifying (non-reserved, not-C) tokens at
-            all -- unanimity among zero voters proves nothing, so an
-            empty or fully-reserved context casts no V9 votes for
-            anyone, same as V3 casts no votes from an empty context
-            either. Default weight 2.5 -- see config.py's
-            WHOLE_CONTEXT_WEIGHT for why it's set a notch above V8.
+Caching: build_cache()/enable_cache()/disable_cache() precompute Q1's per-token
+rows for the full vocabulary (Q2-Q4 are already a few set lookups per step).
+Same numbers either way; trace["cache_used"] reports which path ran.
 
-        V10(C) = noise_weight × Σ_{t∈P} noise_row(t)[C]
-            "Noise cancellation" vote (see noise.py) -- back to a
-            per-context-token SUM, like V3/V4/V6, but the per-(t, C)
-            contribution comes from a different, PRECOMPUTED source:
-            noise.py's TokenVocabularyMatrix, not this module's own
-            _token_rels/_adjacent state. noise_row(t)[C] is "how many
-            OTHER training sentences don't already know C, summed
-            across every sentence t itself appears in" (see noise.py's
-            module docstring for the full rule) -- a token that keeps
-            showing up as noise-worthy alongside t, across many of t's
-            sentences, earns C a bigger contribution here than a token
-            t only ever saw once. This is an IDF-flavored signal,
-            distinct from every other layer: V3/V4/V6 ask "did t and C
-            ever share evidence," V10 asks "how UNUSUAL is C, relative
-            to what t's other sentences already knew, everywhere t
-            appears." A context token with no precomputed row (never
-            trained, or trained but never had an eligible home)
-            contributes nothing. Magnitude-based and potentially
-            large-scale (see config.py's NOISE_WEIGHT), so kept small
-            BY DESIGN, same rule as V1/V2/V4: it can only ever nudge a
-            decision V3 left open, never override one V3 already made.
-            Contributes nothing at all if no TokenVocabularyMatrix was
-            ever attached to this instance (see attach_noise_layer(),
-            which model.py calls on first Open Mode use) -- the same
-            "None means zero, not an error" contract this module
-            already applies to Strict Mode's optional add-ons.
-
-        score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C) + V10(C)
-
-      This deliberately reopens the door rule 24 shut ("unclustered
-      tokens contribute 0 votes") -- V3/V4 are a considered exception,
-      not an oversight: every context token gets a full, equal,
-      independent say (V3) plus a tiny magnitude-sensitive refinement
-      (V4), on top of (not instead of) the structural importance-
-      weighted signal in V1/V2.
-
-      Tie-break cascade when score itself doesn't discriminate (see
-      select()): bigram frequency (how often `candidate` literally
-      followed `current`), then global frequency (candidate's raw
-      corpus-wide count -- the one signal deliberately excluded from
-      the primary formula, used here ONLY as an absolute last resort),
-      then lowest token id. Always deterministic. A None winner means
-      candidates itself was empty; the caller (inference.py) still
-      needs a deterministic fallback for that degenerate case, never
-      randomness.
-
-An alternative to Stage 2's lineage tie-break (inference.py), NOT an
-alternative to CTM -- see ctm.py's module docstring for the
-distinction. Stage 2 asks "does the exact triple (previous, current,
-C) exist with a matching relationship_id?" -- a single previous
-token, checked for an exact match. This module asks a broader
-question instead: "which of the currently tied candidates do the
-IMPORTANT tokens already generated so far collectively point to?" --
-every clustered token in the whole context gets a vote, not just the
-immediately preceding one, and a vote is driven by co-occurrence, not
-exact-triple match.
-
-1. Candidates are whatever Stage 1 already produced (successors from
-   E, +EE in open mode, narrowed by bridge/lineage authority) -- IVM
-   does not generate its own candidate list.
-
-2. Important tokens -- corrected definition
-   -----------------------------------------
-   A token is important only if it ever occupies the VARYING
-   (member) role of some cluster -- not merely "any role in any
-   clustered triple." This is NOT the same test as bridges.t_index:
-   t_index is populated from BOTH the bridge and target roles of
-   every clustered triple regardless of which one is the axis that
-   actually varies, so it also flags the FIXED half of a cluster
-   (the trigger) as if it were a member. On "the boy sat on the
-   chair" (bridge-axis cluster {cat,dog,boy} fixed on (the, sat);
-   bridge-axis cluster {sat,ran} fixed on (boy, on)):
-       - "boy" is the varying bridge of the first cluster -> a true
-         member -> important.
-       - "sat" is the varying bridge of the second cluster -> a true
-         member -> important.
-       - "the" and "on" only ever appear as the FIXED half of a
-         cluster (the trigger), never as the varying member of any
-         cluster -- t_index still lists them (they sit in a
-         clustered triple's bridge/target slot), but they are not
-         important under this stricter test, and must not be. An
-         earlier version of this module used t_index directly and
-         let "the"/"on" cast votes; on real generation traces this
-         let common structural words swing a tie purely by sentence
-         frequency, drowning out the two tokens that actually carry
-         information (boy, sat). This version fixes that by reusing
-         importance.py's own axis-aware member/trigger split
-         (_trigger_for_triple) instead of t_index.
-   This is computed once per model (over every triple, both roles,
-   using the SAME axis logic importance.py already uses to tag
-   per-occurrence importance) and cached as a flat set of token ids
-   -- see important_member_tokens(). Only V1/V2 restrict themselves
-   to this set; V3 deliberately does not (see above).
-
-3. "Knows" -- an important token t knows candidate C if they ever
-   co-occur in the same training sentence (same reuse of ctm.py's
-   token_to_relationships as before): support(t, C) =
-   |rels(t) ∩ rels(C)| > 0. That count IS the V1 vote itself now
-   (not a multiplier); influence enters only through V2, as its own
-   independent term.
-
-4. Influence(t) = number of distinct candidates t knows (breadth).
-
-5. resolve_tie's legacy formula (unchanged): score(C) = Σ influence(t),
-   once per candidate a token knows, regardless of evidence count.
-   A remaining tie means "no opinion, return None." This is a
-   completely separate formula from V1/V2/V3 above -- see the module
-   docstring's opening split.
-
-Honesty notes
---------------
-  - Vote weights (support / "knows") come ONLY from the literal
-    training Relationship Matrix -- via token_to_relationships,
-    reused unmodified from ctm.py. There is no longer a separate
-    Experience data source: "strict" and "open" mode see identical
-    evidence for every layer, including V5's bigram-witness sets
-    (bigram_relationships()) and V6's adjacency index
-    (adjacent_pairs()), both built ONLY from the literal
-    Bridge/Edge + Relationship Matrix.
-  - `important_member_tokens()`'s `mode` parameter is likewise
-    accepted for call-site compatibility but has no effect anymore --
-    "important" (V1/V2 eligibility) is cluster membership from the
-    (only) Bridge Matrix, the same set in both modes.
-  - A token never votes for itself if it's also a tied candidate --
-    counting rels(t) ∩ rels(t) as "evidence" would just be the
-    token's own sentence-frequency inflating its own candidacy, not
-    co-occurrence with anything. Applies to all three vote layers.
-  - Reserved tokens (<PAD>/<UNK>/<BOS>/<EOS>) never count as
-    important and never vote in any layer, same exclusion ctm.py
-    applies and for the same reason.
-  - resolve_tie never changes what inference.py decides UNLESS
-    explicitly opted into (Strict Mode only). select()/
-    score_candidates() are unconditional for an Open Mode engine --
-    see inference.py's module docstring.
+Strict Mode's legacy opt-in tie-break, resolve_tie(), now ranks the tied
+candidates by this same final score (unique top scorer wins, otherwise None =
+"no opinion, fall through").
 """
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 
-from ctm import RESERVED, token_to_relationships
-from importance import _trigger_for_triple
-from config import IVMConfig, NoiseConfig
+from config import EOS, RESERVED, IVMConfig
+
+# Q2's evidence is "which sentences contained the bigram (current, C)". True means every
+# adjacent pair has witnesses, including a sentence's last pair (e.g. "." -> <EOS>), so
+# Q2's idea of "legal bigram" is exactly the same set Q3/Q4 use.
+Q2_INCLUDE_FINAL_PAIR = True
+
+# One place that names the questions, in the order they are summed and displayed.
+# (key in the trace, short column label, what it asks)
+QUESTIONS = (
+    ("q1", "Q1 (co-occur)",  "has each context token ever shared a sentence with C?"),
+    ("q2", "Q2 (witness)",   "legal bigram current->C: how many context tokens were in its sentences?"),
+    ("q3", "Q3 (legal bigram)", "is current->C a legal bigram? 1 = legal, 0 = not"),
+    ("q4", "Q4 (agreement)",    "did (previous, current) ever precede C as a consecutive triple?"),
+)
 
 
-def important_member_tokens(model, mode="strict"):
-    """
-    Every token id that ever occupies the VARYING (member) role of
-    some cluster -- see the module docstring for why this differs
-    from bridges.t_index. Computed once by scanning every triple and
-    reusing importance.py's own axis-aware split (the same logic
-    that decides, per occurrence, whether a triple's bridge or its
-    target is the "important" one).
-
-    `mode` is accepted for call-site compatibility but has no effect
-    -- there is no longer a separate Experience Bridge Matrix.
-    """
-    tokens = set()
-    b = model.bridges
-    for tid in range(len(b.source)):
-        info = _trigger_for_triple(b, tid)
-        if info:
-            _axis, _trigger, tok = info
-            tokens.add(tok)
-    tokens -= RESERVED
-    return tokens
-
+# ======= evidence builders (all literal, all from the model's own data) ==================
 
 def bigram_frequencies(model, mode="strict"):
-    """
-    {(src, dst): count} from EdgeMatrix -- literal consecutive-pair
-    counts, precomputed once so select()'s tie-break cascade doesn't
-    need to touch model.edges directly at query time. See
-    EdgeMatrix.frequency() for what these counts mean.
-
-    `mode` is accepted for call-site compatibility but has no effect
-    -- there is no longer a separate Experience Edge Matrix.
-    """
-    freqs = {}
-    edges = model.edges
-    for i in range(len(edges.src)):
-        # edges.src/edges.dst are already deduplicated one row per
-        # unique pair (see EdgeMatrix's docstring), so no accumulation
-        # is needed here -- each key is set exactly once.
-        freqs[(edges.src[i], edges.dst[i])] = edges.count[i]
-    return freqs
+    """{(src, dst): count} -- literal consecutive-pair counts, used by the tie-break."""
+    return model.bigram_counts()
 
 
 def bigram_relationships(model):
-    """
-    {(source, candidate): {rel_id, ...}} -- for every literal training
-    triple (source=source, bridge=candidate, target=anything), the
-    set of relationship_ids (training sentences) that triple belongs
-    to. This is the literal evidence V5's bigram-witness vote checks
-    context tokens against: "which sentences actually contained the
-    consecutive pair source->candidate."
-
-    Built ONLY from the Bridge + Relationship Matrix -- the same
-    literal-only reasoning as token_to_relationships (ctm.py): a
-    "this bigram happened in this sentence" fact only exists for
-    bigrams that were actually observed together in one sentence.
-    """
-    out = defaultdict(set)
-    b = model.bridges
-    for tid in range(len(b.source)):
-        rel_ids = model.rels.relationships_for_triple(tid)
-        if rel_ids:
-            out[(b.source[tid], b.bridge[tid])].update(rel_ids)
-    return dict(out)
+    """{(source, candidate): {rel_id, ...}} -- the training sentences each bigram occurred in (Q2's evidence)."""
+    return model.bigram_provenance(include_final=Q2_INCLUDE_FINAL_PAIR)
 
 
 def adjacent_pairs(model):
+    """{(from_token, to_token), ...} -- every DIRECTED legal bigram (Q3/Q4's evidence)."""
+    return model.adjacent_pairs()
+
+
+def parse_top_k(value):
+    """Normalize a "how many top-scored tokens" setting: None / 0 / "all" / "" -> None (all);
+    a positive int (or digit string) -> that int. Anything else raises ValueError."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in ("", "all", "none")):
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"legality top-k must be a positive integer or 'all', got {value!r}") from None
+    if n < 0:
+        raise ValueError(f"legality top-k must be a positive integer or 'all', got {value!r}")
+    return n or None
+
+
+def triples_by_pair(model):
+    """{(a, m): {b, ...}} -- every consecutive trained triple (a, m, b), keyed by its first two
+    tokens (Q4's evidence).  The knowledge store keeps a triple as (source=a, target=b, bridge=m)."""
+    out = {}
+    for source, target, bridge in model.triples():
+        out.setdefault((source, bridge), set()).add(target)
+    return out
+
+
+def co_occurrence_index(token_rels, unified=None):
     """
-    {(from_token, to_token), ...} -- every DIRECTED literal training
-    bigram: from_token immediately followed by to_token, at least
-    once. This is the evidence V6's adjacency vote checks context
-    tokens against: a context token t votes for candidate C iff
-    (t, C) is in this set -- i.e. t was literally, immediately
-    followed by C somewhere in training. Directional: FROM the
-    context token TO the candidate ONLY -- (C, t) being in this set
-    does NOT imply (t, C) is, and the reverse observation does not
-    count as a vote.
-
-    Deliberately a different, WEAKER question than V5's bigram-witness
-    evidence (bigram_relationships() above): V6 only asks "was t ever
-    immediately followed by candidate C, in ANY sentence" -- it
-    doesn't care whether that adjacency has anything to do with the
-    specific transition current->C being scored right now (that's
-    V5's job), and it doesn't require a shared sentence beyond the
-    adjacency itself (V3/V4 ask a broader, even weaker question
-    still: merely sharing a sentence at all, not necessarily standing
-    next to each other in it, in either order).
-
-    Built ONLY from the literal Edge Matrix -- every training bigram
-    that was ever actually observed, in either mode.
+    {token: {other_token: shared_sentence_count}} for every pair of non-reserved tokens that
+    ever appear in the same training sentence (Q1's evidence). A token never co-occurs with
+    itself. With `unified` it is read straight off the knowledge store; without, it is
+    rebuilt by inverting token_rels.
     """
-    e = model.edges
-    return {(a, b) for a, b in zip(e.src, e.dst)}
+    if unified is not None:
+        result = {}
+        for t, rels in token_rels.items():
+            if t in RESERVED or not rels:
+                continue
+            result[t] = {c: n for c, n in unified.co_row(t).items() if c not in RESERVED}
+        return result
 
-
-def co_occurrence_index(token_rels, adjacent=None):
-    """
-    {token: {other_token: shared_relationship_count}} for EVERY pair
-    of (non-reserved) tokens that ever appear together in at least one
-    training relationship (sentence) -- the whole-vocabulary
-    co-occurrence graph underneath V1/V3/V4/V6/V9, and the gate that
-    lets score_candidates() skip a candidate straight to a 0 score
-    once no context token has ever heard of it (see the module
-    docstring's "The gate" section for the proof of why that's always
-    safe for V1-V6/V9, and score_candidates()'s docstring for the one
-    extra condition V7/V8 need).
-
-    Built by inverting token_rels (relationship_id -> its member
-    tokens) ONCE and, for each relationship, only visiting the tokens
-    actually IN it -- the same technique
-    ImportanceVoteMatrix.build_cache() used to use internally (see its
-    docstring for the full O(vocab^2)-vs-O(corpus co-occurrence) cost
-    argument), just generalized here to the ENTIRE vocabulary instead
-    of one candidate set, and computed exactly once per model build so
-    build_cache() (now just a filter over this) and score_candidates()
-    (the live gate) both reuse the same underlying work instead of
-    each paying for their own O(sum of sentence-length^2) pass.
-
-    If `adjacent` (a set of directed (t, c) pairs -- see
-    adjacent_pairs()) is given, also backfills any adjacency-only pair
-    NOT already present with a shared count of 0, for any t that has
-    AT LEAST ONE relationship-based entry already (token_rels.get(t)
-    is truthy) -- the same condition the live scoring path and the
-    cache-building code both already applied before this function
-    existed (a token with literally zero known relationships is
-    skipped by both, regardless of any adjacency it might have; this
-    backfill deliberately preserves that existing behavior rather than
-    widening it). This covers a real, if rare, edge case: two tokens
-    that were literally consecutive in a training sentence too SHORT
-    (fewer than 3 tokens) to have produced a Bridge Matrix triple --
-    and therefore a relationship_id -- at all (see importance.py's
-    note on degenerate short sentences). Such a pair has adjacency
-    (V6's evidence) but zero relationship-level co-occurrence
-    (V1/V3/V4/V9's evidence) for that SPECIFIC candidate -- V6 can
-    still vote for it on its own terms regardless of what this index
-    says, but WITHOUT this backfill the gate would wrongly treat that
-    candidate as "no context token has ever heard of it" and skip it,
-    silently dropping the V6 vote it's actually entitled to. The
-    backfilled entry's shared count is 0, so it contributes nothing to
-    V1/V3/V4/V9 (still correctly zero for them) -- it only keeps the
-    candidate visible to the gate so V6 itself still gets a chance to
-    fire.
-
-    Reserved tokens never appear as a key or a value, and a token
-    never "co-occurs" with itself -- same exclusions every other
-    layer in this module applies.
-    """
     rel_to_tokens = defaultdict(set)
     for tok, rels in token_rels.items():
         if tok in RESERVED or not rels:
             continue
         for r in rels:
             rel_to_tokens[r].add(tok)
-
-    co_occurring = defaultdict(Counter)
+    result = defaultdict(dict)
     for toks in rel_to_tokens.values():
         toks = list(toks)
         for i, ti in enumerate(toks):
-            row = co_occurring[ti]
+            row = result[ti]
             for j, tj in enumerate(toks):
                 if i != j:
-                    row[tj] += 1
-
-    result = {t: dict(row) for t, row in co_occurring.items()}
-
-    if adjacent:
-        for (t, c) in adjacent:
-            if t in RESERVED or c in RESERVED or c == t:
-                continue
-            if not token_rels.get(t):
-                continue
-            row = result.setdefault(t, {})
-            if c not in row:
-                row[c] = 0
-
-    return result
-
-
-def literal_triples(model):
-    """
-    {(source, bridge, target), ...} -- every literal, deduplicated
-    Bridge Matrix triple: three tokens that were seen consecutively,
-    in exactly that order, at least once in training. This is the
-    evidence V8's triple-witness vote checks (previous, current, C)
-    against: an exact match here means previous->current->C happened
-    as one literal trained continuation, not merely that the three
-    tokens shared a sentence somewhere (that weaker question is V7's
-    job, via token_to_relationships/rels intersection).
-
-    Built ONLY from the literal Bridge Matrix -- every triple there
-    already occurred at least once in training (BridgeMatrix.build()
-    only ever records triples it actually saw), so no additional
-    relationship-existence check is needed here, unlike
-    bigram_relationships() (which layers relationship_ids on top of
-    the Bridge Matrix for V5's narrower per-sentence question). Same
-    literal-only reasoning as every other helper in this module.
-    """
-    b = model.bridges
-    return {(b.source[i], b.bridge[i], b.target[i]) for i in range(len(b.source))}
+                    row[tj] = row.get(tj, 0) + 1
+    return dict(result)
 
 
 class ImportanceVoteMatrix:
-    """
-    Precomputed, once-built support for importance voting: which
-    tokens count as important members under a mode, the shared
-    token -> {relationship_id, ...} index votes are counted from, and
-    the bigram-frequency index the tie-break cascade uses. Same
-    precompute-once-query-many pattern as ContextTriggerMatrix.
-    """
+    """Precomputed evidence for Q1-Q4 plus the tie-break data. Build once, query many times."""
 
     def __init__(self):
-        self._memos = {}        # derived lookup structures (see _memo()) -- never serialized
-        self._ctx_state = None  # last context's accumulated evidence -- see _context_accumulators()
-        self._cand_memo = None  # (source list, len, first, last, sorted list, set) -- see _prepare_candidates()
-        self._token_rels = {}   # token -> set(rel_id), from ctm.token_to_relationships
-        self._important = set()  # token ids eligible to cast V1/V2 votes under this mode
-        self._important_weight = IVMConfig.IMPORTANT_WEIGHT  # V1's per-token weight -- see score_candidates()
-        self._influence_weight = IVMConfig.INFLUENCE_WEIGHT  # V2's per-token weight -- see score_candidates()
-        self._context_weight = IVMConfig.CONTEXT_WEIGHT    # V3's per-token weight -- see score_candidates()
-        self._context_influence_weight = IVMConfig.CONTEXT_INFLUENCE_WEIGHT  # V4's per-token weight -- see score_candidates()
-        self._bigram_witness_weight = IVMConfig.BIGRAM_WITNESS_WEIGHT  # V5's per-token weight -- see score_candidates()
-        self._adjacency_weight = IVMConfig.ADJACENCY_WEIGHT  # V6's per-token weight -- see score_candidates()
-        self._prev_current_weight = IVMConfig.PREV_CURRENT_WEIGHT  # V7's flat weight -- see score_candidates()
-        self._triple_weight = IVMConfig.TRIPLE_WEIGHT  # V8's flat weight -- see score_candidates()
-        self._whole_context_weight = IVMConfig.WHOLE_CONTEXT_WEIGHT  # V9's flat weight -- see score_candidates()
-        self._noise_weight = IVMConfig.NOISE_WEIGHT  # V10's per-token weight -- see score_candidates()
-        # V10's data source (see noise.py's TokenVocabularyMatrix). None
-        # until attached: by build() when NoiseConfig.EAGER_BUILD is on,
-        # otherwise lazily by model.py's _ensure_noise_layer() on the
-        # first Open Mode inference call (or explicitly via
-        # attach_noise_layer(), e.g. after from_dict()). A bare instance
-        # with no token_vocab means V10 contributes nothing, not an
-        # error, same contract as Strict Mode's optional
-        # context_triggers/importance_votes args.
-        self._token_vocab = None
-        self._bigram_freq = {}  # (token, candidate) -> count, from bigram_frequencies()
-        self._bigram_rels = {}  # (token, candidate) -> set(rel_id), from bigram_relationships()
-        self._adjacent = set()  # {(from_token, to_token), ...}, from adjacent_pairs() -- directed
-        self._triples = set()   # {(source, bridge, target), ...}, from literal_triples()
-        # {token: {other_token: shared_relationship_count}} -- the
-        # whole-vocabulary co-occurrence gate/reverse-index, built once
-        # in build()/from_dict() (never serialized -- fully re-derivable
-        # from _token_rels, same "derived, not stored" treatment as
-        # _token_cache below). Powers three things: (1) build_cache()'s
-        # sparse cache construction, (2) score_candidates()'s live gate
-        # (skip a candidate straight to a 0 score if no context token
-        # has ever co-occurred with it), (3) V9's unanimous-agreement
-        # check. See the module docstring's "The gate" section.
-        self._co_occurring = {}
-        # Sparse per-token score cache for V1/V2/V3/V4/V6 -- see build_cache()
-        # and the "cache" branch of score_candidates(). NOT serialized by
-        # to_dict/from_dict (it's fully re-derivable from _token_rels,
-        # _important, _adjacent, and the weights above, all of which
-        # already are serialized) -- call build_cache()/enable_cache()
-        # again after from_dict() if you want it back.
-        self._token_cache = {}      # {t: {c: (shared_count, adjacent_flag)}}
-        self._cache_candidates = None  # frozenset the cache was built for, or None
-        self._use_cache = False     # toggle -- see enable_cache()/disable_cache()
+        self._memos = {}        # derived lookup views (see _memo()) -- speed only, never serialized
+        self._ctx_state = None  # Q1 counts for the last context seen (incremental) -- see _q1_counts()
+        self._cand_memo = None  # remembered sorted/deduped candidate list -- see _prepare_candidates()
+        self._token_rels = {}   # token -> {rel_id}, from model.token_relationships(min_len=3)
+        self._q1_weight = IVMConfig.Q1_WEIGHT
+        self._q2_weight = IVMConfig.Q2_WEIGHT
+        self._legality_top_k = parse_top_k(IVMConfig.LEGALITY_TOP_K)   # None = all (see select())
+        self._bigram_freq = {}  # (a, b) -> count        (tie-break)
+        self._bigram_rels = {}  # (a, b) -> {rel_id}     (Q2)
+        self._adjacent = set()  # {(a, b), ...} directed legal bigrams (Q3)
+        self._triples = {}      # {(a, m): {b}} consecutive trained triples a m b (Q4)
+        self._co_occurring = {} # token -> {other: shared_count}   (Q1)
+        # Optional Q1 cache -- see build_cache(). Not serialized (re-derivable).
+        self._token_cache = {}         # {t: {c: shared_count}}, shared_count > 0 only
+        self._cache_candidates = None  # frozenset the cache was built for
+        self._use_cache = False
+
+    def set_legality_top_k(self, k):
+        """Set how many of the top-scored tokens Q3/Q4 may work on: a positive int, or
+        None / 0 / "all" for every candidate. Returns the stored value (None = all)."""
+        self._legality_top_k = parse_top_k(k)
+        return self._legality_top_k
+
+    @property
+    def legality_top_k(self):
+        return self._legality_top_k
 
     @classmethod
-    def build(cls, model, mode="strict", important_weight=IVMConfig.IMPORTANT_WEIGHT,
-              influence_weight=IVMConfig.INFLUENCE_WEIGHT, context_weight=IVMConfig.CONTEXT_WEIGHT,
-              context_influence_weight=IVMConfig.CONTEXT_INFLUENCE_WEIGHT,
-              bigram_witness_weight=IVMConfig.BIGRAM_WITNESS_WEIGHT,
-              adjacency_weight=IVMConfig.ADJACENCY_WEIGHT,
-              prev_current_weight=IVMConfig.PREV_CURRENT_WEIGHT,
-              triple_weight=IVMConfig.TRIPLE_WEIGHT,
-              whole_context_weight=IVMConfig.WHOLE_CONTEXT_WEIGHT,
-              noise_weight=IVMConfig.NOISE_WEIGHT, use_cache=False):
+    def build(cls, model, mode="strict", q1_weight=IVMConfig.Q1_WEIGHT, q2_weight=IVMConfig.Q2_WEIGHT,
+              use_cache=False):
         ivm = cls()
-        ivm._token_rels = token_to_relationships(model)
-        ivm._important = important_member_tokens(model, mode=mode)
-        ivm._important_weight = important_weight
-        ivm._influence_weight = influence_weight
-        ivm._context_weight = context_weight
-        ivm._context_influence_weight = context_influence_weight
-        ivm._bigram_witness_weight = bigram_witness_weight
-        ivm._adjacency_weight = adjacency_weight
-        ivm._prev_current_weight = prev_current_weight
-        ivm._triple_weight = triple_weight
-        ivm._whole_context_weight = whole_context_weight
-        ivm._noise_weight = noise_weight
+        ivm._token_rels = model.token_relationships(min_len=3)
+        ivm._q1_weight, ivm._q2_weight = q1_weight, q2_weight
         ivm._bigram_freq = bigram_frequencies(model, mode=mode)
         ivm._bigram_rels = bigram_relationships(model)
         ivm._adjacent = adjacent_pairs(model)
-        ivm._triples = literal_triples(model)
-        # Whole-vocabulary co-occurrence gate/reverse-index -- built
-        # once here (from the _token_rels just computed above) and
-        # reused by build_cache() below AND by score_candidates()'s
-        # live path, instead of each recomputing its own version.
-        ivm._co_occurring = co_occurrence_index(ivm._token_rels, adjacent=ivm._adjacent)
-        # V10's data source (see noise.py) -- OPT-IN by default (see
-        # config.NoiseConfig.EAGER_BUILD's docstring for why): reuse
-        # model.token_vocab if it's already been built by something
-        # that actually wanted it, but do NOT force a fresh build here
-        # on every single call -- a full TokenVocabularyMatrix build
-        # touches every (token, home) pair in the corpus once, paid on
-        # every train()/train_incremental()/merge/load() regardless of
-        # whether V10 was ever going to be used this session. Local
-        # import: noise.py imports token_to_relationships from this
-        # module at its own top level, so importing it back up there
-        # would be circular -- same reason model.py imports ctm/ivm/
-        # noise lazily inside methods instead of at module scope.
-        if NoiseConfig.EAGER_BUILD:
-            ivm.attach_noise_layer(model)
-        else:
-            ivm._token_vocab = model.token_vocab
+        ivm._triples = triples_by_pair(model)
+        ivm._co_occurring = co_occurrence_index(ivm._token_rels, unified=model)
         if use_cache:
-            # Open Mode always scores the FULL vocabulary as candidates
-            # (see model.all_candidate_tokens()/model.py's
-            # _rebuild_open_engine) -- that's the one candidate set this
-            # cache is actually built and validated against.
             ivm.enable_cache(model.all_candidate_tokens())
         return ivm
 
-    def attach_noise_layer(self, model):
-        """
-        (Re)attach V10's data source -- noise.py's TokenVocabularyMatrix
-        -- from `model`. model.py's _ensure_noise_layer() calls this
-        for you on the first Open Mode inference call (and build() does
-        too when NoiseConfig.EAGER_BUILD is on), so you only need it
-        yourself when driving an ImportanceVoteMatrix directly -- e.g.
-        after from_dict() (which can't restore _token_vocab on its own
-        -- see to_dict()'s docstring) or if `model`'s graphs changed and
-        you want V10's evidence refreshed without a full rebuild. Reuses
-        model.token_vocab if already built, else builds it fresh (and
-        caches it back onto `model`, same as model.build_token_vocab()
-        would). Returns the attached TokenVocabularyMatrix.
-        """
-        if model.token_vocab is None:
-            if model.noise_index is None:
-                # This instance already holds token -> relationship ids from
-                # the same graphs; hand them over instead of re-deriving
-                # them in a second full pass over every triple.
-                model.build_noise_index(token_rels=self._token_rels)
-            model.build_token_vocab()
-        self._token_vocab = model.token_vocab
-        return self._token_vocab
-
-    # ── sparse per-token score cache (V1/V2/V3/V4/V6 only) ─────────────────
-    #
-    # V1, V2, V3, V4, and V6 are each a SUM OVER CONTEXT TOKENS of a
-    # per-(t, c) contribution that depends only on t, c, and static
-    # per-instance state (_token_rels, _important, _adjacent, weights) --
-    # never on which OTHER tokens happen to be in context this step, and
-    # never on `current`/`previous`. That means each (t, c) contribution
-    # can be computed once and reused for every future step, instead of
-    # being recomputed from scratch (three separate O(|context| x
-    # |candidates|) loops -- _context_vote, _context_influence_vote,
-    # _adjacency_vote -- plus _knows_rels' own O(|important present| x
-    # |candidates|) loop) on every single call.
-    #
-    # V5, V7, V8, V9, and V10 are deliberately NOT part of this cache:
-    # V5's vote for (t, c) also depends on `current` (a different
-    # `current` means a different witness set for the same t/c); V7/V8
-    # aren't a per-token contribution at all -- each is a single
-    # fixed-pair (V7) or fixed-triple (V8) check on (previous,
-    # current), not a sum over context tokens; V9 is a conjunction
-    # ACROSS every context token for one candidate, not a sum of
-    # independent per-(t, c) terms, so it can't be decomposed into
-    # per-token rows the way V1-V4/V6 can either; V10 IS a per-(t, c)
-    # sum like V1-V4/V6, but its values live in a wholly separate
-    # precomputed structure (noise.py's TokenVocabularyMatrix, built
-    # and owned outside this cache), so folding it in here would mean
-    # this cache duplicating state that structure already IS the cache
-    # for. All five are still fast, though -- V5/V7/V8 are cheap
-    # sparse set/tuple lookups (over _bigram_rels / _token_rels /
-    # _triples), V9 reuses this same instance's _co_occurring gate
-    # (see score_candidates()), and V10 reads directly from
-    # TokenVocabularyMatrix's own precomputed rows -- so all five are
-    # computed live whether or not the V1-V4/V6 cache is enabled.
-    #
-    # Only ONE raw quantity actually varies per (t, c) pair here:
-    # shared = len(rels(t) & rels(c)). V1 (a token knows C at all) and V3
-    # (a context token co-occurred with C at all) are both just
-    # "shared > 0"; V4 IS shared, scaled small; V2's influence(t) is the
-    # count of candidates t shares any relationship with (== the number
-    # of cache[t] entries with shared > 0); V6 is a separate binary flag
-    # (adjacency does not require sharing multiple relationships, just
-    # one -- and in practice adjacency implies shared > 0 anyway, since
-    # two literally-consecutive tokens are necessarily in the same
-    # sentence). Storing the two raw numbers (not the five pre-weighted
-    # votes) also means changing a weight (important_weight, ...) after
-    # the cache is built does NOT stale it -- the weights are re-applied
-    # at score time, only the underlying evidence is cached.
+    # ======= optional Q1 cache =========================================================
 
     def build_cache(self, candidates):
-        """
-        Build the sparse per-token cache for exactly `candidates` (an
-        iterable of token ids -- for Open Mode this should be
-        model.all_candidate_tokens(), the same full-vocabulary set
-        score_candidates()/select() are actually called with every
-        step). Does NOT enable the cache by itself -- see enable_cache().
-
-        self._token_cache ends up as {t: {c: (shared, adjacent)}}, sparse:
-        a token t only gets an entry at all if _token_rels has one for it
-        (reserved/never-seen tokens are skipped entirely), and within
-        that, a candidate c only gets an entry if shared > 0 or the pair
-        is adjacent -- exactly the same "only nonzero rows" sparsity the
-        rest of this module already uses for _bigram_rels/_adjacent, not
-        a dense |vocab| x |vocab| table.
-
-        ALGORITHM NOTE: shared(t, c) = |rels(t) & rels(c)| is exactly
-        the number of relationships (training sentences) containing
-        BOTH t and c. An old version tested every (t, c) pair in a
-        full |tokens_with_relationships| x |candidates| double loop,
-        computing that intersection from scratch each time -- an
-        O(vocab^2) cost that dominated model build time for anything
-        past a small vocabulary (empirically ~4x slower per ~2x
-        vocabulary growth: quadratic, not linear). A later version
-        fixed that here directly, by inverting relationship -> member
-        tokens ONCE and only visiting tokens actually co-occurring
-        together -- O(sum of sentence-length^2 across the corpus)
-        instead of O(vocab^2). That inversion is now
-        co_occurrence_index(), computed ONCE per model in build() (and
-        from_dict()) as self._co_occurring, since score_candidates()'s
-        live gate needs the exact same whole-vocabulary co-occurrence
-        graph -- this method is now just a FILTER over that shared
-        structure down to `candidates`, not a separate O(sum of
-        sentence-length^2) pass of its own every time build_cache() is
-        called (e.g. re-enabling the cache for a different candidate
-        set after incremental training no longer re-pays that cost).
-        """
+        """Precompute, for exactly `candidates`, {t: {c: shared_count}} (shared_count > 0 only).
+        Does not enable it -- see enable_cache()."""
         candidates = frozenset(candidates)
-
         cache = {}
         for t, row in self._co_occurring.items():
-            out_row = {}
-            for c, shared in row.items():
-                # co_occurrence_index() already excludes RESERVED and
-                # self-pairs (t, t) by construction, and already
-                # backfills adjacency-only (shared=0) pairs -- only the
-                # candidate-set restriction is this method's own job.
-                if c not in candidates:
-                    continue
-                adjacent = 1 if (t, c) in self._adjacent else 0
-                out_row[c] = (shared, adjacent)
-            if out_row:
-                cache[t] = out_row
-
+            out = {c: n for c, n in row.items() if n and c in candidates}
+            if out:
+                cache[t] = out
         self._token_cache = cache
         self._cache_candidates = candidates
 
     def enable_cache(self, candidates=None):
-        """
-        Turn the cache ON. If `candidates` is given, (re)builds it first
-        (via build_cache) -- pass this whenever the model's graphs may
-        have changed since the cache was last built (fresh train,
-        incremental merge) or the very first time you enable it. If
-        `candidates` is omitted, reuses whatever was built last time --
-        raises ValueError if nothing has been built yet, rather than
-        silently scoring against a stale or nonexistent cache.
-        """
+        """Turn the cache on, (re)building it first if `candidates` is given. Without
+        `candidates` it reuses the last build, or raises ValueError if there is none."""
         if candidates is not None:
             self.build_cache(candidates)
         elif self._cache_candidates is None:
             raise ValueError("enable_cache() called with no `candidates` and "
-                              "no prior build_cache() call -- nothing to enable")
+                             "no prior build_cache() call -- nothing to enable")
         self._use_cache = True
 
     def disable_cache(self):
-        """
-        Turn the cache OFF -- score_candidates() falls back to its live
-        computation. The built cache data itself is left in place (not
-        cleared), so a later enable_cache() with no arguments is instant.
-        This is the toggle for comparing cached vs. live scoring/timing
-        without rebuilding anything in between.
-        """
+        """Back to live Q1. The built cache is kept, so enable_cache() with no arguments is instant."""
         self._use_cache = False
 
-    # ── queries ──────────────────────────────────────────────────────────
-
-    # ── derived lookup structures (speed only -- never change a score) ─────
-    #
-    # score_candidates() runs once per generated token. Several of its
-    # inner loops asked a per-candidate question by building a tuple key
-    # ((t, c), (current, c), (previous, current, c)) for EVERY candidate --
-    # O(vocabulary) allocations per step for answers that are almost
-    # always "no". The helpers below regroup the same underlying data
-    # (_adjacent, _bigram_rels, _triples, _token_rels) by their leading
-    # token(s) once, so a step only touches entries that can actually
-    # vote. Each is rebuilt automatically if the underlying container is
-    # swapped for another object or changes size (test.py hand-builds
-    # instances that way), so they can never serve stale data.
+    # ==== derived lookup views (speed only -- never change a score) =======================
 
     def _memo(self, key, source, builder):
         m = self._memos.get(key)
@@ -883,34 +281,22 @@ class ImportanceVoteMatrix:
         return value
 
     def _adjacent_from(self):
-        """{t: {c, ...}} view of self._adjacent -- 'was t ever immediately
-        followed by c' as one set-membership per (t, c) instead of building
-        a (t, c) tuple for it."""
+        """{a: {b, ...}} view of the legal bigrams -- 'what has a ever been followed by'."""
         def build(adjacent):
             out = {}
-            for t, c in adjacent:
-                out.setdefault(t, set()).add(c)
+            for a, b in adjacent:
+                out.setdefault(a, set()).add(b)
             return out
         return self._memo("adjacent_from", self._adjacent, build)
 
     def _bigrams_from(self):
-        """{a: {b: witness_rels}} view of self._bigram_rels -- only the
-        successors `a` was ever literally seen with."""
+        """{a: {b: witness_rels}} view of Q2's evidence."""
         def build(bigram_rels):
             out = {}
             for (a, b), rels in bigram_rels.items():
                 out.setdefault(a, {})[b] = rels
             return out
         return self._memo("bigrams_from", self._bigram_rels, build)
-
-    def _triples_from(self):
-        """{(previous, current): {c, ...}} view of self._triples."""
-        def build(triples):
-            out = {}
-            for a, b, c in triples:
-                out.setdefault((a, b), set()).add(c)
-            return out
-        return self._memo("triples_from", self._triples, build)
 
     def _rel_tokens(self):
         """{rel_id: {token, ...}} -- the inverse of self._token_rels."""
@@ -922,28 +308,11 @@ class ImportanceVoteMatrix:
             return out
         return self._memo("rel_tokens", self._token_rels, build)
 
-    def _positive_row(self, t, row):
-        """frozenset of {c : row[c] > 0} for context token t's
-        _co_occurring row (rows also carry shared == 0 adjacency-only
-        entries, which must not count as 'knows'), cached per token and
-        re-derived if that row object is ever replaced."""
-        cache = self._memos.setdefault("positive_rows", {})
-        hit = cache.get(t)
-        if hit is not None and hit[0] is row and hit[1] == len(row):
-            return hit[2]
-        pos = frozenset(c for c, shared in row.items() if shared > 0)
-        cache[t] = (row, len(row), pos)
-        return pos
-
     def _prepare_candidates(self, candidates):
-        """(sorted list, set) for `candidates`. The Open Mode engine hands
-        score_candidates() the very same vocabulary list every step, so for
-        list/tuple input the sort+dedupe is remembered (guarded by object
-        identity, length, and both end elements); anything else -- sets,
-        generators, a caller that rebuilds its list -- is just recomputed."""
+        """(sorted list, set) for `candidates`; the sort is remembered for the identical
+        vocabulary list Open Mode passes every step."""
         if isinstance(candidates, (list, tuple)) and candidates:
-            memo = self._cand_memo
-            n = len(candidates)
+            memo, n = self._cand_memo, len(candidates)
             if (memo is not None and memo[0] is candidates and memo[1] == n
                     and memo[2] == candidates[0] and memo[3] == candidates[-1]):
                 return memo[4], memo[5]
@@ -954,224 +323,79 @@ class ImportanceVoteMatrix:
         ordered = sorted(set(candidates))
         return ordered, set(ordered)
 
-    def _context_accumulators(self, context_set, candidates_set):
-        """
-        Per-candidate evidence from the (non-reserved) context tokens, as
-        exact integer counts, extended incrementally: if the context grew
-        since the previous call (same candidate universe, same underlying
-        data) only the NEW tokens' co-occurrence rows are added; anything
-        else rebuilds from scratch (== the cost of one old-style pass).
+    # ============ the four questions ==================================================
 
-        Returns a dict of:
-          n_ctx      {c: how many context tokens co-occurred with c}   (V3 / V10)
-          shared_sum {c: sum of shared-sentence counts}                 (V4)
-          adj_n      {c: how many context tokens were directly followed by c} (V6)
-          imp_n      {c: how many IMPORTANT context tokens know c}      (V1)
-          imp_infl   {c: sum of those tokens' influence}                (V2)
-          knows / influence  {important token: {c: shared}} / {token: count} (trace)
-        The returned dict is a published snapshot: never mutated after this
-        returns. Extending copies first and swaps the new snapshot in with
-        one assignment, so concurrent generations (server.py is threaded)
-        can at worst waste a rebuild -- never see a half-updated state.
+    def _q1_counts(self, context_tokens, candidates_set, use_cache):
         """
-        important_set = self._important
-        adjacent_from = self._adjacent_from()
-        tokens = {t for t in context_set if t not in RESERVED}
+        {c: how many context tokens have ever shared a sentence with c}  (Q1, unweighted).
+        Three equivalent ways to get it: from the cache, incrementally for a set context
+        (generation grows the context one token per step, so only NEW tokens' rows are added),
+        or a plain pass for any other iterable (a list counts a repeated token each time).
+        """
+        token_rels = self._token_rels
+        if use_cache:
+            n = {}
+            for t in context_tokens:
+                if t in RESERVED:
+                    continue
+                for c in self._token_cache.get(t, ()):
+                    n[c] = n.get(c, 0) + 1
+            return n
+
+        co = self._co_occurring
+        if not isinstance(context_tokens, (set, frozenset)):
+            n = {}
+            for t in context_tokens:
+                if t in RESERVED or not token_rels.get(t):
+                    continue
+                for c, shared in co.get(t, {}).items():
+                    if shared and c in candidates_set:
+                        n[c] = n.get(c, 0) + 1
+            return n
+
+        tokens = {t for t in context_tokens if t not in RESERVED}
         st = self._ctx_state
-        reuse = (st is not None
-                 and st["cands"] is candidates_set
-                 and st["co"] is self._co_occurring and st["co_len"] == len(self._co_occurring)
-                 and st["rels"] is self._token_rels and st["rels_len"] == len(self._token_rels)
-                 and st["imp"] is important_set and st["imp_len"] == len(important_set)
-                 and st["adj"] is adjacent_from
-                 and st["tokens"] <= tokens)
-        if reuse:
+        if (st is not None and st["cands"] is candidates_set
+                and st["co"] is co and st["co_len"] == len(co)
+                and st["rels"] is token_rels and st["rels_len"] == len(token_rels)
+                and st["tokens"] <= tokens):
             new_tokens = tokens - st["tokens"]
             if not new_tokens:
-                return st
-            n_ctx, shared_sum, adj_n = dict(st["n_ctx"]), dict(st["shared_sum"]), dict(st["adj_n"])
-            imp_n, imp_infl = dict(st["imp_n"]), dict(st["imp_infl"])
-            knows, influence = dict(st["knows"]), dict(st["influence"])
+                return st["n"]
+            n = dict(st["n"])           # copy, then publish: concurrent generations never see a half-update
         else:
-            new_tokens = tokens
-            n_ctx, shared_sum, adj_n, imp_n, imp_infl = {}, {}, {}, {}, {}
-            knows, influence = {}, {}
-
-        token_rels, co_occurring = self._token_rels, self._co_occurring
+            new_tokens, n = tokens, {}
         for t in new_tokens:
             if not token_rels.get(t):
                 continue
-            row = co_occurring.get(t)
-            if not row:
-                continue
-            is_important = t in important_set
-            t_knows = {} if is_important else None
-            adj_t = adjacent_from.get(t)
-            for c, shared in row.items():
-                if c not in candidates_set:
-                    continue
-                if shared:
-                    n_ctx[c] = n_ctx.get(c, 0) + 1
-                    shared_sum[c] = shared_sum.get(c, 0) + shared
-                    if is_important:
-                        t_knows[c] = shared
-                if adj_t is not None and c in adj_t:
-                    adj_n[c] = adj_n.get(c, 0) + 1
-            if is_important and t_knows:
-                knows[t] = t_knows
-                inf = len(t_knows)
-                influence[t] = inf
-                for c in t_knows:
-                    imp_n[c] = imp_n.get(c, 0) + 1
-                    imp_infl[c] = imp_infl.get(c, 0) + inf
+            for c, shared in co.get(t, {}).items():
+                if shared and c in candidates_set:
+                    n[c] = n.get(c, 0) + 1
+        self._ctx_state = {"cands": candidates_set, "co": co, "co_len": len(co),
+                           "rels": token_rels, "rels_len": len(token_rels),
+                           "tokens": frozenset(tokens), "n": n}
+        return n
 
-        snapshot = {"cands": candidates_set, "co": co_occurring, "co_len": len(co_occurring),
-                    "rels": token_rels, "rels_len": len(token_rels),
-                    "imp": important_set, "imp_len": len(important_set), "adj": adjacent_from,
-                    "tokens": frozenset(tokens),
-                    "n_ctx": n_ctx, "shared_sum": shared_sum, "adj_n": adj_n,
-                    "imp_n": imp_n, "imp_infl": imp_infl, "knows": knows, "influence": influence}
-        self._ctx_state = snapshot
-        return snapshot
-
-    def important_tokens_in(self, context_tokens):
-        """Sorted subset of context_tokens that count as important."""
-        return sorted(t for t in context_tokens
-                      if t in self._important and t not in RESERVED)
-
-    def _knows_rels(self, important_token, candidates):
+    def _q2_counts(self, current, context_tokens, candidates_set):
         """
-        Like _knows, but returns the actual set of relationship ids
-        shared with each candidate, not just the count -- exposed for
-        tracing/auditing. A token never votes for itself -- see
-        honesty notes.
+        {c: number of context tokens that were in a sentence containing the bigram (current, c)}
+        (Q2, unweighted). Only successors `current` was ever seen with can vote, so only those
+        are visited. No entry (not 0) for a candidate whose bigram was never seen.
         """
-        rels_t = self._token_rels.get(important_token)
-        if not rels_t:
-            return {}
         out = {}
-        for c in candidates:
-            if c in RESERVED or c == important_token:
-                continue
-            rels_c = self._token_rels.get(c)
-            if not rels_c:
-                continue
-            shared = rels_t & rels_c
-            if shared:
-                out[c] = shared
-        return out
-
-    def _knows(self, important_token, candidates):
-        """{candidate: support} for one important token, support > 0 only."""
-        return {c: len(rels) for c, rels in self._knows_rels(important_token, candidates).items()}
-
-    def _context_vote(self, context_tokens, candidates):
-        """
-        V3: EVERY token in context -- important or not -- casts a
-        full, un-scaled vote of 1.0 for any candidate it co-occurred
-        with at least once. Binary: a token either attests a
-        candidate or it doesn't; evidence count does not scale this
-        vote (V1 is also binary now -- see score_candidates -- and V4
-        is where evidence count/magnitude enters, at a much smaller
-        weight). Same exclusions as every other vote layer: reserved
-        tokens never vote, and a token never votes for itself.
-        """
-        votes = Counter()
-        for t in context_tokens or []:
-            if t in RESERVED:
-                continue
-            rels_t = self._token_rels.get(t)
-            if not rels_t:
-                continue
-            for c in candidates:
-                if c in RESERVED or c == t:
-                    continue
-                rels_c = self._token_rels.get(c)
-                if rels_c and (rels_t & rels_c):
-                    votes[c] += 1.0
-        return dict(votes)
-
-    def _context_influence_vote(self, context_tokens, candidates):
-        """
-        V4: "context token influence" -- every context token P (not
-        just important members) ALSO casts a magnitude-sensitive
-        vote: not just "do I know this candidate at all" (that's
-        V3's binary job) but "how many times have I co-occurred with
-        THIS SPECIFIC candidate" -- the raw evidence count, same
-        knowledge(t, C) quantity V1 used to use before it was made
-        binary (see score_candidates). Weighted very small (default
-        0.01, smaller even than V1/V2's 0.1) so it can only ever
-        refine a decision V3 already made, never compete with it --
-        same "small vote riding on top of a big one" principle as
-        V1/V2 relative to V3, just for the WHOLE context instead of
-        only the important subset. Same exclusions as every other
-        layer: reserved tokens never vote, a token never votes for
-        itself.
-        """
-        votes = Counter()
-        for t in context_tokens or []:
-            if t in RESERVED:
-                continue
-            rels_t = self._token_rels.get(t)
-            if not rels_t:
-                continue
-            for c in candidates:
-                if c in RESERVED or c == t:
-                    continue
-                rels_c = self._token_rels.get(c)
-                if not rels_c:
-                    continue
-                n = len(rels_t & rels_c)
-                if n:
-                    votes[c] += self._context_influence_weight * n
-        return dict(votes)
-
-    def _bigram_witness_vote(self, current, context_tokens, candidates):
-        """
-        V5: for each candidate C, look up the literal set of training
-        sentences (relationship_ids) where the exact bigram
-        (current, C) occurred (self._bigram_rels -- see
-        bigram_relationships()). Every token in context then casts one
-        full binary vote for C if it was ALSO present in at least one
-        of those specific witnessing sentences -- "I have seen
-        current->C happen, and I was there." A token that shares
-        plenty of other sentences with C, but never one containing
-        this exact bigram, casts no V5 vote for it ("I have never
-        seen that connection") -- that is the whole point of this
-        layer being distinct from V3's broader "co-occurred anywhere"
-        question. Returns {} if `current` is None (nothing to look up)
-        or the candidate was never literally seen as this bigram at
-        all (no entry in self._bigram_rels). Same exclusions as every
-        other layer: reserved tokens never vote, a token never votes
-        for a candidate it IS.
-        """
-        votes = Counter()
-        if current is None:
-            return dict(votes)
-        if isinstance(candidates, (set, frozenset)):
-            # Fast path (score_candidates always passes a set): only the
-            # successors `current` was ever literally seen with can vote at
-            # all, so walk those instead of every candidate.
-            succ = self._bigrams_from().get(current)
-            if not succ:
-                return dict(votes)
-            items = [(c, rels) for c, rels in succ.items() if c in candidates]
-        else:
-            items = [(c, self._bigram_rels.get((current, c))) for c in candidates]
+        if current is None or current in RESERVED:
+            return out
+        succ = self._bigrams_from().get(current)
+        if not succ:
+            return out
         ctx_set = context_tokens if isinstance(context_tokens, (set, frozenset)) else None
-        rel_tokens = None
-        for c, witness_rels in items:
-            if c in RESERVED:
-                continue
-            if not witness_rels:
+        token_rels, rel_tokens = self._token_rels, None
+        for c, witness_rels in succ.items():
+            if c not in candidates_set or c in RESERVED or c == current or not witness_rels:
                 continue
             if ctx_set is not None and len(witness_rels) * 4 < len(ctx_set):
-                # Few witnessing sentences, many context tokens: gather the
-                # tokens that appear in those sentences once and intersect
-                # with the context, instead of intersecting every context
-                # token's relationship set with witness_rels. Same count
-                # (a token votes iff it shares a witnessing sentence; not
-                # reserved, not c itself).
+                # Few witnessing sentences, many context tokens: collect the tokens in those
+                # sentences once and intersect, instead of testing every context token.
                 if rel_tokens is None:
                     rel_tokens = self._rel_tokens()
                 pool = set()
@@ -1180,897 +404,225 @@ class ImportanceVoteMatrix:
                 voters = (pool & ctx_set) - RESERVED
                 voters.discard(c)
                 if voters:
-                    votes[c] += float(len(voters))
+                    out[c] = float(len(voters))
                 continue
-            for t in context_tokens or []:
+            n = 0
+            for t in context_tokens or ():
                 if t in RESERVED or t == c:
                     continue
-                rels_t = self._token_rels.get(t)
+                rels_t = token_rels.get(t)
                 if rels_t and (rels_t & witness_rels):
-                    votes[c] += 1.0
-        return dict(votes)
+                    n += 1
+            if n:
+                out[c] = float(n)
+        return out
 
-    def _adjacency_vote(self, context_tokens, candidates):
-        """
-        V6: for each candidate C, every context token t asks a single,
-        strictly DIRECTIONAL bigram-level question -- "was I (t) ever
-        immediately followed by you (C), anywhere in training?"
-        (self._adjacent -- see adjacent_pairs()). Full vote (1.0) if
-        the literal bigram (t -> C) exists, 0 if not. FROM t TO C
-        only: t being immediately followed by C is what counts here;
-        C being immediately followed by t does NOT vote for C (it
-        would instead be evidence for t, if t were ever scored as a
-        candidate itself). Note what this does NOT require, to keep
-        it distinct from the other layers:
-          - unlike V5, it doesn't matter whether this (t -> C)
-            adjacency has anything to do with the specific
-            current->C transition being scored right now -- t voting
-            here only means t was ONCE literally, immediately
-            followed by C, in some sentence, possibly unrelated to
-            the current step;
-          - unlike V3/V4, mere co-occurrence in the same training
-            sentence is NOT enough -- t must have been immediately
-            followed by C, not just present in the same sentence.
-        Same exclusions as every other layer: reserved tokens never
-        vote, a token never votes for a candidate it IS.
-        """
-        votes = Counter()
-        for c in candidates:
-            if c in RESERVED:
-                continue
-            for t in context_tokens or []:
-                if t in RESERVED or t == c:
-                    continue
-                if (t, c) in self._adjacent:
-                    votes[c] += 1.0
-        return dict(votes)
+    def _q3_legal(self, current, candidates_set):
+        """Q3: the candidates for which (current -> c) is a legal bigram. A token never follows
+        itself and reserved tokens are never chosen. With no `current` there is nothing to
+        check, so every candidate passes."""
+        if current is None:
+            return set(candidates_set)
+        legal = self._adjacent_from().get(current, ())
+        return {c for c in candidates_set if c in legal and c not in RESERVED and c != current}
 
-    def _prev_current_vote(self, previous, current, candidates):
-        """
-        V7: for each candidate C, cast one full binary vote iff
-        `previous`, `current`, AND C all appear together in at least
-        one training sentence -- rels(previous) ∩ rels(current) ∩
-        rels(C) ≠ ∅. UNLIKE every other layer, this is not "every
-        context token t votes" -- it's a single fixed-pair check on
-        the two most recent tokens specifically: "have I ever seen a
-        sentence that mentioned both of my last two tokens and you?"
-        One flat vote per candidate, not summed over context.
+    @staticmethod
+    def _q4_active(previous, current):
+        """Q4 is an agreement of TWO tokens, so it only starts once the context has two real
+        (non-reserved) tokens. With one (e.g. a one-word prompt: previous is <BOS>) it is
+        inactive -- it neither fires nor blocks, and Q3 alone decides."""
+        return (previous is not None and previous not in RESERVED
+                and current is not None and current not in RESERVED)
 
-        Different question from V5 (bigram_relationships(), the
-        literal (current, C) triple regardless of `previous`) and
-        from V6 (adjacent_pairs(), direct t->C adjacency for every
-        context token) -- V7 needs no adjacency between ANY of the
-        three tokens, only that all three shared one sentence.
+    def _q4_legal(self, previous, current, candidates_set):
+        """Q4 (only meaningful when _q4_active): the candidates that (previous, current) know as
+        the next token -- i.e. the consecutive triple (previous, current, c) was trained.
+        Reserved tokens are never chosen. A (previous, current) pair never seen together passes
+        nobody."""
+        known = self._triples.get((previous, current), ())
+        return {c for c in candidates_set if c in known and c not in RESERVED}
 
-        Returns {} if `previous` or `current` is None or reserved, or
-        if the two of them never even share a sentence with each
-        other (nothing left to check candidates against). A candidate
-        never votes via being `previous` or `current` itself, same
-        "a token never votes for itself" rule as every other layer.
-        """
-        votes = Counter()
-        if previous is None or current is None:
-            return dict(votes)
-        if previous in RESERVED or current in RESERVED:
-            return dict(votes)
-        rels_prev = self._token_rels.get(previous)
-        rels_curr = self._token_rels.get(current)
-        if not rels_prev or not rels_curr:
-            return dict(votes)
-        shared_pc = rels_prev & rels_curr
-        if not shared_pc:
-            return dict(votes)
-        if isinstance(candidates, (set, frozenset)) and len(shared_pc) * 4 < len(candidates):
-            # Few shared sentences: the only tokens that can vote are the ones
-            # appearing in them, so read those off directly rather than
-            # intersecting every candidate's relationship set with shared_pc.
-            rel_tokens = self._rel_tokens()
-            pool = set()
-            for r in shared_pc:
-                pool |= rel_tokens.get(r, ())
-            for c in pool & candidates:
-                if c in RESERVED or c == previous or c == current:
-                    continue
-                votes[c] += 1.0
-            return dict(votes)
-        for c in candidates:
-            if c in RESERVED or c == previous or c == current:
-                continue
-            rels_c = self._token_rels.get(c)
-            if rels_c and (shared_pc & rels_c):
-                votes[c] += 1.0
-        return dict(votes)
-
-    def _triple_vote(self, previous, current, candidates):
-        """
-        V8: for each candidate C, cast one full binary vote iff
-        (previous, current, C) was ever literally a single, consecutive
-        Bridge Matrix triple in training -- source=previous,
-        bridge=current, target=C, all three in that exact order,
-        checked against self._triples (see literal_triples()). Same
-        fixed-pair SHAPE as V7 (one flat vote per candidate, not
-        summed over context), but a strictly EXACT-MATCH question
-        instead of V7's "did all three merely share a sentence"
-        question -- (previous, current, C) can share a sentence
-        without ever having occurred as this literal triple (V7 fires,
-        V8 doesn't), but it can never occur as this literal triple
-        without also sharing a sentence (V8 firing implies V7 would
-        too, for the same candidate).
-
-        Returns {} if `previous` or `current` is None or reserved. A
-        candidate never votes via being `previous` or `current`
-        itself, same "a token never votes for itself" rule as every
-        other layer.
-        """
-        votes = Counter()
-        if previous is None or current is None:
-            return dict(votes)
-        if previous in RESERVED or current in RESERVED:
-            return dict(votes)
-        if isinstance(candidates, (set, frozenset)):
-            for c in self._triples_from().get((previous, current), ()):
-                if c in candidates and c not in RESERVED and c != previous and c != current:
-                    votes[c] += 1.0
-            return dict(votes)
-        for c in candidates:
-            if c in RESERVED or c == previous or c == current:
-                continue
-            if (previous, current, c) in self._triples:
-                votes[c] += 1.0
-        return dict(votes)
-
-    def _whole_context_vote(self, context_tokens, candidates):
-        """
-        V9: for each candidate C, cast one full binary vote iff EVERY
-        non-reserved token currently in context (other than C itself,
-        if C happens to already be a context token) has co-occurred
-        with C in at least one training relationship. V3 asks "does
-        at least one context token know C" -- this asks the strictly
-        harder "do ALL of them" -- unanimous CONSENSUS rather than
-        mere presence of evidence.
-
-        Uses self._co_occurring (the same whole-vocabulary
-        co-occurrence gate score_candidates()'s live path uses -- see
-        co_occurrence_index()) so each "does t know C" check is an
-        O(1)-average dict lookup against a precomputed row, checking
-        the stored shared-relationship COUNT is > 0 -- not just key
-        membership, since that same structure also carries adjacency-
-        only backfill entries (shared=0) that must NOT count as
-        "knowledge" here even though they're valid gate members for
-        V6's sake elsewhere.
-
-        A qualifying context token that equals C itself is excluded
-        from the requirement, not from eligibility -- same "a token
-        never has to vouch for itself" rule every other layer applies
-        to voting, just checked once per required token here instead
-        of skipped inside a sum. If that leaves NO qualifying tokens
-        at all for a given C (e.g. context is empty, entirely
-        reserved, or entirely equal to C itself), no vote is cast for
-        C -- unanimity among zero voters is not evidence, the same
-        reasoning V3 already applies to an empty context.
-        """
-        votes = Counter()
-        required_all = [t for t in (context_tokens or []) if t not in RESERVED]
-        if not required_all:
-            return dict(votes)
-        if isinstance(candidates, (set, frozenset)):
-            # Set form of the same test: c is unanimous iff, for EVERY required
-            # token t other than c itself, c is in t's positive row. That is
-            # c in the intersection of (positive_row(t) | {t}) over all t
-            # (t == c is exempt), minus the case where c is the only required
-            # token (nobody left to vouch -> no vote, as below).
-            distinct = set(required_all)
-            pools = []
-            for t in distinct:
-                row = self._co_occurring.get(t)
-                pos = self._positive_row(t, row) if row else frozenset()
-                pools.append(pos | {t})
-            pools.sort(key=len)
-            unanimous = set(pools[0])
-            for pool in pools[1:]:
-                unanimous &= pool
-                if not unanimous:
-                    break
-            for c in unanimous & candidates:
-                if c in RESERVED:
-                    continue
-                if distinct == {c}:
-                    continue
-                votes[c] += 1.0
-            return dict(votes)
-        for c in candidates:
-            if c in RESERVED:
-                continue
-            required = [t for t in required_all if t != c]
-            if not required:
-                continue
-            if all(self._co_occurring.get(t, {}).get(c, 0) > 0 for t in required):
-                votes[c] += 1.0
-        return dict(votes)
-
-    def _noise_vote(self, context_tokens, candidates, counts=None):
-        """
-        V10: noise-cancellation vote (see noise.py). For each
-        candidate C, sum every context token's PRECOMPUTED
-        TokenVocabularyMatrix row value for C -- exactly
-        noise.combine_context()'s bulk-accumulation step, exposed here
-        as a tenth independent vote layer instead of a standalone
-        analysis query. A context token with no row at all (never
-        trained, or trained but never had an eligible home -- see
-        TokenVocabularyMatrix.row()) contributes nothing for any
-        candidate, same "missing means zero" rule V1-V6 already
-        follow for a token _token_rels has nothing on.
-
-        Returns {} immediately if no TokenVocabularyMatrix has been
-        attached to this instance yet (see attach_noise_layer()/
-        model.py's _ensure_noise_layer()) -- V10 contributing nothing is not an
-        error, same contract every other opt-in signal in this module
-        follows.
-
-        `candidates` is expected to already be gate-restricted (see
-        score_candidates()) -- filtering combine()'s full output down
-        to just `candidates` here, rather than only summing the
-        candidates actually wanted, is what keeps this O(context x
-        rows-per-token) instead of O(context x |candidates|) for a
-        large candidate set like Open Mode's full vocabulary.
-        """
-        if self._token_vocab is None:
-            return {}
-        if counts is not None:
-            # Fast path (what score_candidates() uses). A candidate's noise
-            # score is the same in every context token's row (see
-            # noise.py's NoiseCancellationIndex.candidate_stages()), so
-            # summing the context tokens' rows is just that score times
-            # HOW MANY context tokens have the candidate in their row --
-            # exactly V3's raw per-candidate count. No per-token row (each
-            # up to vocabulary size) is ever built or walked.
-            return self._token_vocab.weighted_counts(
-                {c: n for c, n in counts.items() if c in candidates})
-        candidates = set(candidates)
-        combined = self._token_vocab.combine(
-            t for t in (context_tokens or []) if t not in RESERVED)
-        return {c: v for c, v in combined.items() if c in candidates}
-
-    def votes(self, candidates, context_tokens):
-        """
-        Full working, exposed for inspection/tracing (not just the
-        winner) -- this is the log that makes the mechanism auditable
-        rather than a black box.
-
-        Returns:
-            {"important_tokens": [...], "knows": {t: {C: support}},
-             "influence": {t: int}, "totals": {C: int}}
-        knows/influence are keyed by every important token present in
-        context that knows at least one candidate; totals[C] = sum of
-        influence(t) over every t that knows C (not sum of support --
-        see rule 5 in the module docstring).
-        """
-        candidates = sorted(set(candidates))
-        important = self.important_tokens_in(context_tokens or [])
-
-        knows = {}
-        for t in important:
-            k = self._knows(t, candidates)
-            if k:
-                knows[t] = k
-        influence = {t: len(k) for t, k in knows.items()}
-
-        totals = Counter()
-        for t, k in knows.items():
-            for c in k:
-                totals[c] += influence[t]
-
-        return {"important_tokens": important, "knows": knows,
-                "influence": influence, "totals": dict(totals)}
-
-    def resolve_tie(self, candidates, context_tokens):
-        """
-        Try to break a tie among `candidates` (raw token ids) using
-        importance voting. Returns the winning token id, or None if
-        no important tokens are present in context, none of them
-        know any tied candidate, or the vote total itself remains
-        tied -- every None case means "fall back to the caller's
-        normal tie-break," same contract as
-        ContextTriggerMatrix.resolve_tie.
-
-        This is the LEGACY tie-break entry point (flat influence-sum,
-        only ever called on an already-narrowed tied set). Strict
-        Mode's optional Stage-2-skip still uses this. Open Mode's
-        primary selection uses score_candidates()/select() below
-        instead -- a different formula (influence × knowledge, not
-        just influence) evaluated over the FULL legal candidate set,
-        not just a tie.
-        """
-        if not context_tokens:
-            return None
-        totals = self.votes(candidates, context_tokens)["totals"]
-        if not totals:
-            return None
-        max_votes = max(totals.values())
-        top = sorted(c for c, v in totals.items() if v == max_votes)
-        return top[0] if len(top) == 1 else None
+    # ==== scoring ========================================================================= 
 
     def score_candidates(self, candidates, context_tokens, current=None, previous=None):
         """
-        Open Mode's primary scoring pass -- evaluates EVERY candidate
-        given, not just a pre-existing tie. TEN independent vote
-        layers, summed (see the module docstring for the full
-        rationale). An important token is ALSO a context token
-        (I ⊆ P), so it votes in every context-token layer it
-        qualifies for -- V3, V4, V6, and V10 as a plain context member,
-        PLUS V1 and V2 because it's important. Non-important context
-        tokens cast V3/V4/V6/V10. V7 and V8 are separate from all of
-        that -- neither iterates over context at all, only `previous`
-        and `current` specifically (see below and _prev_current_vote).
-        V9 is separate again -- it's the only layer that requires
-        EVERY context token to agree, not just one or a fixed pair.
+        ivm's score for EVERY candidate, all of them taking part equally: Q1 + Q2, each a
+        normalized percentage (see the module docstring). Q3/Q4 are reported here as the legal
+        sets but are NOT applied to the score -- select() applies them when it picks.
+        Returns a trace dict:
 
-            V1(C) = important_weight × Σ_{t∈I} 1[knowledge(t, C) > 0]
-                Important tokens vote independently, RAW/binary --
-                one vote per important token that knows C at all, NOT
-                scaled by how many relationships they co-occurred in.
-                Scaled down (default weight 0.1). Deliberately a
-                SMALL, supporting vote, not an independent channel
-                that can compete with V3 -- see the module docstring.
-
-            V2(C) = influence_weight × Σ_{t∈I, knows C} influence(t)
-                Influence casts its OWN small vote too -- not a
-                multiplier on V1 -- worth influence_weight (default
-                0.1) per important token that knows C, scaled by that
-                token's breadth (how many distinct candidates it
-                knows -- this is a DIFFERENT quantity from "how many
-                times it knows THIS candidate," which V4 covers).
-
-            V3(C) = context_weight × Σ_{t∈P} 1[knowledge(t, C) > 0]
-                EVERY context token P (not just important members)
-                casts one full vote (default weight 1.0 -- strictly
-                larger than V1's important_weight) for any candidate
-                it co-occurred with at least once. Binary per token,
-                not scaled by evidence count.
-
-            V4(C) = context_influence_weight × Σ_{t∈P} knowledge(t, C)
-                "Context token influence" -- the one place evidence
-                MAGNITUDE (not just presence) enters: every context
-                token P, important or not, also votes proportional to
-                HOW MANY TIMES it co-occurred with C specifically.
-                Weighted very small (default 0.01 -- smaller even
-                than V1/V2) so it only ever refines what V3 already
-                decided, never competes with it.
-
-            V5(C) = bigram_witness_weight × Σ_{t∈P}
-                        1[t was ever in a training sentence
-                          containing the literal bigram (current, C)]
-                "Bigram witness" vote -- requires `current` (the
-                token this step is generating from); returns all
-                zeros if current is None. Every context token P casts
-                one full binary vote per candidate: not "did I ever
-                co-occur with C" (V3's question) but the narrower,
-                stronger "was I present in one of the specific
-                sentences where current->C actually happened as a
-                consecutive pair." Default weight 1.0 -- PEER-weighted
-                with V3, deliberately NOT kept small like V1/V2/V4:
-                see the module docstring for why this layer is exempt
-                from the "stay beneath V3" rule the others follow.
-
-            V6(C) = adjacency_weight × Σ_{t∈P}
-                        1[t was ever DIRECTLY, immediately followed
-                          by C in training -- t->C, not C->t]
-                "Adjacency" vote -- every context token P asks C a
-                single, strictly DIRECTIONAL bigram-level question:
-                "were you ever the very next token right after me?"
-                (see adjacent_pairs()) -- FROM t TO C only, the
-                reverse direction does not count. Unlike V3/V4 (mere
-                co-occurrence in the same sentence is enough), V6
-                requires actual t->C consecutiveness; unlike V5, that
-                adjacency doesn't have to be the specific current->C
-                transition being scored -- it can be from any
-                sentence, as long as the direction is t->C. Default
-                weight 1.0 -- also PEER-weighted with V3/V5, same
-                reasoning: independently strong, specific (bigram-
-                level, not sentence-level) evidence, not a structural
-                nudge.
-
-            V7(C) = prev_current_weight × 1[rels(previous) ∩
-                        rels(current) ∩ rels(C) ≠ ∅]
-                "Previous+current co-occurrence" vote -- requires
-                `previous` (this step's actual preceding token, a
-                fixed value, NOT "every important token" or "every
-                context token"); returns all zeros if `previous` or
-                `current` is None. A single flat check per candidate,
-                not summed over context: "was there ever one training
-                sentence that mentioned previous, current, AND C, all
-                together?" No adjacency required between any pair --
-                broader than V5 in that one sense -- but it also
-                requires BOTH previous and current (not just one
-                token) to share a sentence with C, so it's narrower
-                than V3. Default weight 1.0 -- PEER-weighted with
-                V3/V5/V6: independently strong, specific, sentence-
-                level evidence, not a structural nudge.
-
-            V8(C) = triple_weight × 1[(previous, current, C) was ever
-                        a literal, consecutive Bridge Matrix triple]
-                "Triple witness" vote -- the strictest of all eight:
-                not "did these three share a sentence" (V7), but "was
-                source=previous, bridge=current, target=C ever the
-                EXACT trained triple." Same fixed-pair shape as V7
-                (one flat vote per candidate, not summed over
-                context; all zeros if `previous` or `current` is
-                None), but an exact three-way match instead of a
-                three-way shared-sentence check -- the same literal
-                test Strict Mode's Stage 2 already uses for legality,
-                exposed here as a vote instead of a hard filter.
-                Default weight 2.0 -- a notch above V5/V6/V7's peer
-                weight, since exact-triple evidence is strictly more
-                specific than any of theirs individually.
-
-            V9(C) = whole_context_weight × 1[every non-reserved token
-                        t ∈ P, t ≠ C, satisfies knowledge(t, C) > 0]
-                "Whole context" / UNANIMOUS vote -- V3 asks "does at
-                least one context token know C"; this asks the
-                strictly harder "do ALL of them" (excluding C itself
-                from the requirement if it's already a context
-                token -- same self-exclusion rule as every other
-                layer). One flat binary vote, not scaled by context
-                size or evidence magnitude -- unanimity either holds
-                or it doesn't. No vote for ANY candidate if context
-                has no qualifying tokens at all (empty, fully
-                reserved, or entirely equal to C) -- unanimity among
-                zero voters proves nothing. Default weight 2.5 -- see
-                config.py's WHOLE_CONTEXT_WEIGHT for why it sits a
-                notch above V8.
-
-            score(C) = V1(C) + V2(C) + V3(C) + V4(C) + V5(C) + V6(C) + V7(C) + V8(C) + V9(C)
-
-        By construction (important_weight, influence_weight, and
-        context_influence_weight all smaller than context_weight),
-        no amount of important-token or magnitude support can outvote
-        a genuine context-vote (V3) lead -- V1+V2+V4 can only ever
-        nudge a decision V3 left open, never override one it already
-        made. Confirm this holds for your own weights if you change
-        them: it's a property of the ratios, not guaranteed
-        automatically. V5, V6, V7, V8, and V9 are the five layers NOT
-        bound by that rule -- each is independently strong, specific
-        evidence, and by default can each outweigh V3 on its own
-        (weight >= 1.0, same as or greater than V3).
-
-        THE GATE: V1, V2, V3, V4, V6, V9, and V10 all reduce to sums or
-        conjunctions of "did t and C ever co-occur" (self._co_occurring
-        -- see co_occurrence_index()) -- so if NO context token has
-        EVER co-occurred with a given candidate C, every one of those
-        seven layers is guaranteed 0 for C, by construction, not by
-        approximation:
-          - V1/V2 only consider important tokens, a SUBSET of context.
-          - V3/V4 sum over exactly the tokens the gate checks.
-          - V6 requires t immediately followed by C in training, which
-            implies t and C shared that sentence -- a STRICTER
-            condition than mere co-occurrence, so V6-eligible implies
-            gate-eligible.
-          - V9 requires ALL context tokens to co-occur with C, which
-            trivially implies at least one does.
-          - V10 draws from noise.py's TokenVocabularyMatrix, a
-            DIFFERENT precomputed source than _co_occurring, but a
-            nonzero row entry for C still implies C appeared in one of
-            that context token's home sentences -- i.e. co-occurred --
-            so it's gate-eligible by the same argument, just proven
-            against different underlying state.
-        V5 sums over context tokens too (checking a stronger,
-        bigram-specific condition), so the same argument applies to it
-        UNCONDITIONALLY. V7 and V8 check `previous`/`current` directly
-        rather than summing over context, so the gate only covers them
-        when `previous` and `current` are THEMSELVES members of
-        `context_tokens` -- true for every real generation call (see
-        inference.py/model.py, which always build context_tokens as
-        the full token sequence including both), but NOT guaranteed
-        for an arbitrary caller. This method checks that condition at
-        runtime before applying the gate to V7/V8, and falls back to
-        scoring them against the full candidate list (never skipping
-        work that might change the answer) when it doesn't hold --
-        e.g. a caller (see test.py) that deliberately narrows
-        context_tokens to isolate one layer in a unit test.
-
-        Returns a full trace dict, not just scores, so this stays
-        auditable: {"important_tokens": [...], "knows": {...},
-        "influence": {...}, "important_vote": {C: V1},
-        "influence_vote": {C: V2}, "context_vote": {C: V3},
-        "context_influence_vote": {C: V4}, "bigram_witness_vote":
-        {C: V5}, "adjacency_vote": {C: V6}, "prev_current_vote":
-        {C: V7}, "triple_vote": {C: V8}, "whole_context_vote": {C: V9},
-        "noise_vote": {C: V10},
-        "scores": {C: V1+V2+...+V9+V10}, "cache_used": bool}.
-        "scores" is the one that actually drives select(); the ten
-        components are exposed separately (already weighted, so they
-        sum directly to "scores") so each stays independently
-        auditable. Every candidate in `candidates` gets a "scores"
-        entry (0 if no layer voted for it); the per-layer dicts only
-        have entries where that layer actually cast a vote.
-
-        If self._use_cache is on AND `candidates` (as a set) is exactly
-        the set build_cache()/enable_cache() was last built for, V1,
-        V2, V3, V4, and V6 are read from the precomputed per-token
-        cache instead of recomputed from _token_rels/_important/
-        _adjacent -- same formulas, same weights, identical numeric
-        result, just without redoing the O(|context| x |candidates|)
-        work every step (see build_cache()'s comment for why those five
-        layers -- and only those five -- are cacheable this way). When
-        the cache is off (or doesn't match), the same five layers are
-        computed live via the gate above instead of the old dense
-        O(|context| x |candidates|) loop: for each context token, only
-        the candidates it's KNOWN to co-occur with (self._co_occurring
-        row) are ever visited, so the loop's real cost tracks actual
-        co-occurrence in the corpus, not vocabulary size. V5, V7, V8,
-        V9, and V10 are always computed live either way, each
-        restricted to the gate-derived candidate set per the paragraph
-        above (V10 additionally has its own separate, always-live
-        precomputed source -- see _noise_vote()).
-        "cache_used" in the returned trace reports which path actually
-        ran, so cached vs. live runs stay easy to compare/verify
-        against each other. A candidate-set mismatch (e.g. Strict Mode
-        calling this with a narrower successor set) silently falls
-        back to the live path -- never a wrong answer, just not the
-        fast one.
+            {"q1": {C: Q1}, "q2": {C: Q2},   # weight x percentage, candidates with votes only
+             "q1_raw": {C: n}, "q2_raw": {C: n},   # raw vote counts
+             "q1_pct": {C: %}, "q2_pct": {C: %},   # normalized 0-100 over ALL candidates, before the weight
+             "q3": {C: 1.0}, "q4": {C: 1.0},   # candidates that pass each check (display)
+             "legal3": set, "legal4": set,   # the same, as sets (legal4 is empty when Q4 is inactive)
+             "q4_active": bool,   # False with fewer than two real context tokens: Q4 neither fires nor blocks
+             "scores": {C: Q1+Q2},   # one entry per candidate, 0 if nothing voted
+             "cache_used": bool}
         """
         candidates, candidates_set = self._prepare_candidates(candidates)
         context_tokens = context_tokens or []
-        context_set = set(context_tokens)
-        important = self.important_tokens_in(context_tokens)
         use_cache = (self._use_cache and self._cache_candidates is not None
                      and self._cache_candidates == candidates_set)
 
-        if use_cache:
-            knows = {}
-            for t in important:
-                row = self._token_cache.get(t)
-                if not row:
-                    continue
-                k = {c: shared for c, (shared, _adj) in row.items() if shared}
-                if k:
-                    knows[t] = k
-            influence = {t: len(k) for t, k in knows.items()}
+        raw1 = self._q1_counts(context_tokens, candidates_set, use_cache)
+        raw2 = self._q2_counts(current, context_tokens, candidates_set)
 
-            important_vote = Counter()
-            influence_vote = Counter()
-            for t, k in knows.items():
-                for c in k:
-                    important_vote[c] += self._important_weight * 1
-                    influence_vote[c] += self._influence_weight * influence[t]
+        # Normalize Q1 and Q2 to percentages over ALL candidates (see NORMALIZATION above).
+        def _pct(raw):
+            total = sum(raw.values())
+            return {c: 100.0 * n / total for c, n in raw.items()} if total else {}
+        q1_pct, q2_pct = _pct(raw1), _pct(raw2)
+        q1 = {c: self._q1_weight * p for c, p in q1_pct.items()}
+        q2 = {c: self._q2_weight * p for c, p in q2_pct.items()}
 
-            raw_context_vote = Counter()
-            raw_adjacency_vote = Counter()
-            context_influence_vote = Counter()
-            for t in context_tokens:
-                if t in RESERVED:
-                    continue
-                row = self._token_cache.get(t)
-                if not row:
-                    continue
-                for c, (shared, adjacent) in row.items():
-                    if shared:
-                        raw_context_vote[c] += 1.0
-                        context_influence_vote[c] += self._context_influence_weight * shared
-                    if adjacent:
-                        raw_adjacency_vote[c] += 1.0
-            context_vote = {c: self._context_weight * v for c, v in raw_context_vote.items()}
-            context_influence_vote = dict(context_influence_vote)
-            adjacency_vote = {c: self._adjacency_weight * v for c, v in raw_adjacency_vote.items()}
-        elif isinstance(context_tokens, (set, frozenset)):
-            # INCREMENTAL path -- what generation actually takes (model.py /
-            # inference.py always pass set(ids)). The live pass below walks
-            # EVERY context token's whole co-occurrence row on EVERY step
-            # (cost ~ |context| x row size, growing as the reply grows) even
-            # though only one token was added since the last step.
-            # _context_accumulators() keeps the per-candidate evidence
-            # (as exact integer counts) for the context it last saw and only
-            # adds the rows of tokens that are NEW; the weights are applied
-            # here, once, on the finished counts. Same evidence, same
-            # weights, same layers -- V1/V2/V4 are now weight x exact
-            # integer total instead of a float built by repeated addition in
-            # whatever order the context set happened to iterate, so they
-            # can differ from the old value in the last bit (and no longer
-            # depend on set iteration order at all).
-            acc = self._context_accumulators(context_set, candidates_set)
-            knows = dict(acc["knows"])
-            influence = dict(acc["influence"])
-            raw_context_vote = acc["n_ctx"]          # published state: read-only here
-            raw_adjacency_vote = acc["adj_n"]
-            ci_weight = self._context_influence_weight
-            context_vote = {c: self._context_weight * n for c, n in raw_context_vote.items()}
-            context_influence_vote = {c: ci_weight * n for c, n in acc["shared_sum"].items()}
-            adjacency_vote = {c: self._adjacency_weight * n for c, n in raw_adjacency_vote.items()}
-            important_vote = {c: self._important_weight * n for c, n in acc["imp_n"].items()}
-            influence_vote = {c: self._influence_weight * n for c, n in acc["imp_infl"].items()}
-        else:
-            # SINGLE merged pass for V1/V2/V3/V4/V6 -- the previous version
-            # called _knows_rels() (for V1/V2, important tokens only), then
-            # _context_vote(), _context_influence_vote(), and
-            # _adjacency_vote() (for V3/V4/V6, every context token), each as
-            # its OWN independent O(|context| x |candidates|) loop -- so an
-            # important token that's also an ordinary context member (the
-            # common case: I ⊆ P) had `shared = len(rels_t & rels_c)`
-            # recomputed from scratch up to three separate times per
-            # candidate (once in _knows_rels, again in _context_vote, again
-            # in _context_influence_vote), on top of a fourth separate scan
-            # for adjacency. A later version merged those four scans into
-            # one loop over (t, c), still tested against every candidate in
-            # `candidates` regardless of whether t and c had ever
-            # co-occurred. This version goes one step further: instead of
-            # `for c in candidates: rels_c = ...; shared = len(rels_t &
-            # rels_c)`, it looks up self._co_occurring[t] -- precomputed
-            # once per model in build() (see co_occurrence_index()) -- and
-            # only visits the candidates t is ALREADY known to co-occur
-            # (or be directly adjacent to) with. For a candidate t has never
-            # heard of, this skips the work entirely rather than computing
-            # an intersection that was always going to come back empty --
-            # real cost now tracks actual co-occurrence in the corpus, not
-            # |candidates| (typically the full vocabulary in Open Mode).
-            # Same formulas, same weights, identical numeric output to the
-            # previous versions (test.py's cached-vs-live parity checks
-            # cover this, and co_occurrence_index()'s adjacency backfill is
-            # what keeps V6 exact even for the rare degenerate-short-
-            # sentence case -- see its docstring).
-            knows = {}
-            influence = {}
-            raw_context_vote = Counter()
-            raw_adjacency_vote = Counter()
-            context_influence_vote = Counter()
-            important_set = self._important
-            adjacent_from = self._adjacent_from()
-            ci_weight = self._context_influence_weight
-
-            for t in context_tokens:
-                if t in RESERVED:
-                    continue
-                rels_t = self._token_rels.get(t)
-                if not rels_t:
-                    continue
-                is_important = t in important_set
-                t_knows = {} if is_important else None
-                # GATE: only visit candidates t has ever actually
-                # co-occurred (or, per co_occurrence_index()'s
-                # backfill, been directly adjacent to) with, instead
-                # of testing every candidate in the full set. Same
-                # `shared`/`adjacent` values the old per-candidate
-                # intersection would have computed -- see
-                # co_occurrence_index()'s docstring for why this is
-                # exactly equivalent, not an approximation.
-                row = self._co_occurring.get(t)
-                if not row:
-                    continue
-                # Same additions, in the same per-candidate order, as the
-                # Counter `+=` / `(t, c) in self._adjacent` version this
-                # replaces (so every float sum is bit-identical) -- just
-                # without a __missing__ call and a fresh (t, c) tuple per
-                # element.
-                adj_t = adjacent_from.get(t)
-                for c, shared in row.items():
-                    if c not in candidates_set:
-                        continue
-                    if shared:
-                        raw_context_vote[c] = raw_context_vote.get(c, 0) + 1.0
-                        context_influence_vote[c] = (context_influence_vote.get(c, 0)
-                                                     + ci_weight * shared)
-                        if is_important:
-                            t_knows[c] = shared
-                    if adj_t is not None and c in adj_t:
-                        raw_adjacency_vote[c] = raw_adjacency_vote.get(c, 0) + 1.0
-                if is_important and t_knows:
-                    knows[t] = t_knows
-                    influence[t] = len(t_knows)
-
-            # V1 -- important tokens vote independently, RAW/binary, scaled small
-            # V2 -- influence casts its OWN vote, scaled, per token that knows C
-            important_vote = Counter()
-            influence_vote = Counter()
-            for t, k in knows.items():
-                inf = influence[t]
-                for c in k:
-                    important_vote[c] += self._important_weight * 1
-                    influence_vote[c] += self._influence_weight * inf
-
-            # V3 -- every context token, important or not, casts a full binary vote
-            context_vote = {c: self._context_weight * v for c, v in raw_context_vote.items()}
-
-            # V4 -- already accumulated above (context_influence_vote)
-
-            # V6 -- every context token casts a full vote iff it was ever
-            # literally, immediately followed by C in training (t->C only)
-            adjacency_vote = {c: self._adjacency_weight * v
-                               for c, v in raw_adjacency_vote.items()}
-            context_influence_vote = dict(context_influence_vote)
-            important_vote = dict(important_vote)
-            influence_vote = dict(influence_vote)
-
-        # GATE for V5/V7/V8/V9: any candidate that raised a V3 or V6
-        # vote above is a candidate at least one context token has
-        # co-occurred (or, via the adjacency backfill, been directly
-        # adjacent) with. V5 and V9 are BOTH sums/conjunctions over
-        # context tokens themselves, so restricting them to this set is
-        # always exact (see the module docstring's "THE GATE" section
-        # for the proof) -- no candidate outside it could ever have
-        # scored nonzero on V5 or V9 anyway. V7/V8 check `previous`/
-        # `current` directly rather than summing over context, so the
-        # same restriction is only valid for them when both are
-        # themselves members of context_tokens (true for every real
-        # generation call -- see model.py/inference.py -- but not
-        # guaranteed for an arbitrary caller, e.g. some of test.py's
-        # isolated-layer checks); otherwise fall back to the full
-        # candidate list for V7/V8 specifically, so nothing is ever
-        # silently under-scored.
-        gate_candidates = (set(raw_context_vote) | set(raw_adjacency_vote)) & candidates_set
-
-        # V5 -- every context token casts a full vote iff it literally
-        # witnessed the exact (current, C) bigram in a training sentence.
-        # Always live (see build_cache()'s comment for why) -- depends on
-        # `current`, not just t/c, so it can't be a per-token cache entry.
-        raw_bigram_witness_vote = self._bigram_witness_vote(current, context_tokens, gate_candidates)
-        bigram_witness_vote = {c: self._bigram_witness_weight * v
-                                for c, v in raw_bigram_witness_vote.items()}
-
-        v78_gate_safe = ((previous is None or previous in context_set)
-                          and (current is None or current in context_set))
-        v78_candidates = gate_candidates if v78_gate_safe else candidates_set
-
-        # V7 -- a single fixed-pair check: did previous, current, and C
-        # ever all three share one training sentence together
-        raw_prev_current_vote = self._prev_current_vote(previous, current, v78_candidates)
-        prev_current_vote = {c: self._prev_current_weight * v
-                              for c, v in raw_prev_current_vote.items()}
-
-        # V8 -- a single fixed-triple check: was (previous, current, C)
-        # ever literally one consecutive trained Bridge Matrix triple
-        raw_triple_vote = self._triple_vote(previous, current, v78_candidates)
-        triple_vote = {c: self._triple_weight * v
-                       for c, v in raw_triple_vote.items()}
-
-        # V9 -- unanimous vote: every non-reserved, non-self context
-        # token has to know C, not just one (V3's question). Gated the
-        # same unconditional way as V5 -- see the comment above.
-        raw_whole_context_vote = self._whole_context_vote(context_tokens, gate_candidates)
-        whole_context_vote = {c: self._whole_context_weight * v
-                               for c, v in raw_whole_context_vote.items()}
-
-        # V10 -- noise-cancellation vote (see noise.py/_noise_vote()):
-        # every context token sums its precomputed TokenVocabularyMatrix
-        # row for C. Gated the same way as V5/V9 -- a nonzero row entry
-        # for C implies C appeared in one of that context token's home
-        # sentences, i.e. co-occurred with it, so restricting to
-        # gate_candidates never drops a candidate that could have
-        # scored nonzero here anyway. Contributes nothing (not an
-        # error) if no TokenVocabularyMatrix was ever attached -- see
-        # attach_noise_layer()/model.py's _ensure_noise_layer().
-        raw_noise_vote = self._noise_vote(context_tokens, gate_candidates,
-                                          counts=raw_context_vote)
-        noise_vote = {c: self._noise_weight * v for c, v in raw_noise_vote.items()}
-
-        # Sparse accumulation: start every candidate at 0 and add each layer
-        # only where it actually has an entry, in the SAME left-to-right layer
-        # order the old per-candidate `a.get(c, 0) + b.get(c, 0) + ...`
-        # expression used. Adding a missing layer's 0 never changes a float,
-        # so every score is bit-identical -- but the cost is proportional to
-        # the votes cast instead of ten dict lookups for each of the
-        # (vocabulary-sized) candidates.
-        final_scores = dict.fromkeys(candidates, 0)
-        for layer in (important_vote, influence_vote, context_vote,
-                      context_influence_vote, bigram_witness_vote,
-                      adjacency_vote, prev_current_vote, triple_vote,
-                      whole_context_vote, noise_vote):
+        scores = dict.fromkeys(candidates, 0)
+        for layer in (q1, q2):
             for c, v in layer.items():
-                if c in final_scores:
-                    final_scores[c] += v
+                if c in scores:
+                    scores[c] += v
 
-        return {"important_tokens": important, "knows": knows,
-                "influence": influence,
-                "important_vote": dict(important_vote),
-                "influence_vote": dict(influence_vote),
-                "context_vote": context_vote,
-                "context_influence_vote": context_influence_vote,
-                "bigram_witness_vote": bigram_witness_vote,
-                "adjacency_vote": adjacency_vote,
-                "prev_current_vote": prev_current_vote,
-                "triple_vote": triple_vote,
-                "whole_context_vote": whole_context_vote,
-                "noise_vote": noise_vote,
-                "scores": final_scores,
-                "cache_used": use_cache}
+        legal3 = self._q3_legal(current, candidates_set)
+        q4_active = self._q4_active(previous, current)
+        legal4 = self._q4_legal(previous, current, candidates_set) if q4_active else set()
+        return {"q1": q1, "q2": q2,
+                "q3": dict.fromkeys(legal3, 1.0), "q4": dict.fromkeys(legal4, 1.0),
+                "legal3": legal3, "legal4": legal4, "q4_active": q4_active,
+                "q1_raw": raw1, "q2_raw": raw2, "q1_pct": q1_pct, "q2_pct": q2_pct,
+                "scores": scores, "cache_used": use_cache}
+
+    # ==== choosing ======================================================================
 
     def _bigram_frequency(self, token, candidate):
-        """How many times `candidate` literally followed `token` (+ experience-implied, in open mode)."""
+        """How many times `candidate` literally followed `token` in training."""
         return self._bigram_freq.get((token, candidate), 0)
 
     def _global_frequency(self, candidate):
-        """Candidate's raw corpus-wide relationship count -- LAST-RESORT tie-break only, see select()."""
-        return len(self._token_rels.get(candidate, set()))
+        """Candidate's corpus-wide sentence count -- last-resort tie-break only."""
+        return len(self._token_rels.get(candidate, ()))
 
-    def select(self, candidates, context_tokens, current=None, previous=None):
+    def choose(self, scores, current=None):
         """
-        Deterministic winner among `candidates` by the combined score
-        (V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10, see
-        score_candidates), with a three-stage deterministic tie-break
-        cascade when the combined score itself doesn't discriminate:
+        Pick the winner from final `scores` ({candidate: score}), with the deterministic
+        tie-break cascade. Returns (winner_or_None, stage) where stage says what decided it:
+        "score" | "bigram_frequency" | "global_frequency" | "lowest_token_id".
+        winner is None only if `scores` is empty.
+        """
+        if not scores:
+            return None, "score"
+        top_score = max(scores.values())
+        top = sorted(c for c, s in scores.items() if s == top_score)
+        if len(top) == 1:
+            return top[0], "score"
+        stage = "lowest_token_id"
+        if current is not None:
+            freqs = {c: self._bigram_frequency(current, c) for c in top}
+            best = max(freqs.values())
+            narrowed = sorted(c for c in top if freqs[c] == best)
+            if len(narrowed) < len(top):
+                stage = "bigram_frequency"
+            top = narrowed
+        if len(top) > 1:
+            freqs = {c: self._global_frequency(c) for c in top}
+            best = max(freqs.values())
+            narrowed = sorted(c for c in top if freqs[c] == best)
+            if len(narrowed) < len(top):
+                stage = "global_frequency"
+            top = narrowed
+        return top[0], stage
 
-            1. score (V1..V10)      -- primary, structural + contextual
-            2. bigram frequency     -- how often `candidate` literally
-                                        followed `current` (requires
-                                        `current`; skipped if not given)
-            3. global frequency     -- candidate's raw corpus-wide
-                                        frequency (last resort only)
-            4. lowest token id      -- final tie-break, always available
+    def select(self, candidates, context_tokens, current=None, previous=None, extra_scores=None):
+        """
+        Deterministic winner among `candidates`. Returns (winner_or_None, trace).
 
-        `current` and `previous` are also forwarded into
-        score_candidates() itself now (not just used here for the
-        tie-break), since V5 needs `current` to look up which bigram
-        is being scored and V7/V8 each need BOTH `previous` and
-        `current` to check their respective three-way conditions --
-        passing them through once is enough; V5 degrades to all-zero
-        votes if `current` is omitted, V7/V8 degrade to all-zero votes
-        if either is omitted.
-
-        Each stage only ever narrows a tie the stage before it left
-        open; it never overrides a decision an earlier stage already
-        made. Returns (winner_or_None, trace_dict). winner is None
-        only when `candidates` itself is empty.
+        `extra_scores` ({candidate: score}, optional) are ANOTHER scorer's final scores (model.py
+        passes noise.py's); they are added to ivm's score to make the total every candidate is
+        ranked by. Q3/Q4 then decide which candidates may be PICKED: the winner is the
+        highest-total candidate that passes Q3 and Q4 (if the top one is not legal, the next
+        highest is tried, and so on). If nobody passes Q4, Q3 alone decides; if nobody is a legal
+        bigram, there is no legal continuation and the winner is <EOS>. Ties among the eligible fall to choose(). The trace is
+        score_candidates()'s, plus
+          "total_scores"     ivm + extra, EVERY candidate (== "scores" when there are no extras)
+          "legality"         "q3+q4" | "q3" | "none" -- which check the eligible set came from
+                             ("none": no legal continuation, the winner is <EOS>)
+          "legality_top_k"   how many top-scored candidates Q3/Q4 worked on (None = all)
+          "window_size"      how many candidates that actually was (>= top_k when scores tie)
+          "eligible"         the candidates that were allowed to win (empty when "none")
+          "final_scores"     total_scores for eligible candidates, 0 for the rest
+          "tie_break_stage"  what decided the winner (see choose()), or
+                             "no_legal_continuation_eos"
         """
         trace = self.score_candidates(candidates, context_tokens, current=current, previous=previous)
-        scores = trace["scores"]
-        if not scores:
-            return None, trace
-        max_score = max(scores.values())
-        top = sorted(c for c, s in scores.items() if s == max_score)
+        totals = trace["scores"]
+        if extra_scores:
+            totals = dict(totals)
+            for c, v in extra_scores.items():
+                if c in totals:
+                    totals[c] += v
+        # Q3/Q4 only work on the top-K scored candidates (None = all). Ties at the cut-off stay in.
+        k = self._legality_top_k
+        window = None
+        if k and k < len(totals):
+            cut = sorted(totals.values(), reverse=True)[k - 1]
+            window = {c for c, v in totals.items() if v >= cut}
+        legal3, legal4 = trace["legal3"], trace["legal4"]
+        if window is not None:
+            legal3, legal4 = legal3 & window, legal4 & window
+        both = (legal3 & legal4) if trace["q4_active"] else set()
+        if both:
+            eligible, legality = both, "q3+q4"
+        elif legal3:
+            eligible, legality = legal3, "q3"
+        else:
+            eligible, legality = set(), "none"
+        if eligible:
+            winner, stage = self.choose({c: totals[c] for c in eligible}, current)
+        else:
+            # No legal continuation after Q3/Q4: nothing may be picked, so the text ends.
+            winner, stage = EOS, "no_legal_continuation_eos"
+        trace["total_scores"] = totals
+        trace["legality"] = legality
+        trace["legality_top_k"] = k
+        trace["window_size"] = len(window) if window is not None else len(totals)
+        trace["eligible"] = eligible
+        trace["final_scores"] = {c: (v if c in eligible else 0.0) for c, v in totals.items()}
+        trace["tie_break_stage"] = stage
+        return winner, trace
 
-        if len(top) > 1 and current is not None:
-            bigram_freqs = {c: self._bigram_frequency(current, c) for c in top}
-            max_bf = max(bigram_freqs.values())
-            top = sorted(c for c in top if bigram_freqs[c] == max_bf)
+    def resolve_tie(self, candidates, context_tokens, current=None, previous=None):
+        """
+        Strict Mode's legacy opt-in tie-break: rank the tied `candidates` by ivm's final score.
+        Returns the unique top scorer, or None ("no opinion -- fall through") if nobody scored
+        or the top is still tied.
+        """
+        if not context_tokens:
+            return None
+        scores = self.score_candidates(candidates, context_tokens,
+                                       current=current, previous=previous)["scores"]
+        best = max(scores.values(), default=0)
+        if best <= 0:
+            return None
+        top = [c for c, s in scores.items() if s == best]
+        return top[0] if len(top) == 1 else None
 
-        if len(top) > 1:
-            global_freqs = {c: self._global_frequency(c) for c in top}
-            max_gf = max(global_freqs.values())
-            top = sorted(c for c in top if global_freqs[c] == max_gf)
-
-        return top[0], trace
+    # ======== persistence ============================================================
 
     def to_dict(self):
         return {
             "token_rels": {str(t): sorted(r) for t, r in self._token_rels.items()},
-            "important": sorted(self._important),
-            "important_weight": self._important_weight,
-            "influence_weight": self._influence_weight,
-            "context_weight": self._context_weight,
-            "context_influence_weight": self._context_influence_weight,
-            "bigram_witness_weight": self._bigram_witness_weight,
-            "adjacency_weight": self._adjacency_weight,
-            "prev_current_weight": self._prev_current_weight,
-            "triple_weight": self._triple_weight,
-            "whole_context_weight": self._whole_context_weight,
-            "noise_weight": self._noise_weight,
+            "q1_weight": self._q1_weight, "q2_weight": self._q2_weight,
             "bigram_freq": {f"{t}:{c}": n for (t, c), n in self._bigram_freq.items()},
             "bigram_rels": {f"{t}:{c}": sorted(r) for (t, c), r in self._bigram_rels.items()},
             "adjacent": [list(pair) for pair in self._adjacent],
-            "triples": [list(tri) for tri in self._triples],
+            "triples": [[a, m, b] for (a, m), bs in self._triples.items() for b in sorted(bs)],
         }
 
     @classmethod
-    def from_dict(cls, d):
+    def from_dict(cls, d, matrix=None):
         ivm = cls()
         ivm._token_rels = {int(t): set(r) for t, r in d["token_rels"].items()}
-        ivm._important = set(d["important"])
-        ivm._important_weight = d.get("important_weight", IVMConfig.IMPORTANT_WEIGHT)
-        ivm._influence_weight = d.get("influence_weight", d.get("freq_weight", IVMConfig.INFLUENCE_WEIGHT))
-        ivm._context_weight = d.get("context_weight", IVMConfig.CONTEXT_WEIGHT)
-        ivm._context_influence_weight = d.get("context_influence_weight", IVMConfig.CONTEXT_INFLUENCE_WEIGHT)
-        ivm._bigram_witness_weight = d.get("bigram_witness_weight", IVMConfig.BIGRAM_WITNESS_WEIGHT)
-        ivm._adjacency_weight = d.get("adjacency_weight", IVMConfig.ADJACENCY_WEIGHT)
-        ivm._prev_current_weight = d.get("prev_current_weight", IVMConfig.PREV_CURRENT_WEIGHT)
-        ivm._triple_weight = d.get("triple_weight", IVMConfig.TRIPLE_WEIGHT)
-        ivm._whole_context_weight = d.get("whole_context_weight", IVMConfig.WHOLE_CONTEXT_WEIGHT)
-        ivm._noise_weight = d.get("noise_weight", IVMConfig.NOISE_WEIGHT)
-        # V10's data source (noise.py's TokenVocabularyMatrix) is NOT
-        # serialized here -- like _co_occurring and the sparse V1-V6
-        # cache, it's fully re-derivable, but only from the original
-        # model's training sentences, which this dict doesn't carry.
-        # V10 contributes nothing until attach_noise_layer(model) is
-        # called explicitly -- same "rebuild after load if you want
-        # it" treatment noise.py's own noise_index/token_vocab get.
-        ivm._token_vocab = None
+        ivm._q1_weight = d.get("q1_weight", IVMConfig.Q1_WEIGHT)
+        ivm._q2_weight = d.get("q2_weight", IVMConfig.Q2_WEIGHT)
         ivm._bigram_freq = {}
         for key, n in d.get("bigram_freq", {}).items():
             t, c = key.split(":")
@@ -2080,9 +632,8 @@ class ImportanceVoteMatrix:
             t, c = key.split(":")
             ivm._bigram_rels[(int(t), int(c))] = set(r)
         ivm._adjacent = {tuple(pair) for pair in d.get("adjacent", [])}
-        ivm._triples = {tuple(tri) for tri in d.get("triples", [])}
-        # Derived, not stored -- same "re-derive on load" treatment as
-        # everything else here that's fully computable from data
-        # already in this dict (see build()'s matching comment).
-        ivm._co_occurring = co_occurrence_index(ivm._token_rels, adjacent=ivm._adjacent)
+        ivm._triples = {}
+        for a, m, b in d.get("triples", []):
+            ivm._triples.setdefault((a, m), set()).add(b)
+        ivm._co_occurring = co_occurrence_index(ivm._token_rels, unified=matrix)
         return ivm

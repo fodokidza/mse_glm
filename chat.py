@@ -9,72 +9,27 @@ literally followed the current token most often in training) instead
 of a random pick -- see inference.py's _bigram_tie_break.
 
 Open Mode's candidates are the ENTIRE vocabulary, every step -- no
-successor gating at all. Selection is CTM/IVM weighted voting over
-that full candidate set -- TEN independent, summed vote layers:
-  V1 important + V2 influence   -- both deliberately small, ride on
-                                    top of V3, can only ever nudge a
-                                    tie V3 left open, never override it
-  V3 every context token        -- full weight, the primary signal
-  V4 context-token influence    -- tiny magnitude-sensitive refinement,
-                                    same "never override V3" role as V1/V2
-  V5 bigram-witness vote        -- did each context token literally
-                                    appear in a training sentence
-                                    containing THIS exact bigram
-                                    (current->candidate)? PEER-weighted
-                                    with V3 (not kept small) -- this is
-                                    usually the single largest
-                                    contributor to a candidate's score
-                                    whenever the bigram was literally
-                                    seen, so don't expect V1+V2+V3+V4
-                                    alone to add up to the total.
-  V6 adjacency vote             -- was each context token EVER immediately
-                                    followed by the candidate in training
-                                    (directional: token->candidate only,
-                                    not necessarily this specific
-                                    transition, unlike V5)? Also
-                                    PEER-weighted with V3.
-  V7 prev+current co-occurrence -- a single fixed-pair check, not a
-                                    per-context-token vote: did
-                                    `previous`, `current`, AND the
-                                    candidate ever all three share one
-                                    training sentence together, no
-                                    adjacency required between any of
-                                    them? Also PEER-weighted with V3.
-  V8 triple witness vote        -- a single fixed-pair check, stricter
-                                    than V7: was (previous, current,
-                                    candidate) ever literally ONE
-                                    consecutive trained triple, in
-                                    that exact order? Weighted a notch
-                                    above V3/V5/V6/V7.
-  V9 whole-context vote         -- the strictest of the first nine: does
-                                    EVERY non-reserved context token
-                                    (not just one, V3's question) know
-                                    the candidate? Weighted a notch
-                                    above V8 -- the single strictest,
-                                    most literal evidence of those
-                                    layers, since unanimity across an
-                                    arbitrary-size context is at least
-                                    as specific as one exact triple.
-  V10 noise vote                -- noise.py's noise-cancellation AVERAGE
-                                    score: each context token's
-                                    precomputed row (how many OTHER
-                                    sentences/tokens don't already know
-                                    the candidate), summed over context.
-                                    Magnitude-based like V2/V4, so
-                                    weighted small (config.py's
-                                    IVMConfig.NOISE_WEIGHT). Attached
-                                    automatically on the first Open Mode
-                                    step -- no build command needed.
-then a deterministic cascade if the score itself still ties: bigram
-frequency, then global frequency, then lowest token id. See ivm.py's
-module docstring for the full formula. /scores below exposes the
-entire breakdown that drove the last Open Mode token -- which tokens
-were important, what each layer contributed, and which stage of the
-tie-break cascade (if any) actually decided it -- since an
-unexplained score is not something this project wants to hand back.
+successor gating at all. Selection is IVM scoring plus noise.py: every candidate gets
+  Q1 co-occurrence   -- how many context tokens ever shared a sentence
+                         with it (a percentage of all Q1 evidence)
+  Q2 witnessed bigram-- context tokens that were present in a sentence
+                         where (current -> candidate) literally occurred
+                         (a percentage of all Q2 evidence)
+  noise              -- noise.py's noise-cancellation score, scaled by
+                         NoiseConfig.INFERENCE_WEIGHT, added on top
+and the ranked list is then filtered by two LEGALITY CHECKS, not scores:
+  Q3  is (current -> candidate) a legal bigram?
+  Q4  was (previous, current, candidate) a trained triple?
+The winner is the top-scoring candidate passing Q3+Q4 (falling back to
+Q3 alone, then to no filter, if nobody passes). If the score still
+ties: bigram frequency, then global frequency, then lowest token id.
+See ivm.py's module docstring for the full formula. /scores below
+exposes the whole breakdown that drove the last Open Mode token --
+what each term contributed, which legality check applied, and which
+stage of the tie-break cascade (if any) decided it.
 
-V1/V2/V3/V4/V6 (not V5/V7/V8/V9/V10 -- see ivm.py's build_cache()) can
-optionally be served from a sparse precomputed per-token cache
+Q1 (only -- Q2/Q3/Q4 and noise stay live, see ivm.py's build_cache())
+can optionally be served from a sparse precomputed per-token cache
 instead of recomputed from scratch every step -- off by default,
 same answer either way, purely a speed optimization. /cache below
 toggles it on model.open_ctm and reports whether it's on.
@@ -86,7 +41,7 @@ Commands:
                              vocabulary, CTM/IVM weighted voting as
                              primary mechanism)
   /explain <prev> | <curr>  explain a single inference step
-  /scores <prompt>          Open Mode only: full V1-V10 score breakdown for
+  /scores <prompt>          Open Mode only: full Q1-Q4 + noise score breakdown for
                              the next token, plus which tie-break stage (if
                              any) decided the winner. Always SCORES the
                              entire vocabulary -- only DISPLAYS the top N
@@ -100,13 +55,16 @@ Commands:
                              Mode's tie-break and Open Mode's first
                              tie-break stage) -- also shows how many
                              distinct training sentences literally
-                             witnessed the bigram (V5's evidence set)
-  /cache on|off|status      toggle the sparse per-token V1/V2/V3/V4/V6
+                             witnessed the bigram (Q2's evidence set)
+  /cache on|off|status      toggle the sparse per-token Q1
                              score cache on model.open_ctm (Open Mode
                              only) -- "on" builds it fresh for the
                              current vocabulary, "off" reverts to live
                              scoring, "status" (or bare /cache) reports
                              whether it's on and how many entries it holds
+  /legality <n|all>         how many of the top-scored tokens Q3/Q4 may work on
+                             (default: IVMConfig.LEGALITY_TOP_K); if none of them
+                             is a legal continuation, <EOS> wins
   /shared <tok1> <tok2> … infer_shared_role() across token set
   /similarity <a> <b>       cluster-set similarity between two tokens
   /stats                    model stats
@@ -197,7 +155,7 @@ def main():
     print(f"  Stats: {model.stats()}")
     print(f"  Mode:  {mode.upper()}")
     print("  (fully deterministic -- no randomness anywhere in generation)")
-    print("\n  Commands: /mode strict|open  /explain  /scores [--top n|--all]  /bigram  "
+    print("\n  Commands: /mode strict|open  /explain  /scores [--top n|--all]  /bigram  /legality  "
           "/cache  /shared  /similarity  /stats  /clusters  /quit\n")
 
     while True:
@@ -211,7 +169,7 @@ def main():
         if line in ("/quit", "/exit"):
             break
 
-        # ── /mode ─────────────────────────────────────────────────────────
+        # ===== /mode ======================================================= 
         if line.startswith("/mode"):
             parts = line.split()
             if len(parts) < 2 or parts[1] not in ("strict", "open"):
@@ -221,19 +179,19 @@ def main():
             print(f"  Switched to {mode.upper()} mode.")
             continue
 
-        # ── /stats ────────────────────────────────────────────────────────
+        # =========== /stats ================================================= 
         if line == "/stats":
             for k, v in model.stats().items():
                 print(f"  {k}: {v}")
             continue
 
-        # ── /clusters ─────────────────────────────────────────────────────
+        # ==== /clusters ====================================================== 
         if line == "/clusters":
             for c in analyser.cluster_report(top_n=10):
                 print(f"  [{c['cluster_id']}] {c['axis']:6s}  {c['slot']:30s}  {', '.join(c['members'])}")
             continue
 
-        # ── /similarity ───────────────────────────────────────────────────
+        # ==== /similarity ================================================== 
         arg = _match_command(line, "/similarity")
         if arg is not None:
             parts = [_unquote(p) for p in arg.split()]
@@ -245,7 +203,7 @@ def main():
                   f"  shared_clusters={result['shared_clusters']}")
             continue
 
-        # ── /shared ───────────────────────────────────────────────────────
+        # === /shared ========================================================
         arg = _match_command(line, "/shared")
         if arg is not None:
             tokens = [_unquote(p) for p in arg.split()]
@@ -260,7 +218,7 @@ def main():
                     print(f"  {' '.join(tokens)} -> {tok}  [{axis}  {ev}]")
             continue
 
-        # ── /explain ──────────────────────────────────────────────────────
+        # === /explain ========================================================
         arg = _match_command(line, "/explain")
         if arg is not None:
             payload = _unquote(arg)
@@ -273,7 +231,7 @@ def main():
             print(f"  next='{token}'  {trace}")
             continue
 
-        # ── /scores ───────────────────────────────────────────────────────
+        # ==== /scores ============================================================
         arg = _match_command(line, "/scores")
         if arg is not None:
             if mode != "open":
@@ -302,8 +260,12 @@ def main():
                 shown = ranked[:ScoresDisplayConfig.TOP_N]
             truncated = len(shown) < total
 
-            print(f"  important tokens: {info['important_tokens']}")
-            print(f"  influence:        {info['influence']}")
+            print(f"  context tokens: {info['context_tokens']}")
+            print(f"  legality filter: {info['legality']}  "
+                  f"(q3+q4 = bigram AND triple legal; q3 = bigram only; none = nothing legal -> <EOS>)"
+                  + ("" if info["q4_active"] else "  [Q4 inactive: fewer than two context tokens]")
+                  + ("" if info["legality_top_k"] is None else
+                     f"  [Q3/Q4 worked on the top {info['legality_top_k']} (window {info['window_size']})]"))
             if truncated:
                 print(f"  (scoring the entire vocabulary -- {total} candidates; "
                       f"showing top {len(shown)} by score -- "
@@ -312,25 +274,18 @@ def main():
                 print(f"  (scoring the entire vocabulary -- {total} candidates)")
 
             def _print_score_row(c, tag=""):
-                v1 = info["important_vote"].get(c, 0)
-                v2 = info["influence_vote"].get(c, 0)
-                v3 = info["context_vote"].get(c, 0)
-                v4 = info["context_influence_vote"].get(c, 0)
-                v5 = info["bigram_witness_vote"].get(c, 0)
-                v6 = info["adjacency_vote"].get(c, 0)
-                v7 = info["prev_current_vote"].get(c, 0)
-                v8 = info["triple_vote"].get(c, 0)
-                v9 = info["whole_context_vote"].get(c, 0)
-                v10 = info["noise_vote"].get(c, 0)
+                q1 = info["q1"].get(c, 0)
+                q2 = info["q2"].get(c, 0)
+                q3 = info["q3"].get(c, 0)
+                q4 = info["q4"].get(c, 0)
+                nz = info["noise"].get(c, 0)
+                fin = info["final"].get(c, 0)
                 marker = tag if tag else ("  <- winner" if c == info["winner"] else "")
-                print(f"    {c:13s} {v1:15.2f} {v2:15.2f} {v3:13.2f} {v4:15.2f} {v5:17.2f} "
-                      f"{v6:14.2f} {v7:15.2f} {v8:13.2f} {v9:15.2f} {v10:12.4f} "
-                      f"{info['scores'][c]:8.2f}{marker}")
+                print(f"    {c:13s} {q1:9.2f} {q2:9.2f} {int(bool(q3)):>6d} {int(bool(q4)):>6d} "
+                      f"{nz:10.4f} {info['score'][c]:9.2f} {fin:9.2f}{marker}")
 
-            print(f"  {'candidate':15s} {'V1 (important)':>15s} {'V2 (influence)':>15s} "
-                  f"{'V3 (context)':>13s} {'V4 (ctx.infl.)':>15s} {'V5 (big.witness)':>17s} "
-                  f"{'V6 (adjacent)':>14s} {'V7 (prev+curr)':>15s} {'V8 (triple)':>13s} "
-                  f"{'V9 (unanimous)':>15s} {'V10 (noise)':>12s} {'score':>8s}")
+            print(f"  {'candidate':15s} {'Q1 (co-occ)':>9s} {'Q2 (bigram)':>9s} "
+                  f"{'Q3 ok':>6s} {'Q4 ok':>6s} {'noise':>10s} {'score':>9s} {'final':>9s}")
             for c in shown:
                 _print_score_row(c)
             # The winner is never allowed to silently fall off-screen --
@@ -343,7 +298,7 @@ def main():
                   f"  ·  cache: {'on' if info['cache_used'] else 'off'})")
             continue
 
-        # ── /bigram ───────────────────────────────────────────────────────
+        # ==== /bigram ================================================================= 
         arg = _match_command(line, "/bigram")
         if arg is not None:
             parts = [_unquote(p) for p in arg.split()]
@@ -359,37 +314,41 @@ def main():
             print(f"  '{parts[0]}' -> '{parts[1]}':  training={train_count}"
                   f"  total={total}  witness_sentences={len(witnesses)}")
             print("  (training/total is the count Strict Mode's tie-break "
-                  "and Open Mode's first tie-break stage use; witness_sentences is V5's "
+                  "and Open Mode's first tie-break stage use; witness_sentences is Q2's "
                   "evidence set -- how many distinct training sentences literally "
                   "contained this bigram, see ivm.py)")
             continue
 
-        # ── /cache ────────────────────────────────────────────────────────
+        # ===== /cache ==================================================================== 
         arg = _match_command(line, "/cache")
         if arg is not None:
-            if model.open_ctm is None:
-                print("  Open Mode isn't ready (model not trained/loaded) -- no cache to toggle.")
-                continue
-            sub = _unquote(arg).lower()
-            if sub == "on":
-                model.open_ctm.enable_cache(model.all_candidate_tokens())
-                entries = sum(len(row) for row in model.open_ctm._token_cache.values())
-                print(f"  cache: ON  ({len(model.open_ctm._token_cache)} token rows, "
-                      f"{entries} (t,c) entries -- V1/V2/V3/V4/V6 only, V5/V7/V8/V9/V10 stay live)")
-            elif sub == "off":
-                model.open_ctm.disable_cache()
-                print("  cache: OFF  (back to live scoring every step)")
-            elif sub in ("", "status"):
-                on = model.open_ctm._use_cache
-                entries = sum(len(row) for row in model.open_ctm._token_cache.values())
-                print(f"  cache: {'ON' if on else 'OFF'}  "
-                      f"({len(model.open_ctm._token_cache)} token rows, {entries} entries built"
-                      f"{'' if model.open_ctm._token_cache else ' -- none built yet'})")
-            else:
+            sub = _unquote(arg).lower() or "status"
+            if sub not in ("on", "off", "status"):
                 print("  Usage: /cache on|off|status")
+                continue
+            try:
+                r = model.cache_control(sub)
+            except RuntimeError as e:
+                print(f"  {e}")
+                continue
+            print(f"  cache: {'ON' if r['enabled'] else 'OFF'}  ({r['token_rows']} token rows, "
+                  f"{r['entries']} (t,c) entries"
+                  f"{'' if r['token_rows'] else ' -- none built yet'}; Q1 only, Q2/Q3/Q4 and noise stay live)")
             continue
 
-        # ── generate ──────────────────────────────────────────────────────
+        # === /legality ===================================================================
+        arg = _match_command(line, "/legality")
+        if arg is not None:
+            try:
+                k = model.set_legality_top_k(_unquote(arg) or None)
+            except (ValueError, RuntimeError) as e:
+                print(f"  {e}")
+                continue
+            print(f"  Q3/Q4 now work on: {'ALL scored candidates' if k is None else f'the top {k}'}"
+                  f"  (if none of them is a legal continuation, <EOS> wins)")
+            continue
+
+        # ==== generate ============================================================ 
         try:
             text, ids, trace = model.generate(line, max_tokens=args.max_tokens, mode=mode)
             print(f"  model> {text}")

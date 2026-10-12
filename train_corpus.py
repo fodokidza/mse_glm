@@ -106,7 +106,7 @@ def train_from_folder(folder, out_path, vocab_size=TokenizerConfig.DEFAULT_VOCAB
 
     t0 = time.time()
 
-    # ── Pass 1: vocabulary from streamed word frequencies ────────────
+    # ======= Pass 1: vocabulary from streamed word frequencies ============================
     log(f"  {_bold('Pass 1/2')}  building shared vocabulary…")
     word_freq = Counter()
     total_sentences_p1 = 0
@@ -127,7 +127,7 @@ def train_from_folder(folder, out_path, vocab_size=TokenizerConfig.DEFAULT_VOCAB
         f"  {_dim(f'{time.time()-t0:.2f}s')}")
     log("")
 
-    # ── Pass 2: graph, in batches, reusing incremental-training merge ─
+    # ========= Pass 2: graph, in batches, reusing incremental-training merge =====
     log(f"  {_bold('Pass 2/2')}  building graph in batches of {batch_size} file(s)…")
     model = MSEGraphLanguageModel(vocab_size=vocab_size)
     model.tokenizer = tok

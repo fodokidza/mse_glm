@@ -4,7 +4,7 @@ analyse.py — Analysis layer for MSE-GLM.
 Two library classes:
     CorpusAnalyser  — raw-text statistics, no trained model required.
     Analyser        — graph-level statistics on a trained MSEGraphLanguageModel:
-                       topology, dual-axis cluster reports, Relationship Matrix
+                       topology, dual-axis cluster reports, tile table
                        reports, per-token reports, token similarity, and full
                        step-by-step generation traces.
 
@@ -20,9 +20,8 @@ import json
 import sys
 from collections import Counter
 
-from model import MSEGraphLanguageModel
-from tokenizer import normalize, split_sentences
-from config import InterpretConfig, CTMConfig, ScoresDisplayConfig
+from model import MSEGraphLanguageModel, normalize, split_sentences
+from config import ScoresDisplayConfig
 
 
 # =============================================================================
@@ -58,16 +57,14 @@ class Analyser:
 
     # ------------------------------------------------------------- topology
     def topology(self, top_n: int = 10) -> dict:
-        b = self.model.bridges
-        tok = self.model.tokenizer
-        out_degree = Counter(b.source)
+        out_degree = Counter(self.model.triple_out_degree())
         hubs = out_degree.most_common(top_n)
-        vocab_ids = range(tok.vocab_size_actual)
+        vocab_ids = range(self.model.vocab_size)
         dead_ends = [t for t in vocab_ids if t not in out_degree]
         return {
-            "hub_tokens": [(tok.id_to_token.get(t, t), c) for t, c in hubs],
+            "hub_tokens": [(self.model.token_name(t), c) for t, c in hubs],
             "dead_end_count": len(dead_ends),
-            "dead_end_tokens": [tok.id_to_token.get(t, t) for t in dead_ends[:top_n]],
+            "dead_end_tokens": [self.model.token_name(t) for t in dead_ends[:top_n]],
         }
 
     # ---------------------------------------------------------- raw matrices
@@ -85,15 +82,12 @@ class Analyser:
     def edge_matrix(self, source: str = None, target: str = None,
                      sort: str = "count", limit: int = 50, offset: int = 0) -> dict:
         """
-        Raw EdgeMatrix rows: every deduplicated (source, dst) bigram with
-        its literal training count (see EdgeMatrix.frequency()). Optionally
-        filtered to a single source and/or target word. `sort`: "count"
-        (default, descending) or "source" (ascending source token id, the
-        matrix's native CSR order).
+        Adjacency rows of the unified matrix: every deduplicated (source, dst)
+        bigram with its literal training count. Optionally filtered to a single
+        source and/or target word. `sort`: "count" (default, descending) or
+        "source" (ascending source token id, the matrix's native row order).
         """
-        tok = self.model.tokenizer
-        e = self.model.edges
-        rows = list(zip(e.src, e.dst, e.count))
+        rows = self.model.bigram_rows()
 
         if source is not None:
             src_id = self._resolve_token(source)
@@ -113,21 +107,19 @@ class Analyser:
 
         total = len(rows)
         page = rows[offset:offset + limit] if limit else rows[offset:]
-        decoded = [(tok.id_to_token.get(s, s), tok.id_to_token.get(d, d), c) for s, d, c in page]
+        decoded = [(self.model.token_name(s), self.model.token_name(d), c) for s, d, c in page]
         return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
 
     def bridge_matrix(self, source: str = None, bridge: str = None, target: str = None,
                        clustered_only: bool = False, limit: int = 50, offset: int = 0) -> dict:
         """
-        Raw BridgeMatrix rows: every deduplicated (source, bridge, target)
-        triple with its cluster_id (0 = unclustered -- see BridgeMatrix's
-        dual-axis docstring). Optionally filtered to a single source,
-        bridge, and/or target word, and/or restricted to clustered rows
-        only (cluster_id != 0). Native CSR order (by source).
+        Slot-filler rows of the unified matrix: every deduplicated
+        (source, bridge, target) triple with its derived cluster_id (0 = in no
+        slot group; ids are computed on demand, not stored). Optionally
+        filtered to a single source, bridge, and/or target word, and/or
+        restricted to grouped rows only (cluster_id != 0). Native order (by source).
         """
-        tok = self.model.tokenizer
-        b = self.model.bridges
-        rows = list(zip(b.source, b.bridge, b.target, b.cluster_id))
+        rows = self.model.triple_rows()
 
         for word, slot in ((source, 0), (bridge, 1), (target, 2)):
             if word is not None:
@@ -140,41 +132,24 @@ class Analyser:
 
         total = len(rows)
         page = rows[offset:offset + limit] if limit else rows[offset:]
-        decoded = [(tok.id_to_token.get(s, s), tok.id_to_token.get(br, br),
-                    tok.id_to_token.get(t, t), c) for s, br, t, c in page]
+        decoded = [(self.model.token_name(s), self.model.token_name(br),
+                    self.model.token_name(t), c) for s, br, t, c in page]
         return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
 
-    def relationship_matrix(self, relationship_id: int = None, triple_id: int = None,
-                             limit: int = 50, offset: int = 0) -> dict:
+    def tile_table(self, relationship_id: int = None, limit: int = 50, offset: int = 0) -> dict:
         """
-        Raw RelationshipMatrix rows: every (triple_id, relationship_id)
-        pair, decoded to the triple's actual (source, bridge, target)
-        content. One row per triple OCCURRENCE per training sentence --
-        NOT deduplicated the way EdgeMatrix/BridgeMatrix rows are (see
-        RelationshipMatrix's docstring), so this is normally the largest
-        of the three matrices and the one most worth filtering rather
-        than dumping whole. Optionally filtered to one relationship_id
-        (one training sentence's rows) or one triple_id (every sentence
-        that triple occurs in) -- not both at once.
+        The unified matrix's tile table: how each unique training sentence is
+        stored -- its ordered non-overlapping adjacent pairs (an odd-length
+        sentence ends with an overlapping pair, a one-token sentence with a
+        single token; the second token is then None). Rows are
+        (relationship_id, position, first_token, second_token).
+        Optionally filtered to one relationship_id (one sentence).
         """
-        if relationship_id is not None and triple_id is not None:
-            raise ValueError("relationship_matrix: pass relationship_id OR triple_id, not both")
-        r = self.model.rels
-        b = self.model.bridges
-        tok = self.model.tokenizer
-        rows = list(zip(r.r_triple, r.r_rel))
-        if relationship_id is not None:
-            rows = [row for row in rows if row[1] == relationship_id]
-        elif triple_id is not None:
-            rows = [row for row in rows if row[0] == triple_id]
-
+        rows = self.model.tile_rows(relationship_id)
         total = len(rows)
         page = rows[offset:offset + limit] if limit else rows[offset:]
-        decoded = []
-        for tid, rel_id in page:
-            s, br, t = b.source[tid], b.bridge[tid], b.target[tid]
-            decoded.append((rel_id, tid, tok.id_to_token.get(s, s),
-                             tok.id_to_token.get(br, br), tok.id_to_token.get(t, t)))
+        dec = lambda t: None if t is None else self.model.token_name(t)
+        decoded = [(r, pos, dec(a), dec(b)) for r, pos, a, b in page]
         return {"total": total, "offset": offset, "limit": limit, "rows": decoded}
 
     def _resolve_token(self, word):
@@ -183,36 +158,29 @@ class Analyser:
         matrix filter above -- same convention as per_token_report()."""
         if word is None:
             return None
-        tok = self.model.tokenizer
-        enc = [t for t in tok.encode(word) if t != 2]
+        enc = [t for t in self.model.encode(word) if t != 2]
         return enc[-1] if enc else None
 
     # -------------------------------------------------------------- clusters
     def cluster_report(self, top_n: int = 10, axis: str = None) -> list:
         """
-        List dual-axis clusters (cluster_id != 0). `axis` optionally filters
-        to 'bridge' or 'target' clusters only.
+        List slot groups ("clusters"; ids are derived, not stored). `axis`
+        optionally filters to 'bridge' or 'target' groups only.
         """
-        b = self.model.bridges
-        tok = self.model.tokenizer
-        groups = {}
-        for s, t, br, c in zip(b.source, b.target, b.bridge, b.cluster_id):
-            if c == 0:
-                continue
-            groups.setdefault(c, []).append((s, t, br))
+        u = self.model
 
         report = []
-        for cid, members in groups.items():
-            cluster_axis, _ = b.cluster_axis(cid)
+        for cid in u.cluster_ids():
+            cluster_axis, members = u.cluster_axis(cid)
             if axis and cluster_axis != axis:
                 continue
             s0, t0, _ = members[0]
             if cluster_axis == "bridge":
-                varying = sorted(set(tok.id_to_token.get(br, br) for _, _, br in members))
-                fixed = f"{tok.id_to_token.get(s0, s0)} -> ___ -> {tok.id_to_token.get(t0, t0)}"
+                varying = sorted(set(self.model.token_name(br) for _, _, br in members))
+                fixed = f"{self.model.token_name(s0)} -> ___ -> {self.model.token_name(t0)}"
             elif cluster_axis == "target":
-                varying = sorted(set(tok.id_to_token.get(t, t) for _, t, _ in members))
-                fixed = f"{tok.id_to_token.get(s0, s0)} -> {tok.id_to_token.get(members[0][2], members[0][2])} -> ___"
+                varying = sorted(set(self.model.token_name(t) for _, t, _ in members))
+                fixed = f"{self.model.token_name(s0)} -> {self.model.token_name(members[0][2])} -> ___"
             else:
                 varying, fixed = [], "?"
             report.append({
@@ -224,55 +192,49 @@ class Analyser:
 
     def cluster_detail(self, cluster_id: int) -> dict:
         """Full detail for a single cluster_id, including raw triples."""
-        b = self.model.bridges
-        tok = self.model.tokenizer
-        axis, members = b.cluster_axis(cluster_id)
+        axis, members = self.model.cluster_axis(cluster_id)
         decoded = [
-            (tok.id_to_token.get(s, s), tok.id_to_token.get(t, t), tok.id_to_token.get(br, br))
+            (self.model.token_name(s), self.model.token_name(t), self.model.token_name(br))
             for s, t, br in members
         ]
         return {"cluster_id": cluster_id, "axis": axis, "triples": decoded}
 
     # --------------------------------------------------------- relationships
     def relationship_report(self) -> dict:
-        r = self.model.rels
-        shared = [tid for tid in set(r.r_triple) if len(r.relationships_for_triple(tid)) > 1]
+        u = self.model
+        appearances = Counter()
+        for rid in range(u.n_rels):
+            appearances.update(set(u.triples_for_relationship(rid)))
         return {
-            "total_relationships": r._n_rels,
-            "total_occurrences": sum(r.rel_count),
-            "total_rows": len(r.r_triple),
-            "unique_triples_referenced": len(set(r.r_triple)),
-            "shared_triple_count": len(shared),
+            "total_relationships": u.n_rels,
+            "total_occurrences": sum(u.rel_count),
+            "tile_rows": len(u.t_cell),
+            "unique_triples_referenced": len(appearances),
+            "shared_triple_count": sum(1 for n in appearances.values() if n > 1),
         }
 
     def relationship_detail(self, relationship_id: int) -> dict:
-        """Every triple belonging to a single training sequence (sentence),
-        plus how many literal training occurrences shared that exact
-        sentence content (see graph.py's RelationshipMatrix docstring)."""
-        b = self.model.bridges
-        tok = self.model.tokenizer
-        triple_ids = self.model.rels.triples_for_relationship(relationship_id)
-        triples = []
-        for tid in triple_ids:
-            s, t, br = b.source[tid], b.target[tid], b.bridge[tid]
-            triples.append((tok.id_to_token.get(s, s), tok.id_to_token.get(t, t),
-                             tok.id_to_token.get(br, br)))
+        """Every triple of a single training sentence, plus how many literal
+        training occurrences shared that exact sentence content."""
+        u = self.model
+        triples = [(self.model.token_name(s), self.model.token_name(t), self.model.token_name(br))
+                   for s, t, br in u.triples_for_relationship(relationship_id)]
         return {"relationship_id": relationship_id, "triples": triples,
-                "occurrences": self.model.rels.count(relationship_id)}
+                "occurrences": u.count(relationship_id)}
 
     # ---------------------------------------------------------- per-token
     def per_token_report(self, word: str) -> dict:
-        tok = self.model.tokenizer
-        enc = [t for t in tok.encode(word) if t != 2]
+        enc = [t for t in self.model.encode(word) if t != 2]
         if not enc:
             return None
         token = enc[-1]
-        out_edges = self.model.edges.successors(token)
-        triples = self.model.bridges.triples_from_source(token)
-        clusters = self.model.bridges.t_index.get(token, [])
+        u = self.model
+        out_edges = u.successors(token)
+        triples = u.triples_from_source(token)
+        clusters = u.clusters_of_token(token)
         return {
-            "token": tok.id_to_token.get(token, token),
-            "edge_successors": [tok.id_to_token.get(t, t) for t in out_edges],
+            "token": self.model.token_name(token),
+            "edge_successors": [self.model.token_name(t) for t in out_edges],
             "bridge_triples_as_source": len(triples),
             "cluster_memberships": clusters,
         }
@@ -282,181 +244,77 @@ class Analyser:
         Relatedness between two tokens = |T_index[a] ∩ T_index[b]|, per SDD
         v2.1 §10. Returns the shared clusters and a plain similarity count.
         """
-        tok = self.model.tokenizer
-        t_index = self.model.bridges.t_index
+        u = self.model
 
         def resolve(word):
-            enc = [t for t in tok.encode(word) if t != 2]
+            enc = [t for t in self.model.encode(word) if t != 2]
             return enc[-1] if enc else None
 
         ta, tb = resolve(word_a), resolve(word_b)
         if ta is None or tb is None:
             return {"word_a": word_a, "word_b": word_b, "similarity": 0, "shared_clusters": []}
-        sa, sb = set(t_index.get(ta, [])), set(t_index.get(tb, []))
+        sa, sb = set(u.clusters_of_token(ta)), set(u.clusters_of_token(tb))
         shared = sorted(sa & sb)
         return {
             "word_a": word_a, "word_b": word_b,
             "similarity": len(shared), "shared_clusters": shared,
         }
 
-    # ------------------------------------------------------- interpretation
-    def cluster_interpretation(self, cluster_id: int, top_n: int = InterpretConfig.TOP_N, mode: str = "strict") -> dict:
-        """
-        Propose a human-readable label for a cluster (e.g. {cat, dog, pig}
-        -> "animal"), derived purely from structure already in the trained
-        matrices. Returns None if the cluster_id doesn't exist or nothing
-        was found. `coverage` is a plain fraction, not a confidence score —
-        see interpret.py's module docstring before presenting this to a
-        user as a certainty figure.
-        """
-        return self.model.interpret_cluster(cluster_id, top_n=top_n, mode=mode)
-
-    def interpretation_report(self, min_coverage: float = InterpretConfig.MIN_COVERAGE, max_per_cluster: int = InterpretConfig.MAX_PER_CLUSTER,
-                               mode: str = "strict") -> list:
-        """Every candidate clearing min_coverage per cluster (not just one)."""
-        return self.model.interpret_all_clusters(
-            min_coverage=min_coverage, max_per_cluster=max_per_cluster, mode=mode)
-
-    def interpreter_matrix(self, min_coverage: float = InterpretConfig.MIN_COVERAGE, min_signals: int = InterpretConfig.MIN_SIGNALS,
-                            max_per_cluster: int = None, mode: str = "strict") -> list:
-        """
-        The filtered Cluster Interpreter Matrix -- coverage AND a minimum
-        number of corroborating evidence_mask entries required. A cluster
-        can carry multiple qualifying labels at once (e.g. both "animal"
-        and "pet"); this is what should actually get persisted as "the"
-        interpreter matrix. interpretation_report()/interpret_cluster()
-        are the wider, unfiltered views used to sanity-check candidates
-        by eye.
-        """
-        return self.model.build_interpreter_matrix(
-            min_coverage=min_coverage, min_signals=min_signals,
-            max_per_cluster=max_per_cluster, mode=mode)
-
-    def zero_cluster_groups(self, min_group_size: int = InterpretConfig.MIN_GROUP_SIZE, mode: str = "strict") -> list:
-        """
-        Mine cluster_id==0 for the "third axis" the standard dual-axis
-        rule never implements (fix bridge+target, source varies). Finds
-        groups the regular cluster_report()/interpreter_matrix() never
-        see at all -- see model.discover_zero_cluster_groups for caveats
-        (bigger candidate space, more prone to coincidental groupings).
-        """
-        return self.model.discover_zero_cluster_groups(
-            min_group_size=min_group_size, mode=mode)
-
-    def context_trigger_matrix(self, min_support: int = CTMConfig.MIN_SUPPORT, mode: str = "strict") -> list:
-        """
-        Flat Context Trigger Matrix table: which surrounding tokens
-        (from whole-sentence co-occurrence) support which cluster
-        member. This is analysis/display only -- it does not build or
-        cache model.ctm; call model.build_context_triggers() for that
-        (needed before generate(..., use_context_triggers=True)).
-        """
-        from ctm import build_context_trigger_matrix
-        rows = build_context_trigger_matrix(self.model, min_support=min_support, mode=mode)
-        dec = self.model._dec_tok
-        return [
-            {**r, "trigger_token": dec(r["trigger_token"]), "member_token": dec(r["member_token"])}
-            for r in rows
-        ]
-
-    # --------------------------------------------------------- Layer 2 (products.py)
-    # Unlike context_trigger_matrix() above, this DOES auto-build
-    # (model.build_layer2(), cached as model.layer2) on first use if it
-    # isn't built yet. That's a deliberate difference, not an
-    # inconsistency: model.ctm feeds generate(..., use_context_triggers=
-    # True), so building it is a real decision with downstream effects
-    # worth making explicit; model.layer2 feeds nothing but this query,
-    # so there's no behavior to accidentally opt into by building it
-    # lazily here -- it exists purely so the CLI is convenient for
-    # exploring/testing the Layer 2 idea one query at a time, per
-    # products.py's own module docstring.
-
-    def ask(self, question_word: str, anchor_word: str) -> dict:
-        """
-        Layer 2 query -- e.g. ask("who", "smiled") for "who smiled?".
-        See products.ask()'s docstring for the full contract: returns
-        None (no evidence / anchor_word never trained), a single
-        {"answer", "score", "votes"} dict, or an explicit
-        {"ambiguous": True, "candidates": [...]} dict when two or more
-        different candidates are genuinely tied for the top score --
-        never a silent pick between them. Raises ValueError for a
-        question_word that isn't implemented yet (see
-        products.py's _QUESTION_BUILDERS for what is).
-        """
-        from products import ask as _ask
-        if self.model.layer2 is None:
-            self.model.build_layer2()
-        return _ask(self.model, question_word, anchor_word)
-
-    def layer2_questions(self) -> list:
-        """Which question words (who/where/...) are currently implemented -- see products.py."""
-        from products import _QUESTION_BUILDERS
-        return sorted(_QUESTION_BUILDERS)
-
-    def why(self, question_word: str, anchor_word: str, candidate_word: str) -> dict:
-        """
-        Independent follow-up to ask(): why does (or doesn't)
-        candidate_word get a yes for question_word+anchor_word, per
-        vote layer, with the exact relationship_ids behind each yes?
-        See products.why()'s docstring.
-        """
-        from products import why as _why
-        if self.model.layer2 is None:
-            self.model.build_layer2()
-        return _why(self.model, question_word, anchor_word, candidate_word)
-
     def noise_homes(self, word: str) -> list:
-        """Every training sentence containing this word -- see noise.find_homes()."""
-        from noise import find_homes
-        if self.model.noise_index is None:
-            self.model.build_noise_index()
-        return find_homes(self.model, word)
+        """Every training sentence containing this word -- see model.noise_homes()/noise.find_homes()."""
+        return self.model.noise_homes(word)
 
     def noise_scores(self, anchor_word: str, home: int = None) -> dict:
         """
         Noise-cancellation scores for one anchor+home, broken down by
-        the three underlying stages plus their average -- see
-        noise.noise_scores_detailed()'s docstring. Raises ValueError
-        if anchor_word has multiple candidate home sentences and
-        `home` wasn't given.
+        the three underlying raw stages -- see
+        model.noise_scores_detailed()/noise.noise_scores_detailed()'s
+        docstring. Raises ValueError if anchor_word has multiple
+        candidate home sentences and `home` wasn't given.
         """
-        from noise import noise_scores_detailed as _noise_scores_detailed
-        if self.model.noise_index is None:
-            self.model.build_noise_index()
-        return _noise_scores_detailed(self.model, anchor_word, home_relationship_id=home)
+        return self.model.noise_scores_detailed(anchor_word, home=home)
 
-    def focus_scores(self, anchor_word: str) -> dict:
+    def focus_scores(self, anchor_word: str, weight_mode: str = "count") -> dict:
         """
-        Global, cross-sentence version of noise_scores() -- each
-        candidate scored once across every home the anchor appears
-        in, broken down by stage plus average. See
+        Global, cross-sentence version of noise_scores() -- stage1,
+        stage2, stage3 (the "in this sentence, who should I care about"
+        scoring, only for candidates sharing a home with the anchor),
+        plus stage4 (shared-knowledge attention:
+        for every other sentence, the tokens NOT common with one of the
+        anchor's homes attend to each other, points accumulating across
+        every sentence pair; common tokens score 0). weight_mode="count"
+        (default) weights each pair by |common|; "flat" gives every pair
+        weight 1, isolating the effect of that scaling. These are RAW
+        counts; model.normalize_scores() turns them into percentages and
+        the final score (the average of the four normalized stages). See
         noise.focus_scores_detailed()'s docstring.
         """
-        from noise import focus_scores_detailed as _focus_scores_detailed
-        if self.model.noise_index is None:
-            self.model.build_noise_index()
-        return _focus_scores_detailed(self.model, anchor_word)
+        return self.model.focus_scores_detailed(anchor_word, weight_mode=weight_mode)
 
     def token_row(self, word: str) -> dict:
-        """Permanent, precomputed vocabulary row for one token, broken down by stage -- see noise.vocabulary_row_detailed()."""
-        from noise import vocabulary_row_detailed
-        if self.model.token_vocab is None:
-            self.model.build_token_vocab()
-        return vocabulary_row_detailed(self.model, word)
+        """Permanent, precomputed vocabulary row for one token, broken down by stage -- see model.token_row_detailed()/noise.vocabulary_row_detailed()."""
+        return self.model.token_row_detailed(word)
 
-    def combine(self, words: list) -> dict:
-        """Sum several tokens' precomputed rows into one combined score per target, broken down by stage -- see noise.combine_context_detailed()."""
-        from noise import combine_context_detailed
-        if self.model.token_vocab is None:
-            self.model.build_token_vocab()
-        return combine_context_detailed(self.model, words)
+    def combine(self, words: list, weight_mode: str = "count") -> dict:
+        """
+        RAW combine: each named word's own focus_scores_detailed() row,
+        summed element-wise across words, target by target (all four stages;
+        no combined number on raw rows). weight_mode=
+        "count" (default)/"flat" -- see noise.combine_context_detailed().
+        """
+        return self.model.combine_detailed(words, weight_mode=weight_mode)
+
+    def combine_normalized(self, words: list, weight_mode: str = "count") -> dict:
+        """
+        NORMALIZED combine: the named words' RAW rows are summed element-wise
+        and the SUM is normalized (per stage, 100 / total) -- exactly what
+        generation does. See noise.combine_context_normalized().
+        """
+        return self.model.combine_normalized(words, weight_mode=weight_mode)
 
     def noise_why(self, anchor_word: str, home: int, candidate_word: str) -> dict:
-        """Independent follow-up: which relationship_ids voted yes for one candidate? See noise.why()."""
-        from noise import why as _why
-        if self.model.noise_index is None:
-            self.model.build_noise_index()
-        return _why(self.model, anchor_word, home, candidate_word)
+        """Independent follow-up: which relationship_ids voted yes for one candidate? See model.noise_why()/noise.why()."""
+        return self.model.noise_why(anchor_word, home, candidate_word)
 
     # -------------------------------------------------------------- traces
     def generation_trace(self, prompt: str, max_tokens: int = 20, mode: str = "strict"):
@@ -470,59 +328,42 @@ class Analyser:
         '..._bigram_frequency' instead of a random pick -- see
         inference.py's _bigram_tie_break.
 
-        Open Mode's rule is almost always 'ctm_weighted_vote' (the
-        V1-V10 primary selection scored the full legal candidate set,
-        with its own internal bigram/global-frequency tie-break
-        cascade if the score itself ties -- see ivm.py's select()).
-        'ctm_unavailable_deterministic_fallback' only appears if no
-        CTM/IVM object was built at all. Stage 1/2 lineage rule names
+        Open Mode's rule is almost always 'ivm_noise_weighted_vote' (ivm's
+        Q1-Q4 plus noise's final score scored the full candidate set, with
+        its own internal bigram/global-frequency tie-break cascade if the
+        total itself ties -- see ivm.py's select()).
+        'ivm_unavailable_deterministic_fallback' only appears if no
+        ivm object was built at all. Stage 1/2 lineage rule names
         never appear for an Open Mode trace. See inference.py's
         module docstring.
         """
         text, ids, trace = self.model.generate(prompt, max_tokens=max_tokens, mode=mode)
-        tok = self.model.tokenizer
         readable = []
         for step in trace:
             chosen = step["chosen"]
             entry = {
                 "stage": step["stage"], "rule": step.get("rule"),
-                "chosen_token": tok.id_to_token.get(chosen, chosen),
+                "chosen_token": self.model.token_name(chosen),
                 "active_rels": sorted(step.get("active_rels", [])) if step.get("active_rels") else [],
             }
             if "scores" in step:
-                entry["scores"] = {tok.id_to_token.get(c, c) if c in (0,1,2,3) else tok.decode([c]): v
+                entry["scores"] = {self.model.token_label(c): v
                                     for c, v in step["scores"].items()}
             readable.append(entry)
         return text, readable
 
     def open_mode_scores(self, prompt: str) -> dict:
         """
-        Full auditable V1-V10 score breakdown for the NEXT token given
-        `prompt`, under Open Mode's primary selection mechanism (see
-        ivm.py's score_candidates()/select()): which tokens are
-        important, their influence (breadth), what each of the TEN
-        layers (important vote / influence vote / context vote /
-        context-influence vote / bigram-witness vote / adjacency
-        vote / prev+current co-occurrence vote / triple witness vote /
-        whole-context unanimous vote / noise-cancellation vote)
-        contributed per candidate, the
-        final combined score, and -- critically -- which stage
-        actually decided the winner ("score", "bigram_frequency",
-        "global_frequency", or "lowest_token_id"). The final "score"
-        is the sum of all ten layers, including bigram_witness_vote
-        (V5), adjacency_vote (V6), prev_current_vote (V7), triple_vote
-        (V8), whole_context_vote (V9), and noise_vote (V10, noise.py's
-        averaged noise-cancellation scores, weighted small) -- don't add
-        up just the other four expecting it to match; V5/V6/V7/V8/V9 are usually
-        the largest single contributors (V5 when the exact bigram was
-        literally witnessed, V6 when the context token was ever
-        directly, immediately followed by the candidate --
-        directional, token->candidate only -- V7 when the prompt's
-        last two tokens and the candidate ever all three shared one
-        training sentence together, V8 when the prompt's
-        last two tokens were ever literally, immediately followed by
-        the candidate as one exact trained triple, V9 when EVERY
-        context token, not just one, knows the candidate).
+        Full auditable score breakdown for the NEXT token given `prompt`
+        under Open Mode's selection (see ivm.py and noise.py): what each
+        of ivm's four questions contributed per candidate (q1 co-occurrence,
+        q2 witnessed legal bigram, q3 legal-bigram check, q4 agreement check),
+        ivm's final score (their sum), noise's final score (weighted, plus
+        its raw scale as noise_raw), the total (ivm + noise), and --
+        critically -- which stage actually decided the winner ("score",
+        "bigram_frequency", "global_frequency", or "lowest_token_id").
+        This is the on-demand "which question gave how many points" view;
+        generation itself only uses the totals.
         Requires Open Mode to be available (model trained/loaded).
         Returns None otherwise.
 
@@ -531,11 +372,16 @@ class Analyser:
         """
         return self.model.open_mode_candidate_scores(prompt)
 
+    def set_legality_top_k(self, k=None):
+        """How many of the top-scored tokens Q3/Q4 may work on: a positive int, or None/0/"all"
+        for every candidate -- see model.set_legality_top_k(). Returns the stored value."""
+        return self.model.set_legality_top_k(k)
+
     def cache_control(self, action: str = "status") -> dict:
         """
-        Toggle or inspect model.open_ctm's opt-in sparse per-token
-        score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8/V9/V10 always stay
-        live, see ivm.py's build_cache()). `action`:
+        Toggle or inspect ivm's opt-in sparse per-token
+        score cache (ivm's Q1 only -- Q2-Q4 always stay live, see
+        ivm.py's build_cache()). `action`:
           "on"     -- (re)build the cache for the full vocabulary
                       (model.all_candidate_tokens()) and enable it
           "off"    -- disable it (built data is kept, so "on" again
@@ -547,21 +393,7 @@ class Analyser:
         unlike the read-only methods above, silently returning None
         would hide a real usage error).
         """
-        if self.model.open_ctm is None:
-            raise RuntimeError("Open Mode isn't ready (model not trained/loaded)")
-        ivm = self.model.open_ctm
-        if action == "on":
-            ivm.enable_cache(self.model.all_candidate_tokens())
-        elif action == "off":
-            ivm.disable_cache()
-        elif action != "status":
-            raise ValueError(f"cache_control: unknown action {action!r} "
-                              "(expected 'on', 'off', or 'status')")
-        return {
-            "enabled": ivm._use_cache,
-            "token_rows": len(ivm._token_cache),
-            "entries": sum(len(row) for row in ivm._token_cache.values()),
-        }
+        return self.model.cache_control(action)
 
     def bigram_frequency(self, prev_word: str, curr_word: str, mode: str = "strict") -> dict:
         """
@@ -573,7 +405,7 @@ class Analyser:
 
         Also reports "witness_sentences": how many literal training
         sentences actually contained this bigram as a consecutive
-        pair -- this is the evidence set V5's bigram-witness vote
+        pair -- this is the evidence set ivm's Q2
         checks context tokens against (see ivm.py's
         bigram_relationships()). Mode-independent -- it is NOT the
         same number as "training" above whenever the bigram occurred
@@ -581,18 +413,7 @@ class Analyser:
         more than one sentence; "training" counts raw occurrences,
         "witness_sentences" counts distinct sentences.
         """
-        tok = self.model.tokenizer
-        prev_id = tok.encode(prev_word)[-1]
-        curr_id = tok.encode(curr_word)[-1]
-        engine = self.model._engine(mode)
-        training = self.model.edges.frequency(prev_id, curr_id)
-        witnesses = self.model.bigram_witness_sentences(prev_id, curr_id)
-        return {
-            "prev": prev_word, "curr": curr_word,
-            "training": training,
-            "total": engine._bigram_frequency(prev_id, curr_id),
-            "witness_sentences": len(witnesses),
-        }
+        return self.model.bigram_info(prev_word, curr_word, mode=mode)
 
     # ----------------------------------------------------------- full report
     def full_report(self, top_n: int = 10) -> dict:
@@ -676,13 +497,10 @@ def main():
     p.add_argument("--limit", type=int, default=50, help="0 = no limit")
     p.add_argument("--offset", type=int, default=0)
 
-    p = sub.add_parser("rel-rows",
-                        help="Raw RelationshipMatrix rows (relationship_id, triple_id, "
-                             "decoded source/bridge/target), paged -- normally the biggest "
-                             "of the three matrices; filter with --relationship or --triple")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--relationship", type=int, help="Only rows for this relationship_id")
-    g.add_argument("--triple", type=int, help="Only rows for this triple_id")
+    p = sub.add_parser("tiles",
+                        help="Tile table rows (relationship_id, position, first, second): how each "
+                             "training sentence is stored; filter with --relationship")
+    p.add_argument("--relationship", type=int, help="Only tiles of this relationship_id")
     p.add_argument("--limit", type=int, default=50, help="0 = no limit")
     p.add_argument("--offset", type=int, default=0)
 
@@ -696,60 +514,6 @@ def main():
     p = sub.add_parser("shared", help="infer_shared_role() across two or more tokens")
     p.add_argument("words", nargs="+")
 
-    p = sub.add_parser("interpret", help="Propose a human-readable label for one cluster_id")
-    p.add_argument("cluster_id", type=int)
-    p.add_argument("--top", type=int, default=InterpretConfig.TOP_N)
-    p.add_argument("--mode", choices=["strict", "open"], default="strict")
-
-    p = sub.add_parser("interpretations", help="Every qualifying label per cluster (unfiltered)")
-    p.add_argument("--min-coverage", type=float, default=InterpretConfig.MIN_COVERAGE)
-    p.add_argument("--max-per-cluster", type=int, default=InterpretConfig.MAX_PER_CLUSTER)
-    p.add_argument("--mode", choices=["strict", "open"], default="strict")
-
-    p = sub.add_parser("interpreter-matrix",
-                        help="Filtered CI Matrix (coverage + corroborating evidence required); "
-                             "a cluster may carry multiple labels. "
-                             "Pipe with --json > interpreter_matrix.json to persist it.")
-    p.add_argument("--min-coverage", type=float, default=InterpretConfig.MIN_COVERAGE)
-    p.add_argument("--min-signals", type=int, default=InterpretConfig.MIN_SIGNALS)
-    p.add_argument("--max-per-cluster", type=int, default=None)
-    p.add_argument("--mode", choices=["strict", "open"], default="strict")
-
-    p = sub.add_parser("zero-cluster",
-                        help="Mine cluster_id==0 for groups the standard dual-axis rule "
-                             "never assigns a cluster_id to (fix bridge+target, source varies)")
-    p.add_argument("--min-group-size", type=int, default=InterpretConfig.MIN_GROUP_SIZE)
-    p.add_argument("--mode", choices=["strict", "open"], default="strict")
-
-    p = sub.add_parser("context-triggers",
-                        help="Context Trigger Matrix: which surrounding tokens (whole-sentence "
-                             "co-occurrence) support which cluster member, for contextual "
-                             "disambiguation. Display/analysis only -- does not build/cache "
-                             "model.ctm (needed for generate(use_context_triggers=True)); "
-                             "that's a Python-API-only call: model.build_context_triggers().")
-    p.add_argument("--min-support", type=int, default=CTMConfig.MIN_SUPPORT)
-    p.add_argument("--mode", choices=["strict", "open"], default="strict")
-
-    p = sub.add_parser("ask",
-                        help="Layer 2 query (products.py): e.g. 'ask who smiled' for "
-                             "\"who smiled?\". Reports an explicit ambiguous result, listing "
-                             "every tied candidate, rather than silently picking one when "
-                             "the anchor word alone doesn't distinguish them.")
-    p.add_argument("question_word", help="One of the implemented question types -- run "
-                                          "with no question_word to list them")
-    p.add_argument("anchor_word", nargs="?", help="The verb/event word the question anchors to")
-
-    p = sub.add_parser("why",
-                        help="Independent follow-up to 'ask': why does (or doesn't) a specific "
-                             "candidate get a yes for a question+anchor, per vote layer, with "
-                             "the exact relationship_ids ('ref') behind each yes? Works on any "
-                             "candidate, not just the winning one -- e.g. run this on a wrong "
-                             "answer to see exactly which layer was fooled and by what "
-                             "training sentence.")
-    p.add_argument("question_word")
-    p.add_argument("anchor_word")
-    p.add_argument("candidate_word")
-
     p = sub.add_parser("noise-homes",
                         help="noise.py: every training sentence (relationship_id) containing "
                              "this word -- use this to pick a home_relationship_id for "
@@ -762,8 +526,8 @@ def main():
                              "sitting in one home sentence, score every OTHER word in that "
                              "sentence across three vote rules -- stage1 (literal sentence "
                              "membership), stage2 (sentence-level global co-occurrence), stage3 "
-                             "(token-level global co-occurrence, deduped) -- plus their average, "
-                             "shown as four columns. A voter votes 'pay attention' only if it "
+                             "(token-level global co-occurrence, deduped) -- shown as three raw "
+                             "columns (they are on different scales, so they are not combined). A voter votes 'pay attention' only if it "
                              "does NOT already know the word -- 'the' lands at 0 on every stage, "
                              "with no stopword list.")
     p.add_argument("anchor_word")
@@ -772,26 +536,62 @@ def main():
                                               "one training sentence (see noise-homes)")
 
     p = sub.add_parser("focus-scores",
-                        help="Global, cross-sentence version of noise-scores: sums each stage "
-                             "(plus average) across EVERY training sentence the anchor appears "
-                             "in, so the result is 'wherever this token shows up, focus on "
-                             "these' rather than a single sentence's table.")
+                        help="Global, cross-sentence version of noise-scores: stage1, stage2, "
+                             "stage3 (for candidates sharing a home "
+                             "with the anchor), plus stage4 -- shared-knowledge attention: for "
+                             "every other sentence, tokens NOT common with one of the anchor's "
+                             "homes attend to each other with weight = number of common tokens, "
+                             "accumulating across every sentence pair (common tokens score 0). "
+                             "By default the four stages are shown as percentages plus final% = "
+                             "their average; --raw shows the raw counts.")
     p.add_argument("anchor_word")
+    p.add_argument("--top", type=int, default=30,
+                    help="Rows to print, best first by final% (by stage4 then stage3 with --raw) (0 = all). Many "
+                         "candidates score 0 on stage4, so the tail can be the whole vocabulary. "
+                         "Does not limit --json output.")
+    p.add_argument("--stage4-weight", choices=["count", "flat"], default="count",
+                    help="How each sentence pair contributes to stage4: 'count' (default) "
+                         "weights it by |common tokens|; 'flat' gives every pair equal weight 1, "
+                         "to see stage4's ranking without the |common| scaling.")
+    p.add_argument("--raw", action="store_true",
+                    help="Show raw counts instead of the default normalized percentages. "
+                         "Normalized (default): every stage shown as a percentage of that "
+                         "stage's total WITHIN THIS QUERY (sum across the candidates shown "
+                         "here, not the whole vocabulary) -- see noise.normalize_row(). final% is the average of the four "
+                         "normalized stages (stage1%..stage4%).")
 
     p = sub.add_parser("token-row",
                         help="Permanent, precomputed vocabulary row for one token (noise.py's "
-                             "TokenVocabularyMatrix), broken down by stage plus average -- "
+                             "TokenVocabularyMatrix), broken down by raw stage -- "
                              "'wherever this token appears, these are the tokens it has "
                              "accumulated evidence to pay attention to'. Never re-reads any "
                              "training sentence -- built once (auto-built on first use).")
     p.add_argument("word")
 
     p = sub.add_parser("combine",
-                        help="Sum several tokens' precomputed vocabulary rows into one combined "
-                             "score per target, broken down by stage plus average -- the "
-                             "inference-time step: which OTHER words does a context of these "
-                             "active tokens have the most accumulated evidence to focus on?")
+                        help="Each named word's own focus-scores row (stage1-3, stage4), summed "
+                             "element-wise across the named words, target by target -- "
+                             "'stage1 for cat' + 'stage1 for sat' (and likewise for every stage) "
+                             "-- the inference-time step: which OTHER words does a context of "
+                             "these active tokens have the most accumulated evidence to focus "
+                             "on? --normalize switches to normalize-each-word-FIRST-then-sum "
+                             "(see --normalize's own help), a different, larger result than "
+                             "summing raw rows and normalizing the sum afterward.")
     p.add_argument("words", nargs="+")
+    p.add_argument("--top", type=int, default=30,
+                    help="Rows to print, best first by final% (by stage4 then stage3 with --raw) (0 = all). Many "
+                         "candidates score 0 on stage4, so the tail can be the whole vocabulary. "
+                         "Does not limit --json output.")
+    p.add_argument("--stage4-weight", choices=["count", "flat"], default="count",
+                    help="How each sentence pair contributes to stage4: 'count' (default) "
+                         "weights it by |common tokens|; 'flat' gives every pair equal weight 1, "
+                         "to see stage4's ranking without the |common| scaling.")
+    p.add_argument("--raw", action="store_true",
+                    help="Show raw counts instead of the default normalized combine. "
+                         "Normalized (default): the named words' RAW rows are added "
+                         "element-wise, then the SUM is normalized per stage (100 / that stage's "
+                         "total across the targets shown); final% is the average of the four "
+                         "normalized stages. --raw shows the summed raw rows.")
 
     p = sub.add_parser("noise-why",
                         help="Independent follow-up to noise-scores/focus-scores/token-row: "
@@ -808,22 +608,23 @@ def main():
     p.add_argument("--mode", choices=["strict", "open"], default="strict")
 
     p = sub.add_parser("open-scores",
-                        help="Open Mode only: full V1-V10 weighted-vote breakdown "
-                             "for the next token given a prompt -- important tokens, "
-                             "influence, per-layer contributions (including V5's "
-                             "bigram-witness vote, V6's adjacency vote, V7's "
-                             "prev+current co-occurrence vote, V8's triple "
-                             "witness vote, V9's whole-context vote, and V10's "
-                             "noise-cancellation vote), the final "
-                             "score, and which tie-break stage (if any) decided the winner. "
+                        help="Open Mode only: score breakdown for the next token given a prompt -- "
+                             "what each of ivm's four questions contributed (Q1 co-occurrence, "
+                             "Q2 witnessed legal bigram, Q3 legal-bigram check, Q4 agreement check), "
+                             "ivm's score, noise's score, the total (ivm + noise), the final legal-only score, "
+                             "and which tie-break stage (if any) decided the winner. "
                              "This is Open Mode's PRIMARY selection mechanism, not a "
                              "tie-breaker; use this to audit why it picked what it picked. "
                              "Always scores the entire vocabulary -- Open Mode has no "
                              "successor gating at all.")
     p.add_argument("prompt")
+    p.add_argument("--legality-top", default=None, metavar="N|all",
+                   help="How many of the top-scored tokens Q3/Q4 may work on: a number, or 'all' "
+                        "(the default, IVMConfig.LEGALITY_TOP_K). If none of the top N is a legal "
+                        "continuation, <EOS> wins.")
     p.add_argument("--cache", action="store_true",
-                    help="Enable the sparse V1/V2/V3/V4/V6 score cache "
-                         "(model.open_ctm) before scoring -- same numbers "
+                    help="Enable ivm's sparse Q1 score cache "
+                         "before scoring -- same numbers "
                          "either way, this just times/labels which path ran "
                          "(see the printed 'cache: on/off' line and the "
                          "cache_used field in --json output).")
@@ -839,9 +640,8 @@ def main():
                          "returns every candidate's score.")
 
     p = sub.add_parser("cache",
-                        help="Toggle or inspect model.open_ctm's opt-in sparse "
-                             "per-token score cache (V1/V2/V3/V4/V6 only -- V5/V7/V8/V9/V10 "
-                             "always stay live). Same scores either way; this is "
+                        help="Toggle or inspect ivm's opt-in sparse "
+                             "per-token score cache (Q1 only -- Q2-Q4 always stay live). Same scores either way; this is "
                              "purely a speed optimization -- see benchmark_cache.py "
                              "to actually measure the difference.")
     p.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
@@ -850,7 +650,7 @@ def main():
                         help="Raw bigram frequency for one (prev, curr) pair -- the "
                              "exact count used by Strict Mode's tie-break and Open "
                              "Mode's first tie-break cascade stage, plus how many "
-                             "distinct training sentences witnessed it (V5's evidence "
+                             "distinct training sentences witnessed it (Q2's evidence "
                              "set, see inference.py/ivm.py)")
     p.add_argument("prev")
     p.add_argument("curr")
@@ -937,13 +737,13 @@ def main():
             _print_table(r["rows"], ["source", "bridge", "target", "cluster_id"]),
         ))
 
-    elif args.command == "rel-rows":
-        result = analyser.relationship_matrix(relationship_id=args.relationship, triple_id=args.triple,
-                                               limit=args.limit, offset=args.offset)
+    elif args.command == "tiles":
+        result = analyser.tile_table(relationship_id=args.relationship,
+                                      limit=args.limit, offset=args.offset)
         _emit(result, args.json, lambda r: (
             print(f"  {r['total']} row(s) total (showing offset={r['offset']}, "
                   f"limit={r['limit'] or 'none'})"),
-            _print_table(r["rows"], ["relationship_id", "triple_id", "source", "bridge", "target"]),
+            _print_table(r["rows"], ["relationship_id", "position", "first", "second"]),
         ))
 
     elif args.command == "token":
@@ -967,112 +767,6 @@ def main():
             ["predicted", "axis", "cluster_id", "overlap"],
         ) if r else None)
 
-    elif args.command == "interpret":
-        result = analyser.cluster_interpretation(args.cluster_id, top_n=args.top, mode=args.mode)
-        if result is None:
-            print(f"cluster_id {args.cluster_id} not found", file=sys.stderr)
-            sys.exit(1)
-        if not result["candidates"]:
-            print(f"  cluster {args.cluster_id} ({result['axis']} axis, "
-                  f"members: {', '.join(result['members'])}) — no interpreter found "
-                  f"(corpus has no matching categorical statement for these members)")
-        else:
-            _emit(result, args.json, lambda r: (
-                print(f"  cluster_id: {r['cluster_id']}   axis: {r['axis']}   "
-                      f"members: {', '.join(r['members'])}"),
-                _print_table(
-                    [(c["interpreter_token"], c["coverage"], ",".join(c["evidence_mask"]),
-                      ", ".join(c["members_covered"])) for c in r["candidates"]],
-                    ["interpreter", "coverage", "evidence_mask", "members_covered"],
-                ),
-            ))
-
-    elif args.command == "interpretations":
-        result = analyser.interpretation_report(min_coverage=args.min_coverage,
-                                                 max_per_cluster=args.max_per_cluster,
-                                                 mode=args.mode)
-        if not result:
-            print("  no clusters cleared the coverage threshold")
-        _emit(result, args.json, lambda r: _print_table(
-            [(c["cluster_id"], cand["interpreter_token"], cand["coverage"],
-              ",".join(cand["evidence_mask"]), ", ".join(cand["members_covered"]))
-             for c in r for cand in c["candidates"]],
-            ["cluster_id", "interpreter", "coverage", "evidence_mask", "members_covered"],
-        ) if r else None)
-
-    elif args.command == "interpreter-matrix":
-        result = analyser.interpreter_matrix(min_coverage=args.min_coverage,
-                                              min_signals=args.min_signals,
-                                              max_per_cluster=args.max_per_cluster,
-                                              mode=args.mode)
-        if not result:
-            print("  no clusters cleared both the coverage and evidence thresholds")
-        _emit(result, args.json, lambda r: _print_table(
-            [(row["cluster_id"], row["interpreter_token"], row["coverage"],
-              ",".join(row["evidence_mask"]), ", ".join(row["members_covered"])) for row in r],
-            ["cluster_id", "interpreter", "coverage", "evidence_mask", "members_covered"],
-        ) if r else None)
-
-    elif args.command == "zero-cluster":
-        result = analyser.zero_cluster_groups(min_group_size=args.min_group_size, mode=args.mode)
-        if not result:
-            print("  no groups found in the unclustered bucket at this min_group_size")
-        _emit(result, args.json, lambda r: _print_table(
-            [(row["interpreter_token"], row["member_count"], ",".join(row["evidence_mask"]),
-              ", ".join(row["members"])) for row in r],
-            ["interpreter", "member_count", "evidence_mask", "members"],
-        ) if r else None)
-
-    elif args.command == "context-triggers":
-        result = analyser.context_trigger_matrix(min_support=args.min_support, mode=args.mode)
-        if not result:
-            print("  no triggers found at this min_support")
-        _emit(result, args.json, lambda r: _print_table(
-            [(row["trigger_token"], row["cluster_id"], row["member_token"], row["support"])
-             for row in r],
-            ["trigger_token", "cluster_id", "member_token", "support"],
-        ) if r else None)
-
-    elif args.command == "ask":
-        if args.anchor_word is None:
-            print("  implemented question types: " + ", ".join(analyser.layer2_questions()))
-        else:
-            try:
-                result = analyser.ask(args.question_word, args.anchor_word)
-            except ValueError as e:
-                print(f"  error: {e}")
-                return
-
-            def _print_ask(r):
-                if r is None:
-                    print(f"  no evidence for '{args.question_word} {args.anchor_word}?'")
-                elif r.get("ambiguous"):
-                    print(f"  ambiguous -- {len(r['candidates'])} tied candidate(s), refusing to guess:")
-                    _print_table(
-                        [(c["answer"], c["score"], ", ".join(f"{k}={v}" for k, v in c["votes"].items()))
-                         for c in r["candidates"]],
-                        ["candidate", "score", "votes"],
-                    )
-                else:
-                    print(f"  answer: {r['answer']}  (score {r['score']})")
-                    print(f"  votes:  " + ", ".join(f"{k}={v}" for k, v in r["votes"].items()))
-            _emit(result, args.json, _print_ask)
-
-    elif args.command == "why":
-        try:
-            result = analyser.why(args.question_word, args.anchor_word, args.candidate_word)
-        except ValueError as e:
-            print(f"  error: {e}")
-            return
-        if result is None:
-            print(f"  '{args.anchor_word}' or '{args.candidate_word}' never appeared in training")
-        else:
-            _emit(result, args.json, lambda r: _print_table(
-                [(layer, info["answer"], ", ".join(str(x) for x in info["ref"]))
-                 for layer, info in r.items()],
-                ["layer", "answer", "ref (relationship_ids)"],
-            ))
-
     elif args.command == "noise-homes":
         result = analyser.noise_homes(args.word)
         if not result:
@@ -1095,28 +789,48 @@ def main():
         def _print_noise(r):
             print(f"  home #{r['home']}: \"{r['home_sentence']}\"")
             rows = sorted(
-                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                ((w, info["stage1"], info["stage2"], info["stage3"])
                  for w, info in r["scores"].items()),
-                key=lambda row: -row[4],
+                key=lambda row: (-row[3], -row[2], -row[1]),
             )
-            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
-            print("\n  (for stage 2's exact voters on one candidate, use noise-why)")
+            _print_table(rows, ["word", "stage1", "stage2", "stage3"])
+            print("\n  (raw counts, not combined -- they are on different scales; "
+                  "for stage 2's exact voters on one candidate, use noise-why)")
         _emit(result, args.json, _print_noise)
 
     elif args.command == "focus-scores":
-        result = analyser.focus_scores(args.anchor_word)
+        result = analyser.focus_scores(args.anchor_word, weight_mode=args.stage4_weight)
         if result is None:
             print(f"  '{args.anchor_word}' was never trained")
             return
+        if not args.raw:
+            result["scores"] = analyser.model.normalize_scores(result["scores"])
 
         def _print_focus(r):
             print(f"  homes: {r['homes']}")
-            rows = sorted(
-                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
-                 for w, info in r["scores"].items()),
-                key=lambda row: -row[4],
-            )
-            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+            fmt = (lambda v: v) if args.raw else (lambda v: round(v, 2))
+            if args.raw:
+                rows = sorted(
+                    ((w, fmt(info["stage1"]), fmt(info["stage2"]), fmt(info["stage3"]),
+                      fmt(info["stage4"]))
+                     for w, info in r["scores"].items()),
+                    key=lambda row: (-row[4], -row[3], -row[2], -row[1]),
+                )
+                headers = ["word", "stage1", "stage2", "stage3", "stage4"]
+            else:
+                rows = sorted(
+                    ((w, fmt(info["stage1"]), fmt(info["stage2"]), fmt(info["stage3"]),
+                      fmt(info["stage4"]), fmt(info["final"]))
+                     for w, info in r["scores"].items()),
+                    key=lambda row: -row[5],
+                )
+                headers = ["word", "stage1%", "stage2%", "stage3%", "stage4%", "final%"]
+            total = len(rows)
+            if args.top and total > args.top:
+                rows = rows[:args.top]
+            _print_table(rows, headers)
+            if args.top and total > args.top:
+                print(f"  ... showing top {args.top} of {total} (use --top 0 for all)")
         _emit(result, args.json, _print_focus)
 
     elif args.command == "token-row":
@@ -1130,27 +844,47 @@ def main():
             if not r:
                 return
             rows = sorted(
-                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
+                ((w, info["stage1"], info["stage2"], info["stage3"])
                  for w, info in r.items()),
-                key=lambda row: -row[4],
+                key=lambda row: (-row[3], -row[2], -row[1]),
             )
-            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+            _print_table(rows, ["word", "stage1", "stage2", "stage3"])
         _emit(result, args.json, _print_row)
 
     elif args.command == "combine":
-        result = analyser.combine(args.words)
+        if args.raw:
+            result = analyser.combine(args.words, weight_mode=args.stage4_weight)
+        else:
+            result = analyser.combine_normalized(args.words, weight_mode=args.stage4_weight)
         if not result:
             print(f"  none of {args.words} were trained / had any accumulated row")
 
         def _print_combined(r):
             if not r:
                 return
-            rows = sorted(
-                ((w, info["stage1"], info["stage2"], info["stage3"], info["average"])
-                 for w, info in r.items()),
-                key=lambda row: -row[4],
-            )
-            _print_table(rows, ["word", "stage1", "stage2", "stage3", "average"])
+            fmt = (lambda v: v) if args.raw else (lambda v: round(v, 2))
+            if args.raw:
+                rows = sorted(
+                    ((w, fmt(info["stage1"]), fmt(info["stage2"]), fmt(info["stage3"]),
+                      fmt(info["stage4"]))
+                     for w, info in r.items()),
+                    key=lambda row: (-row[4], -row[3], -row[2], -row[1]),
+                )
+                headers = ["word", "stage1", "stage2", "stage3", "stage4"]
+            else:
+                rows = sorted(
+                    ((w, fmt(info["stage1"]), fmt(info["stage2"]), fmt(info["stage3"]),
+                      fmt(info["stage4"]), fmt(info["final"]))
+                     for w, info in r.items()),
+                    key=lambda row: -row[5],
+                )
+                headers = ["word", "stage1%", "stage2%", "stage3%", "stage4%", "final%"]
+            total = len(rows)
+            if args.top and total > args.top:
+                rows = rows[:args.top]
+            _print_table(rows, headers)
+            if args.top and total > args.top:
+                print(f"  ... showing top {args.top} of {total} (use --top 0 for all)")
         _emit(result, args.json, _print_combined)
 
     elif args.command == "noise-why":
@@ -1181,15 +915,18 @@ def main():
     elif args.command == "open-scores":
         if args.cache:
             analyser.cache_control("on")
+        if args.legality_top is not None:
+            try:
+                analyser.set_legality_top_k(args.legality_top)
+            except ValueError as e:
+                print(f"  {e}", file=sys.stderr)
+                sys.exit(2)
         result = analyser.open_mode_scores(args.prompt)
         if result is None:
             print("Open Mode isn't ready (model not trained/loaded)", file=sys.stderr)
             sys.exit(1)
 
         def _print_open_scores(r):
-            print(f"  important tokens: {r['important_tokens']}")
-            print(f"  influence:        {r['influence']}")
-
             # --top-n only limits what gets PRINTED -- the scores dict
             # (and therefore the winner/tie-break decision) always
             # covers the entire vocabulary. 0 (or a value >= the vocab
@@ -1204,29 +941,22 @@ def main():
                       f"showing top {len(shown)} by score -- "
                       f"--top-n <n> or --top-n 0 to change)")
 
+            layers = analyser.model.score_layers()   # (key, label): q1..q4, ivm, noise, score, final
+
             def _row(c, tag):
-                return (c, round(r["important_vote"].get(c, 0), 2),
-                        round(r["influence_vote"].get(c, 0), 2),
-                        round(r["context_vote"].get(c, 0), 2),
-                        round(r["context_influence_vote"].get(c, 0), 2),
-                        round(r["bigram_witness_vote"].get(c, 0), 2),
-                        round(r["adjacency_vote"].get(c, 0), 2),
-                        round(r["prev_current_vote"].get(c, 0), 2),
-                        round(r["triple_vote"].get(c, 0), 2),
-                        round(r["whole_context_vote"].get(c, 0), 2),
-                        round(r["noise_vote"].get(c, 0), 4),
-                        round(r["scores"][c], 2),
-                        tag)
+                return (c, *[round(r[key].get(c, 0), 4) for key, _ in layers], tag)
 
             rows = [_row(c, "<- winner" if c == r["winner"] else "") for c in shown]
             if truncated and r["winner"] not in shown:
                 rows.append(_row(r["winner"], "<- winner (outside top N)"))
-            _print_table(
-                rows,
-                ["candidate", "V1 (important)", "V2 (influence)", "V3 (context)",
-                 "V4 (ctx.infl.)", "V5 (bigram witness)", "V6 (adjacency)",
-                 "V7 (prev+curr)", "V8 (triple)", "V9 (unanimous)", "V10 (noise)", "score", ""],
-            )
+            _print_table(rows, ["candidate", *[label for _, label in layers], ""])
+            print(f"\n  (score = ivm + noise; noise = noise's own final score x {r['noise_weight']:g}, "
+                  f"see config.NoiseConfig.INFERENCE_WEIGHT; Q3/Q4 = 1 means legal and never change a "
+                  f"score; final = score if eligible to win, else 0; eligible set from: {r['legality']}"
+                  + ("" if r["q4_active"] else "; Q4 inactive: fewer than two context tokens")
+                  + ("" if r["legality_top_k"] is None else
+                     f"; Q3/Q4 worked on the top {r['legality_top_k']} (window {r['window_size']})")
+                  + ")")
             print(f"\n  winner: {r['winner']}  (decided by: {r['tie_break_stage']}"
                   f"  ·  cache: {'on' if r['cache_used'] else 'off'})")
 
@@ -1252,7 +982,7 @@ def main():
             print(f"  '{r['prev']}' -> '{r['curr']}':  training={r['training']}  "
                   f"total={r['total']}  "
                   f"witness_sentences={r['witness_sentences']}"),
-            print("  (witness_sentences is the evidence V5's bigram-witness vote "
+            print("  (witness_sentences is the evidence ivm's Q2 "
                   "checks context tokens against -- see ivm.py)"),
         ))
 

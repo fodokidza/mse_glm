@@ -110,7 +110,7 @@ class InferenceEngine:
         self.vocab   = vocab or []   # Open Mode only: full candidate pool, see model.all_candidate_tokens()
 
 
-    # ── helpers ───────────────────────────────────────────────────────────
+    # === helpers ==================================================================
 
     def _successors(self, token):
         """All legal next tokens from E. Sorted for determinism. Strict Mode only --
@@ -220,23 +220,22 @@ class InferenceEngine:
             return None
         return importance_votes.resolve_tie(tied_candidates, context_tokens)
 
-    def _open_mode_step(self, previous, current, candidates, context_tokens, importance_votes, active_rels):
+    def _open_mode_step(self, previous, current, candidates, context_tokens, importance_votes, active_rels,
+                        extra_scores_fn=None):
         """
         OPEN MODE primary candidate selection. `candidates` is
         `self.vocab` — the ENTIRE vocabulary, not gated by whether a
         bigram was ever literally observed — every one of them is
         scored here, this is not a tie-break inserted after some
         other mechanism narrows things down. See ivm.py's
-        select()/score_candidates() for the ten-layer weighted-
-        voting formula (V1-V10; V1/V2/V4/V10 deliberately weighted small
-        so they can only nudge a tie V3 left open, never override it;
-        V5/V6/V7/V8/V9 peer-weighted with V3, V8/V9 a notch above) and for
-        the bigram-frequency →
-        global-frequency → lowest-token-id tie-break cascade `current`
-        feeds into. `previous` is forwarded too now, purely for V7
-        (the previous+current co-occurrence vote) and V8 (the triple
-        witness vote) -- it plays no role
-        in the tie-break cascade itself, only `current` does.
+        select()/score_candidates() for the scoring (Q1 co-occurrence +
+        Q2 witnessed bigram, plus noise.py's score added via
+        `extra_scores_fn`), the Q3/Q4 legality checks applied to the
+        ranked list, and the bigram-frequency → global-frequency →
+        lowest-token-id tie-break cascade `current` feeds into.
+        `previous` is forwarded for Q4 (the (previous, current) → C
+        triple check) -- it plays no role in the tie-break cascade
+        itself, only `current` does.
 
         Deterministic, always: select() itself resolves any residual
         tie all the way down to lowest token id internally, so this
@@ -257,16 +256,23 @@ class InferenceEngine:
         Open Mode's decision.
         """
         if importance_votes is not None:
+            # extra_scores_fn(context_tokens) -> {candidate: score}: another
+            # scorer's FINAL scores (model.py passes noise.py's). ivm adds
+            # them before ranking; it never inspects them.
+            extra = extra_scores_fn(context_tokens) if extra_scores_fn else None
             winner, trace = importance_votes.select(candidates, context_tokens,
-                                                      current=current, previous=previous)
+                                                      current=current, previous=previous,
+                                                      extra_scores=extra)
             if winner is not None:
-                return winner, {"stage": 1, "rule": "ctm_weighted_vote",
+                return winner, {"stage": 1, "rule": "ivm_noise_weighted_vote",
                                  "chosen": winner, "active_rels": active_rels,
-                                 "candidates": candidates, "scores": trace["scores"],
-                                 "important_vote": trace.get("important_vote", {}),
-                                 "influence_vote": trace.get("influence_vote", {}),
-                                 "context_vote": trace.get("context_vote", {}),
-                                 "noise_vote": trace.get("noise_vote", {})}
+                                 "candidates": candidates, "scores": trace["total_scores"],
+                                 "ivm_scores": trace["scores"],
+                                 "noise_scores": dict(extra) if extra else {},
+                                 "q1": trace["q1"], "q2": trace["q2"],
+                                 "legality": trace["legality"],
+                                 "q4_active": trace.get("q4_active", True),
+                                 "tie_break_stage": trace["tie_break_stage"]}
         # No CTM/IVM object supplied at all, or `candidates` was
         # somehow empty (can't happen here — _successors already
         # checked nonempty before this method is called). Deterministic
@@ -276,13 +282,13 @@ class InferenceEngine:
                          "chosen": winner, "active_rels": active_rels,
                          "candidates": candidates}
 
-    # ── main step ─────────────────────────────────────────────────────────
+    # === main step ==============================================================
 
     def step(self, previous, current, active_rels=None, context_tokens=None,
-              context_triggers=None, importance_votes=None):
+              context_triggers=None, importance_votes=None, extra_scores_fn=None):
         active_rels = active_rels or set()
 
-        # ── OPEN MODE: candidates are ALWAYS the full vocabulary ───────────
+        # ===== OPEN MODE: candidates are ALWAYS the full vocabulary ==============
         # No successor gating at all -- self.vocab (set once at construction,
         # see model.all_candidate_tokens()) is the entire candidate universe
         # every step, scored by IVM's V1-V10 weighted voting (ivm.py). Not an
@@ -294,16 +300,17 @@ class InferenceEngine:
                 return EOS, {"stage": 4, "rule": "termination_empty_vocabulary",
                              "chosen": EOS, "active_rels": active_rels}
             return self._open_mode_step(previous, current, candidates, context_tokens,
-                                         importance_votes, active_rels)
+                                         importance_votes, active_rels,
+                                         extra_scores_fn=extra_scores_fn)
 
-        # ── STRICT MODE ────────────────────────────────────────────────────
-        # ── Collect legal successors (bigram check) ───────────────────────
+        # ===== STRICT MODE ====================================================
+        # === Collect legal successors (bigram check) =========================
         succs = self._successors(current)
         if not succs:
             return EOS, {"stage": 4, "rule": "termination_no_successors",
                          "chosen": EOS, "active_rels": active_rels}
 
-        # ── Stage 1: current token authority ─────────────────────────────
+        # === Stage 1: current token authority ================================
         # Vote for candidate C if triple (source=current, bridge=C) has
         # rel_id ∈ active_rels. "I only vote for whom I know as my bridge
         # and whose relationship_id matches mine."
@@ -364,7 +371,7 @@ class InferenceEngine:
                            "chosen": token, "active_rels": new_rels,
                            "candidates": list(s1_pass)}
 
-        # ── Stage 2: previous token exact match with lineage ──────────────
+        # === Stage 2: previous token exact match with lineage =============
         # First: check if previous and current share a relationship_id in
         # active_rels — narrow active_rels to only the shared ones
         prev_curr_rels = self._exact_triple_rels(previous, current, None)
@@ -414,10 +421,10 @@ class InferenceEngine:
                        "candidates": list(s1_pass)}
 
     def generate(self, prompt_ids, max_tokens=GenerationConfig.MAX_TOKENS, context_triggers=None,
-                 importance_votes=None):
+                 importance_votes=None, extra_scores_fn=None):
         ids = list(prompt_ids)
 
-        # ── validate every adjacent bigram in the prompt ──────────────
+        # ===== validate every adjacent bigram in the prompt ================
         # If any (curr→next) pair does not exist in E, the prompt
         # contains a transition the model has never seen. Return
         # immediately — cannot legally continue. STRICT MODE ONLY:
@@ -436,7 +443,7 @@ class InferenceEngine:
             return b in self.edges.successors(a)
 
         if self.mode == "strict":
-            # ── validate prompt bigrams (skip BOS→first_token) ──────
+            # === validate prompt bigrams (skip BOS→first_token) =================
             # BOS is prepended artificially by encode() — it is not a real
             # training token with known successors. Any real token is a valid
             # generation starting point. Only validate pairs between real tokens.
@@ -449,7 +456,7 @@ class InferenceEngine:
                                   "detail": f"bigram ({curr}->{nxt}) not in edge matrix",
                                   "active_rels": set()}]
 
-        # ── seed active_rels from prompt triples ──────────────────────
+        # ==== seed active_rels from prompt triples ===================================
         active_rels = set()
         for i in range(len(ids) - 2):
             rels = self._rel_ids(ids[i], ids[i+1], ids[i+2])
@@ -457,7 +464,7 @@ class InferenceEngine:
                 active_rels = self._narrow(active_rels, rels)
             else:
                 active_rels = set()   # lineage broken — reset, don't keep stale lock
-        # ─────────────────────────────────────────────────────────────
+        # =========================================================================
         trace    = []
         previous = ids[-2] if len(ids) >= 2 else None
         current  = ids[-1]
@@ -466,7 +473,8 @@ class InferenceEngine:
             token, step_trace = self.step(previous, current, active_rels,
                                            context_tokens=context_tokens,
                                            context_triggers=context_triggers,
-                                           importance_votes=importance_votes)
+                                           importance_votes=importance_votes,
+                                           extra_scores_fn=extra_scores_fn)
             trace.append(step_trace)
             if token == EOS:
                 break

@@ -8,8 +8,8 @@ Two inference modes, one set of graphs -- there is no separate
             two-stage lineage-vote pipeline (default)
   open    — InferenceEngine(E, B, R, mode="open", vocab=<all tokens>)
             candidates are the ENTIRE vocabulary every step, scored
-            by IVM's V1-V10 weighted voting (see ivm.py), including
-            noise.py's noise-cancellation signal as V10
+            by IVM's Q1/Q2 scores (see ivm.py) plus noise.py's noise-cancellation
+            score, filtered by the Q3/Q4 legality checks
 
 Both engines are built automatically as soon as the model is trained
 or loaded -- there is no separate "build Open Mode" step anymore.
@@ -18,10 +18,11 @@ or loaded -- there is no separate "build Open Mode" step anymore.
 import json
 import os
 
-from tokenizer import split_sentences, CharWordTokenizer
+from tokenizer import split_sentences, normalize, CharWordTokenizer
 from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
 from inference import InferenceEngine
-from config import TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfig, PAD, UNK, BOS
+from config import (TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfig,
+                    NoiseConfig, PAD, UNK, BOS, EOS)
 
 
 class MSEGraphLanguageModel:
@@ -39,7 +40,7 @@ class MSEGraphLanguageModel:
         self.noise_index = None  # NoiseCancellationIndex — see noise.py
         self.token_vocab = None  # TokenVocabularyMatrix — permanent per-token vocab rows, see noise.py
 
-    # ─── training ─────────────────────────────────────────────────────────
+    # ==== training ==============================================================
 
     def train(self, corpus):
         """
@@ -50,7 +51,7 @@ class MSEGraphLanguageModel:
         tokenizer.train()'s own word-frequency count, and again inside
         encode_for_training() right below it, re-segmenting the exact
         same text. Profiling on a real corpus showed segment()'s regex
-        substitutions as the single largest remaining cost after V10's
+        substitutions as the single largest remaining cost after noise's
         eager build was fixed (see config.NoiseConfig.EAGER_BUILD) --
         this halves that cost outright rather than tuning it.
         """
@@ -183,10 +184,32 @@ class MSEGraphLanguageModel:
 
     def _merge_graphs(self, new_seqs):
         """
-        Rebuild Edge/Bridge/Relationship matrices as the union of the
-        model's current matrices and the structural facts in new_seqs.
-        See train_incremental's docstring for why this is a full
-        recompute rather than an append.
+        Extend Edge/Bridge/Relationship matrices with the structural
+        facts in new_seqs.
+
+        Edge Matrix: full recompute every call, same as always -- see
+        graph.py's EdgeMatrix docstring for why this was never the
+        expensive part (its cost tracks unique bigrams, which is
+        bounded by vocab size, not corpus size).
+
+        Bridge and Relationship: INCREMENTAL merge
+        (BridgeMatrix.merge_incremental / RelationshipMatrix.
+        merge_incremental in graph.py) rather than a full recompute.
+        Previously both were rebuilt from scratch over the union of
+        old + new triples/sentences on every call -- correct, but it
+        meant batch N of a batched corpus (train_corpus.py) cost
+        roughly proportional to the TOTAL corpus seen through batch N,
+        not just batch N's own size, so N batches cost O(N *
+        corpus_size_so_far) in total rather than O(corpus_size). The
+        incremental versions only reprocess clustering for groups a
+        genuinely new triple actually touches, and only reconstruct
+        relationship content once per loaded model (cached after
+        that) instead of on every merge -- see each method's own
+        docstring in graph.py for the correctness argument. Output is
+        provably identical to the old full-recompute path (see
+        test_bridge_merge_incremental_matches_full_rebuild() /
+        test_relationship_merge_incremental_matches_full_rebuild() in
+        test.py); only the cost profile changed.
         """
         from array import array
         from collections import defaultdict
@@ -219,81 +242,36 @@ class MSEGraphLanguageModel:
             em.index[i] += em.index[i - 1]
         em._vocab_size = vsz
 
-        # ── Bridge Matrix: union of (source,target,bridge) triples,
-        #    cluster_id recomputed from scratch over the merged set ────
-        old_triple_content = list(zip(self.bridges.source, self.bridges.target,
-                                       self.bridges.bridge))
-        merged_triples = set(old_triple_content)
+        # ====Relationship Matrix: cache this relationship set's raw
+        #    content BEFORE Bridge's row order changes underneath it
+        #    (see RelationshipMatrix._ensure_raw_cache's docstring --
+        #    a no-op after the first merge on any given model) =======
+        self.rels._ensure_raw_cache(self.bridges)
+
+        # ==== Bridge Matrix: incremental merge -- only clusters actually
+        #    touched by a new triple are reprocessed (see
+        #    BridgeMatrix.merge_incremental's docstring in graph.py) =====
+        new_triples = set()
         for seq in new_seqs:
             for i in range(len(seq) - 2):
                 source, bridge_tok, target = seq[i], seq[i + 1], seq[i + 2]
-                merged_triples.add((source, target, bridge_tok))
-        merged_triples = sorted(merged_triples, key=lambda t: t[0])
+                new_triples.add((source, target, bridge_tok))
+        self.bridges.merge_incremental(new_triples, vsz)
 
-        n = len(merged_triples)
-        cluster_id = [0] * n
-        groups_by_st = defaultdict(list)
-        groups_by_sb = defaultdict(list)
-        for idx, (s, t, b) in enumerate(merged_triples):
-            groups_by_st[(s, t)].append(idx)
-            groups_by_sb[(s, b)].append(idx)
-        next_cluster = 1
-        for _key, idxs in groups_by_st.items():
-            if len(idxs) > 1:
-                for i in idxs:
-                    cluster_id[i] = next_cluster
-                next_cluster += 1
-        for _key, idxs in groups_by_sb.items():
-            if len(idxs) > 1 and all(cluster_id[i] == 0 for i in idxs):
-                for i in idxs:
-                    cluster_id[i] = next_cluster
-                next_cluster += 1
+        # ========= Relationship Matrix: extend from the cache above, against
+        #    Bridge's now-updated (post-merge) triple_id numbering ========
+        self.rels.merge_incremental(new_seqs, self.bridges)
 
-        bm = BridgeMatrix()
-        bm.source = array("i", [t[0] for t in merged_triples])
-        bm.target = array("i", [t[1] for t in merged_triples])
-        bm.bridge = array("i", [t[2] for t in merged_triples])
-        bm.cluster_id = array("i", cluster_id)
-        bm.index = array("i", [0] * (vsz + 1))
-        for s in bm.source:
-            bm.index[s + 1] += 1
-        for i in range(1, len(bm.index)):
-            bm.index[i] += bm.index[i - 1]
-        bm._vocab_size = vsz
-        t_index = defaultdict(set)
-        for s, t, b, c in zip(bm.source, bm.target, bm.bridge, bm.cluster_id):
-            if c != 0:
-                t_index[b].add(c)
-                t_index[t].add(c)
-        bm.t_index = {k: sorted(v) for k, v in t_index.items()}
-
-        # ── Relationship Matrix: reconstruct every existing relationship_id's
-        #    literal sentence content (from the PRE-merge bridges/rels,
-        #    still intact here), then dedupe that content against new_seqs
-        #    exactly like a from-scratch build() would -- so a new sentence
-        #    that's an exact literal repeat of an existing one collapses
-        #    onto the SAME relationship_id (rel_count incremented) instead
-        #    of getting a new one, and existing sentences keep their
-        #    relationship_id when they're not repeats of anything new.
-        #    See train_incremental's docstring for the one known
-        #    limitation (triple-less, <3-token sentences can't be
-        #    reconstructed and collapse together across a merge).
-        from importance import sequence_for_relationship
-        old_sequences = [sequence_for_relationship(self, rid)
-                          for rid in range(self.rels._n_rels)]
-
-        rm = RelationshipMatrix()
-        rm.build(old_sequences + new_seqs, bm)
-
-        self.edges, self.bridges, self.rels = em, bm, rm
-        # noise.py's index/vocabulary matrix feed V10 (see
+        self.edges = em
+        # noise.py's index/vocabulary matrix feed noise (see
         # _ensure_noise_layer()), so they must be dropped BEFORE the open
         # engine is rebuilt below -- ImportanceVoteMatrix.build() copies
         # whatever model.token_vocab currently is, and a pre-merge one
         # (with its cached per-token rows) would otherwise keep scoring
-        # V10 from the old graphs.
+        # noise from the old graphs.
         self.noise_index = None
         self.token_vocab = None
+        self._drop_evidence_cache()
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
         self._rebuild_open_engine()
 
@@ -304,28 +282,249 @@ class MSEGraphLanguageModel:
         self.ctm = None
         self.ivm = None
 
+    def encode(self, text):
+        return self.tokenizer.encode(text)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids)
+
+    # ====== unified-matrix style views (analyse.py / chat.py) =================
+    # Thin read-only views over the Edge/Bridge/Relationship matrices, in the
+    # flat shape analyse.py expects.
+
+    def token_name(self, token_id):
+        return self.tokenizer.id_to_token.get(token_id, token_id)
+
+    token_label = token_name
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.vocab_size_actual
+
+    def successors(self, token):
+        return self.edges.successors(token)
+
+    def triples_from_source(self, token):
+        return self.bridges.triples_from_source(token)
+
+    def triple_out_degree(self):
+        """One entry per trained triple: its source token (count them for out-degree)."""
+        return list(self.bridges.source)
+
+    def clusters_of_token(self, token):
+        return list(self.bridges.t_index.get(token, []))
+
+    def cluster_ids(self):
+        return sorted({c for c in self.bridges.cluster_id if c != 0})
+
+    def cluster_axis(self, cluster_id):
+        return self.bridges.cluster_axis(cluster_id)
+
+    def count(self, rel_id):
+        return self.rels.count(rel_id)
+
+    @property
+    def rel_count(self):
+        return self.rels.rel_count
+
+    def triples_for_relationship(self, rel_id):
+        """[(source, target, bridge)] for one training sentence."""
+        b = self.bridges
+        return [(b.source[i], b.target[i], b.bridge[i])
+                for i in self.rels.triples_for_relationship(rel_id)]
+
+    def bigram_rows(self):
+        """[(source, target, count)] -- every deduplicated bigram."""
+        e = self.edges
+        return [(e.src[i], e.dst[i], e.count[i]) for i in range(len(e.src))]
+
+    def triple_rows(self):
+        """[(source, bridge, target, cluster_id)] -- every deduplicated triple (0 = no cluster)."""
+        b = self.bridges
+        return [(b.source[i], b.bridge[i], b.target[i], b.cluster_id[i])
+                for i in range(len(b.source))]
+
+    def tile_rows(self, relationship_id=None):
+        """
+        How each unique sentence is stored as ordered non-overlapping adjacent
+        pairs: (relationship_id, position, first, second). An odd-length
+        sentence ends with an overlapping pair; a one-token sentence is a
+        single token (second = None).
+        """
+        rows = []
+        ids = range(self.n_rels) if relationship_id is None else [relationship_id]
+        for rid in ids:
+            seq = self.sequence(rid)
+            n = len(seq)
+            if n == 1:
+                rows.append((rid, 0, seq[0], None))
+                continue
+            pos = 0
+            for i in range(0, n - 1, 2):
+                rows.append((rid, pos, seq[i], seq[i + 1]))
+                pos += 1
+            if n > 1 and n % 2 == 1:
+                rows.append((rid, pos, seq[n - 2], seq[n - 1]))
+        return rows
+
+    @property
+    def t_cell(self):
+        return self.tile_rows()
+
+    def bigram_info(self, prev_word, curr_word, mode="strict"):
+        prev_id = self.tokenizer.encode(prev_word)[-1]
+        curr_id = self.tokenizer.encode(curr_word)[-1]
+        engine = self._engine(mode)
+        witnesses = self.bigram_provenance().get((prev_id, curr_id), ())
+        return {
+            "prev": prev_word, "curr": curr_word,
+            "training": self.edges.frequency(prev_id, curr_id),
+            "total": engine._bigram_frequency(prev_id, curr_id),
+            "witness_sentences": len(witnesses),
+        }
+
+    # ========== Open Mode controls =============================================================
+
+    def set_legality_top_k(self, k=None):
+        """How many of the top-scored tokens Q3/Q4 may work on (int, or None/0/'all' = every
+        candidate). Sticks across retraining. Returns the stored value (None = all)."""
+        try:
+            from ivm import parse_top_k
+        except ImportError:
+            raise RuntimeError("this ivm.py has no legality top-K support (no parse_top_k) -- update ivm.py")
+        value = parse_top_k(k)
+        self._legality_override = (value,)
+        if self.open_ctm is not None and hasattr(self.open_ctm, "set_legality_top_k"):
+            self.open_ctm.set_legality_top_k(value)
+        return value
+
+    def cache_control(self, action="status"):
+        """'on' | 'off' | 'status' for ivm's Q1 cache -> {"enabled", "token_rows", "entries"}."""
+        if self.open_ctm is None:
+            raise RuntimeError("Open Mode isn't ready (model not trained/loaded) -- no cache to toggle.")
+        if action not in ("on", "off", "status", "", None):
+            raise ValueError("cache action must be on, off, or status")
+        if action == "on":
+            self.open_ctm.enable_cache(self.all_candidate_tokens())
+        elif action == "off":
+            self.open_ctm.disable_cache()
+        tc = self.open_ctm._token_cache
+        return {"enabled": bool(self.open_ctm._use_cache), "token_rows": len(tc),
+                "entries": sum(len(r) for r in tc.values())}
+
+    @staticmethod
+    def score_layers():
+        """(result key, column label) for each layer of open_mode_candidate_scores(), in print order."""
+        return [("q1", "Q1 co-occ %"), ("q2", "Q2 bigram %"), ("q3", "Q3 legal"), ("q4", "Q4 agree"),
+                ("ivm", "ivm"), ("noise", "noise"), ("score", "score"), ("final", "final")]
+
+    # ======== evidence API for ivm.py / noise.py ======================================
+    # Both scorers read the training data only through these methods, all
+    # derived from the Edge/Bridge/Relationship matrices. Caches are dropped
+    # whenever the graphs change (see _drop_evidence_cache()).
+
+    def _drop_evidence_cache(self):
+        self._evidence = {}
+
+    def _ev(self, key, builder):
+        ev = self.__dict__.setdefault("_evidence", {})
+        if key not in ev:
+            ev[key] = builder()
+        return ev[key]
+
+    @property
+    def n_rels(self):
+        """Number of distinct training sentences (relationship ids)."""
+        return self.rels._n_rels
+
+    def _sequences(self):
+        def build():
+            self.rels._ensure_raw_cache(self.bridges)
+            return [tuple(s) for s in self.rels._unique_seqs]
+        return self._ev("sequences", build)
+
+    def sequence(self, rel_id):
+        """Token-id sequence of one training sentence ((): out of range)."""
+        seqs = self._sequences()
+        return seqs[rel_id] if 0 <= rel_id < len(seqs) else ()
+
+    def token_relationships(self, min_len=3):
+        """{token: {rel_id}} -- every sentence (of at least `min_len` tokens) each token appears in."""
+        def build():
+            out = {}
+            for rid, seq in enumerate(self._sequences()):
+                if len(seq) < min_len:
+                    continue
+                for t in set(seq):
+                    out.setdefault(t, set()).add(rid)
+            return out
+        return {t: set(r) for t, r in self._ev(("token_rels", min_len), build).items()}
+
+    def co_row(self, token):
+        """{other_token: number of sentences shared with `token`} (never `token` itself)."""
+        def build():
+            rows = {}
+            for rid, seq in enumerate(self._sequences()):
+                if len(seq) < 3:
+                    continue
+                toks = set(seq)
+                for a in toks:
+                    row = rows.setdefault(a, {})
+                    for b in toks:
+                        if a != b:
+                            row[b] = row.get(b, 0) + 1
+            return rows
+        return self._ev("co_rows", build).get(token, {})
+
+    def bigram_counts(self):
+        """{(a, b): times b literally followed a in training}."""
+        e = self.edges
+        return {(e.src[i], e.dst[i]): e.count[i] for i in range(len(e.src))}
+
+    def adjacent_pairs(self):
+        """{(a, b)} -- every directed legal bigram."""
+        e = self.edges
+        return {(e.src[i], e.dst[i]) for i in range(len(e.src))}
+
+    def bigram_provenance(self, include_final=True):
+        """{(a, b): {rel_id}} -- the training sentences each bigram occurred in."""
+        out = {}
+        for rid, seq in enumerate(self._sequences()):
+            last = len(seq) - 1 if include_final else len(seq) - 2
+            for i in range(last):
+                out.setdefault((seq[i], seq[i + 1]), set()).add(rid)
+        return out
+
+    def triples(self):
+        """Iterate (source, target, bridge) for every consecutive trained triple."""
+        b = self.bridges
+        return [(b.source[i], b.target[i], b.bridge[i]) for i in range(len(b.source))]
+
     def _ensure_noise_layer(self):
         """
-        Make sure Open Mode's ImportanceVoteMatrix has V10's data source
-        (noise.py's TokenVocabularyMatrix, whose per-token rows hold the
-        three-stage AVERAGE noise-cancellation scores) attached -- called
-        at the top of every Open Mode inference entry point below
-        (generate(), explain_step(), open_mode_candidate_scores()).
-
-        Lazy on purpose (see config.NoiseConfig.EAGER_BUILD): nothing is
-        built at train()/train_incremental()/load() time, so a model that
-        never runs Open Mode inference never pays for it. The first Open
-        Mode call builds model.token_vocab (instant -- its rows are
-        computed per token on first use and cached) and hands it to
-        open_ctm; every later call is a no-op identity check. Also
-        re-attaches if open_ctm is holding a different matrix than the
-        model currently has, so V10 can't keep scoring from a stale one.
+        Make sure noise.py's TokenVocabularyMatrix (self.token_vocab) exists --
+        called at the top of every Open Mode inference entry point below.
+        Lazy: nothing is built at train()/train_incremental()/load() time,
+        and the matrix itself only computes a token's row the first time
+        that token is asked for. ivm.py knows nothing about noise; this is
+        the only place the two scorers meet (see noise_final_scores()).
         """
-        ivm = self.open_ctm
-        if ivm is None:
-            return
-        if ivm._token_vocab is None or ivm._token_vocab is not self.token_vocab:
-            ivm.attach_noise_layer(self)
+        if self.token_vocab is None:
+            self.build_token_vocab()
+
+    def noise_final_scores(self, context_tokens):
+        """
+        noise.py's FINAL score for every candidate it has evidence for,
+        summed over the context tokens and scaled by
+        config.NoiseConfig.INFERENCE_WEIGHT. {token_id: score}. Reserved
+        tokens (PAD/UNK/BOS/EOS) are skipped as context. This is what
+        select(..., extra_scores=...) adds to ivm's own score.
+        """
+        self._ensure_noise_layer()
+        ctx = sorted(t for t in (context_tokens or ()) if t not in (PAD, UNK, BOS, EOS))
+        combined = self.token_vocab.combine_final_score(ctx)
+        w = NoiseConfig.INFERENCE_WEIGHT
+        return {c: w * v for c, v in combined.items()}
 
     def _rebuild_open_engine(self):
         """
@@ -341,16 +540,20 @@ class MSEGraphLanguageModel:
             mode="open", vocab=self.all_candidate_tokens(),
         )
         self.open_ctm = ImportanceVoteMatrix.build(self)
+        ov = getattr(self, '_legality_override', None)
+        if ov is not None and hasattr(self.open_ctm, "set_legality_top_k"):
+            self.open_ctm.set_legality_top_k(ov[0])
 
     def _build_graphs(self, seqs):
         vsz = self.tokenizer.vocab_size_actual
         self.edges.build(seqs, vsz)
         self.bridges.build(seqs, vsz)
         self.rels.build(seqs, self.bridges)
-        # Same reason as _merge_graphs(): V10's data source is derived
+        # Same reason as _merge_graphs(): noise's data source is derived
         # from the graphs just rebuilt, so any earlier one is stale.
         self.noise_index = None
         self.token_vocab = None
+        self._drop_evidence_cache()
         self._strict = InferenceEngine(self.edges, self.bridges, self.rels, mode="strict")
         self._rebuild_open_engine()
 
@@ -400,7 +603,7 @@ class MSEGraphLanguageModel:
         worth attention (lacking a word = voting for it; already
         having it = staying quiet). Read-only analysis, same as
         build_context_triggers() -- doesn't change generate()'s
-        behavior by itself (V10's data source is the token_vocab built
+        behavior by itself (noise's data source is the token_vocab built
         on top of it -- see build_token_vocab()). Returns the built
         index (also stored on self.noise_index). `token_rels` is an
         optional precomputed token -> {relationship_id} map (what
@@ -442,9 +645,9 @@ class MSEGraphLanguageModel:
         that has one. After this call, row()/combine() queries never
         touch a literal training sentence again -- the sentence was
         only ever the training mechanism. This matrix is also Open
-        Mode's V10 data source: each row value is the three-stage
+        Mode's noise data source: each row value is the three-stage
         AVERAGE score, and generate(mode="open") sums the context
-        tokens' rows into V10 (see ivm.py's _noise_vote()). You never
+        tokens' rows into noise (see ivm.py's _noise_vote()). You never
         need to call this for that -- _ensure_noise_layer() does it on
         first Open Mode use. Returns the built matrix (also stored on
         self.token_vocab).
@@ -474,7 +677,88 @@ class MSEGraphLanguageModel:
         from noise import why as _why
         return _why(self, anchor_word, home_relationship_id, candidate_word)
 
-    # ─── generate ─────────────────────────────────────────────────────────
+    def noise_homes(self, word):
+        """Thin wrapper -- see noise.find_homes()'s docstring (every training sentence containing `word`)."""
+        from noise import find_homes
+        if self.noise_index is None:
+            self.build_noise_index()
+        return find_homes(self, word)
+
+    def noise_scores_detailed(self, anchor_word, home=None):
+        """
+        Thin wrapper -- see noise.noise_scores_detailed()'s docstring:
+        one anchor+home's noise-cancellation scores, broken down by
+        the three underlying stages (no combined average). Raises
+        ValueError if anchor_word has multiple candidate homes and
+        `home` wasn't given (see noise_homes() to list them).
+        """
+        from noise import noise_scores_detailed as _noise_scores_detailed
+        if self.noise_index is None:
+            self.build_noise_index()
+        return _noise_scores_detailed(self, anchor_word, home_relationship_id=home)
+
+    def focus_scores_detailed(self, anchor_word, weight_mode="count"):
+        """
+        Thin wrapper -- see noise.focus_scores_detailed()'s docstring:
+        stage1/stage2/stage3 (unchanged) plus stage4
+        (shared-knowledge attention; weight_mode="count"/"flat"), per
+        candidate, for one anchor word.
+        """
+        from noise import focus_scores_detailed as _focus_scores_detailed
+        if self.noise_index is None:
+            self.build_noise_index()
+        return _focus_scores_detailed(self, anchor_word, weight_mode=weight_mode)
+
+    def token_row_detailed(self, word):
+        """Thin wrapper -- see noise.vocabulary_row_detailed()'s docstring (permanent, precomputed, broken down by stage)."""
+        from noise import vocabulary_row_detailed
+        if self.token_vocab is None:
+            self.build_token_vocab()
+        return vocabulary_row_detailed(self, word)
+
+    def combine_detailed(self, words, weight_mode="count"):
+        """
+        Thin wrapper -- see noise.combine_context_detailed()'s
+        docstring: RAW combine, each named word's own
+        focus_scores_detailed() row summed element-wise across words.
+        """
+        from noise import combine_context_detailed
+        if self.noise_index is None:
+            self.build_noise_index()
+        return combine_context_detailed(self, words, weight_mode=weight_mode)
+
+    def combine_normalized(self, words, weight_mode="count"):
+        """
+        Thin wrapper -- see noise.combine_context_normalized()'s
+        docstring: the named words' RAW rows summed element-wise, THEN
+        normalized once (combine_detailed() before the normalizing step).
+        """
+        from noise import combine_context_normalized
+        if self.noise_index is None:
+            self.build_noise_index()
+        return combine_context_normalized(self, words, weight_mode=weight_mode)
+
+    def normalize_scores(self, scores):
+        """
+        Thin wrapper -- see noise.normalize_row()'s docstring: turn a
+        raw {candidate: {"stage1",...,"stage4"}} dict (from
+        focus_scores_detailed()/combine_detailed()/combine_normalized())
+        into percentages, scoped to the candidates in `scores` itself.
+        """
+        from noise import normalize_row
+        return normalize_row(scores)
+
+    def context_trigger_rows(self, min_support=CTMConfig.MIN_SUPPORT, mode="strict"):
+        """
+        Thin wrapper -- see ctm.build_context_trigger_matrix()'s
+        docstring. Analysis/display only: does NOT build or cache
+        self.ctm (call build_context_triggers() for that, needed
+        before generate(..., use_context_triggers=True)).
+        """
+        from ctm import build_context_trigger_matrix
+        return build_context_trigger_matrix(self, min_support=min_support, mode=mode)
+
+    # ========== generate ===================================================================
 
     def bigram_witness_sentences(self, prev_id, curr_id):
         """
@@ -505,7 +789,7 @@ class MSEGraphLanguageModel:
         computed once whenever the graphs (re)build and reused from
         there. <EOS> is deliberately kept IN this set (not excluded as
         reserved) so the model can still choose to end generation on
-        IVM's own evidence (V1-V10, see ivm.py) rather than only ever
+        IVM's own evidence (Q1-Q4, see ivm.py) rather than only ever
         stopping via a successors gate -- Open Mode has none anymore.
         """
         return sorted(t for t in self.tokenizer.token_to_id.values()
@@ -515,7 +799,7 @@ class MSEGraphLanguageModel:
                  use_context_triggers=False, use_importance_votes=False):
         engine = self._engine(mode)
         if mode == "open":
-            self._ensure_noise_layer()   # V10's data source -- see above
+            self._ensure_noise_layer()   # noise's data source -- see above
             # Open Mode's CTM/IVM weighted voting is the PRIMARY
             # candidate-selection mechanism -- always wired in, auto-
             # built alongside self._open as soon as the model is
@@ -532,11 +816,12 @@ class MSEGraphLanguageModel:
             # its prompt-bigram legality check entirely for Open Mode
             # (see inference.py), so any prompt is accepted here, even
             # one containing a transition the model has genuinely never
-            # seen. IVM's ten vote layers (V1-V10) score the full
+            # seen. IVM's ten vote layers (V1-noise) score the full
             # candidate set directly, every step.
             ids, trace = engine.generate(
                 self.tokenizer.encode(prompt), max_tokens=max_tokens,
-                importance_votes=self.open_ctm)
+                importance_votes=self.open_ctm,
+                extra_scores_fn=self.noise_final_scores)
             return self.tokenizer.decode(ids), ids, trace
         triggers = self.ctm if (use_context_triggers and self.ctm) else None
         votes = self.ivm if (use_importance_votes and self.ivm) else None
@@ -553,7 +838,9 @@ class MSEGraphLanguageModel:
         curr     = curr_ids[-1]
         if mode == "open":
             self._ensure_noise_layer()
-            token, trace = engine.step(prev, curr, importance_votes=self.open_ctm)
+            token, trace = engine.step(prev, curr, importance_votes=self.open_ctm,
+                                       context_tokens=set(prev_ids + curr_ids),
+                                       extra_scores_fn=self.noise_final_scores)
         else:
             token, trace = engine.step(prev, curr)
         return self.tokenizer.decode([token]), trace
@@ -566,14 +853,12 @@ class MSEGraphLanguageModel:
         (i.e. Open Mode itself must be available). Returns None if
         Open Mode isn't ready. Decoded to surface strings for display.
 
-        "scores" is the FINAL combined score: V1 ("important_vote") +
-        V2 ("influence_vote") + V3 ("context_vote") + V4
-        ("context_influence_vote") + V5 ("bigram_witness_vote") + V6
-        ("adjacency_vote") + V7 ("prev_current_vote") + V8
-        ("triple_vote") + V9 ("whole_context_vote") + V10
-        ("noise_vote", see noise.py) -- ten independent
-        vote layers, summed, each exposed separately so all ten stay
-        independently auditable.
+        "scores" is the combined score candidates are ranked by:
+        ivm's Q1 + Q2 ("ivm_scores") plus noise.py's final score
+        ("noise_scores"). Q3/Q4 are legality checks applied to that
+        ranking when the winner is picked ("legality" says which applied;
+        "final_scores" zeroes the ineligible). Each piece is exposed
+        separately so it stays auditable.
         "winner" and
         "tie_break_stage" report what select() actually returned and
         which stage of the cascade decided it (score /
@@ -599,41 +884,33 @@ class MSEGraphLanguageModel:
         previous = ids[-2] if len(ids) >= 2 else None
         candidates = self._open.vocab
         context_tokens = set(ids)
-        trace = self.open_ctm.score_candidates(candidates, context_tokens, current=current, previous=previous)
-        winner, _ = self.open_ctm.select(candidates, context_tokens, current=current, previous=previous)
+        extra = self.noise_final_scores(context_tokens)
+        winner, trace = self.open_ctm.select(candidates, context_tokens, current=current,
+                                             previous=previous, extra_scores=extra)
         dec = self._dec_tok
-
-        max_score = max(trace["scores"].values()) if trace["scores"] else None
-        tied_on_score = [c for c, s in trace["scores"].items() if s == max_score]
-        if len(tied_on_score) <= 1:
-            tie_break_stage = "score"
-        else:
-            bigram_freqs = {c: self.open_ctm._bigram_frequency(current, c) for c in tied_on_score}
-            if len(set(bigram_freqs.values())) > 1:
-                tie_break_stage = "bigram_frequency"
-            else:
-                global_freqs = {c: self.open_ctm._global_frequency(c) for c in tied_on_score}
-                tie_break_stage = "global_frequency" if len(set(global_freqs.values())) > 1 else "lowest_token_id"
+        d = lambda m: {dec(c): v for c, v in m.items()}
 
         return {
             "candidates": [dec(c) for c in candidates],
-            "important_tokens": [dec(t) for t in trace["important_tokens"]],
-            "influence": {dec(t): v for t, v in trace["influence"].items()},
-            "knows": {dec(t): {dec(c): s for c, s in k.items()}
-                      for t, k in trace["knows"].items()},
-            "important_vote": {dec(c): v for c, v in trace["important_vote"].items()},
-            "influence_vote": {dec(c): v for c, v in trace["influence_vote"].items()},
-            "context_vote": {dec(c): v for c, v in trace["context_vote"].items()},
-            "context_influence_vote": {dec(c): v for c, v in trace["context_influence_vote"].items()},
-            "bigram_witness_vote": {dec(c): v for c, v in trace["bigram_witness_vote"].items()},
-            "adjacency_vote": {dec(c): v for c, v in trace["adjacency_vote"].items()},
-            "prev_current_vote": {dec(c): v for c, v in trace["prev_current_vote"].items()},
-            "triple_vote": {dec(c): v for c, v in trace["triple_vote"].items()},
-            "whole_context_vote": {dec(c): v for c, v in trace["whole_context_vote"].items()},
-            "noise_vote": {dec(c): v for c, v in trace["noise_vote"].items()},
-            "scores": {dec(c): v for c, v in trace["scores"].items()},
+            "context_tokens": [dec(c) for c in sorted(context_tokens)],
+            "q1": d(trace["q1"]),
+            "q2": d(trace["q2"]),
+            "q3": d(trace["q3"]),
+            "q4": d(trace["q4"]),
+            "q1_raw": d(trace["q1_raw"]),
+            "q2_raw": d(trace["q2_raw"]),
+            "ivm": d(trace["scores"]),                    # Q1 + Q2
+            "noise": d({c: extra.get(c, 0) for c in candidates}),
+            "score": d(trace["total_scores"]),            # ivm + noise: what candidates are ranked by
+            "scores": d(trace["total_scores"]),           # same as "score" (ranking key)
+            "final": d(trace["final_scores"]),            # score if eligible to win, else 0
+            "noise_weight": NoiseConfig.INFERENCE_WEIGHT,
+            "legality": trace["legality"],                # "q3+q4" | "q3" | "none" (none -> <EOS>)
+            "q4_active": trace.get("q4_active", True),
+            "legality_top_k": trace.get("legality_top_k"),
+            "window_size": trace.get("window_size", len(candidates)),
             "winner": dec(winner) if winner is not None else None,
-            "tie_break_stage": tie_break_stage,
+            "tie_break_stage": trace["tie_break_stage"],
             "cache_used": trace.get("cache_used", False),
         }
 
@@ -780,7 +1057,7 @@ class MSEGraphLanguageModel:
             raise RuntimeError("Model has not been trained or loaded.")
         return self._strict
 
-    # ─── stats ────────────────────────────────────────────────────────────
+    # ===== stats ====================================================================
 
     def stats(self):
         return {
@@ -794,7 +1071,7 @@ class MSEGraphLanguageModel:
             "relationship_occurrences": sum(self.rels.rel_count),
         }
 
-    # ─── save / load ──────────────────────────────────────────────────────
+    # ======= save / load =================================================
 
     def save(self, folder):
         os.makedirs(folder, exist_ok=True)
