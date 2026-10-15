@@ -1,711 +1,269 @@
 """
-train.py  —  MSE-GLM Training Pipeline with full per-step live display.
+train.py  --  the ONE training script for MSE-GLM.
 
-Shows exactly what is being added at every training step:
-  - Edge phase:        E  the → cat    new
-  - Bridge phase:      B  the →[cat]→ sat   cluster:0
-  - Cluster phase:     cluster 1  [bridge]  the→__→sat  {cat,dog,boy}
-  - Rel phase:         R  triple_3  sat→on→the  → rel:2    shared
+One command, any source, fresh or incremental:
 
-Usage:
-    python3 train.py --text "the cat sat on the mat." --out runs/demo
-    python3 train.py --corpus corpus.txt --out runs/model --vocab-size 2000
-    python3 train.py --corpus corpus.txt --out runs/model --quiet
+    SOURCE   --corpus PATH    a text file, OR a folder of .txt files (recursive)
+             --text "..."     an inline string
+
+    fresh    python3 train.py --corpus corpus.txt   --out runs/model
+             python3 train.py --corpus data/        --out runs/model --vocab-size 8000
+             python3 train.py --text "the cat sat on the mat." --out runs/demo
+
+    add to an existing model (incremental -- same SOURCE options)
+             python3 train.py --corpus new.txt  --continue-from runs/model
+             python3 train.py --corpus more/    --continue-from runs/model --out runs/model2
+             python3 train.py --corpus more/    --continue-from runs/model \\
+                              --extend-vocab --target-vocab-size 3000
+
+    big folders: --batch-size N  files merged per step (default from config.TrainCorpusConfig);
+                 --no-recursive  only the top level of a folder;  --quiet  no live display.
+
+This file is only a front end: argument parsing and the progress output (the plain pass-1 / pass-2 style train_corpus.py used).  EVERY
+training decision (file vs folder, vocabulary pass, batching, merging, building
+the inference engines, saving) lives in model.py -- see MSEGraphLanguageModel's
+train_from_source() / train_incremental_source() / train() / train_incremental().
+Change training there and this script needs no edit.
 """
 
 import argparse
 import os
 import sys
 import time
-import shutil
-from collections import Counter, defaultdict
 
-from config import TokenizerConfig
+from config import TokenizerConfig, TrainCorpusConfig
 
-# ─── terminal helpers ─────────────────────────────────────────────────────────
 
-def _tw():  return shutil.get_terminal_size((100, 24)).columns
-def _clr(): sys.stdout.write("\r\033[K")
-def _up(n): sys.stdout.write(f"\033[{n}A")
+# ============= terminal helpers =================================================================
 
-def _bar(done, total, width=30, fill="█", empty="░"):
-    pct = min(done / total, 1.0) if total else 1.0
-    filled = int(width * pct)
-    return fill * filled + empty * (width - filled), int(pct * 100)
+def _dim(t):   return f"\033[2m{t}\033[0m"
+def _teal(t):  return f"\033[36m{t}\033[0m"
+def _green(t): return f"\033[32m{t}\033[0m"
+def _bold(t):  return f"\033[1m{t}\033[0m"
+def _amber(t): return f"\033[33m{t}\033[0m"
 
-def _c(text, code): return f"\033[{code}m{text}\033[0m"
-def teal(t):   return _c(t, "36")
-def amber(t):  return _c(t, "33")
-def green(t):  return _c(t, "32")
-def dim(t):    return _c(t, "2")
-def bold(t):   return _c(t, "1")
-def white(t):  return _c(t, "97")
-def red(t):    return _c(t, "31")
-def purple(t): return _c(t, "35")
-def cyan(t):   return _c(t, "96")
 
-PHASES = [
-    ("tokenize", "Tokenizer (2-stage) "),
-    ("edges",    "Edge Matrix (E)     "),
-    ("bridges",  "Bridge Matrix (B)   "),
-    ("clusters", "Cluster Assignment  "),
-    ("rels",     "Relationship Matrix "),
-    ("save",     "Saving Model        "),
-]
+def _preview(text, n=72):
+    return text[:n].replace("\n", " ") + ("…" if len(text) > n else "")
 
-PHASE_COLORS = [teal, amber, purple, green, red, dim]
 
-# ─── Display ──────────────────────────────────────────────────────────────────
-
-class Display:
-    """
-    14-line live display. Redraws in place on every step.
-
-    L0   spacer
-    L1   MSE Graph Language Model  ─  Training
-    L2   ─────────────────────────────────────
-    L3   Phase  Edge Matrix (E)   [bar]  37%  step 7/19
-    L4   ─────────────────────────────────────
-    L5   ▸ E  the → cat   ✦ new          ← current item (highlighted)
-    L6   ─────────────────────────────────────
-    L7     E  <BOS> → the                ← recent[-3]
-    L8     E  the → cat   ✦ new          ← recent[-2]
-    L9     E  cat → sat   ✦ new          ← recent[-1]
-    L10  spacer
-    L11  vocab 40  edges 7  bridges 0  clusters 0  rels 0
-    L12  elapsed 0.3s  ·  25 pair/s  ·  phase 0.1s  ·  next: Bridge Matrix
-    L13  spacer
-    """
-
-    LINES       = 14
-    LOG_LINES   = 3      # recent items shown (L7-L9)
-    REDRAW_HZ   = 25     # max redraws per second
-
-    def __init__(self, quiet=False):
-        self.quiet        = quiet
-        self.phase        = ""
-        self.phase_label  = ""
-        self.step         = 0
-        self.total        = 0
-        self.stats        = {}
-        self.t0           = time.time()
-        self.phase_t0     = time.time()
-        self.rate_unit    = "step"
-        self.next_phase   = ""
-        self._first       = True
-        self._last_step   = 0
-        self._last_t      = time.time()
-        # per-step log
-        self.current_item = dim("─")
-        self._log         = [""] * self.LOG_LINES  # fixed-size ring
-        self._log_pos     = 0
-        self._last_draw   = 0.0
-        self._interval    = 1.0 / self.REDRAW_HZ
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def start(self):
-        if self.quiet: return
-        print()
-        for _ in range(self.LINES): print()
-        sys.stdout.flush()
-
-    def update(self, step=None, total=None, stats=None, phase=None,
-               phase_label=None, rate_unit=None, next_phase=None):
-        if step        is not None: self.step = step
-        if total       is not None: self.total = total
-        if phase       is not None: self.phase = phase
-        if phase_label is not None: self.phase_label = phase_label
-        if rate_unit   is not None: self.rate_unit = rate_unit
-        if next_phase  is not None: self.next_phase = next_phase
-        if stats:                   self.stats.update(stats)
-        if not self.quiet:          self._maybe_redraw()
-
-    def item(self, text, force=False):
-        """Call on every training step with a human-readable description."""
-        self.current_item = text
-        self._log[self._log_pos % self.LOG_LINES] = text
-        self._log_pos += 1
-        if not self.quiet:
-            now = time.time()
-            if force or (now - self._last_draw) >= self._interval:
-                self._redraw()
-                self._last_draw = now
-
-    def phase_done(self, label, detail=""):
-        if self.quiet:
-            print(f"  ✓  {label}  {detail}")
-            return
-        elapsed = time.time() - self.phase_t0
-        pidx    = next((i for i,(k,_) in enumerate(PHASES) if k==self.phase), 0)
-        col     = PHASE_COLORS[pidx % len(PHASE_COLORS)]
-        bar     = "█" * 30
-        done_line = (
-            f"  {dim('Phase')}  {col(self.phase_label or self.phase)}"
-            f"  [{green(bar)}]  {green('100%')}  "
-            f"{dim(detail)}  {dim(f'{elapsed:.2f}s')}"
-        )
-        # overwrite phase bar line (L3) without touching the rest
-        _up(self.LINES - 3)
-        _clr()
-        print(done_line)
-        for _ in range(self.LINES - 4): print()
-        sys.stdout.flush()
-
-    def finish(self, stats, out_path):
-        if not self.quiet:
-            _up(1); print()
-        tw = _tw()
-        print("  " + green("─" * min(tw - 4, 70)))
-        print(f"  {green('✓')}  {bold('Training complete')}")
-        print()
-        rows = [
-            ("Output folder",     out_path),
-            ("Vocabulary",        f"{stats.get('vocab_size',0):,} tokens"),
-            ("Edge Matrix",       f"{stats.get('edges',0):,} unique bigrams"),
-            ("Bridge Matrix",     f"{stats.get('bridges',0):,} unique triples"),
-            ("Clustered triples", f"{stats.get('clustered_bridges',0):,}  ({stats.get('clusters',0)} clusters)"),
-            ("Relationship rows", f"{stats.get('relationship_rows',0):,}  ({stats.get('relationships',0)} unique sentences)"),
-            ("Total time",        f"{time.time() - self.t0:.2f}s"),
-        ]
-        w = max(len(k) for k,_ in rows)
-        for k, v in rows:
-            print(f"  {dim(k.ljust(w))}  {teal(v)}")
-        print()
-
-    # ── internal ──────────────────────────────────────────────────────────────
-
-    def _maybe_redraw(self):
-        now = time.time()
-        if now - self._last_draw >= self._interval:
-            self._redraw()
-            self._last_draw = now
-
-    def _rate(self):
-        now = time.time()
-        dt  = now - self._last_t
-        ds  = self.step - self._last_step
-        self._last_step = self.step
-        self._last_t    = now
-        return (ds / dt) if dt > 0.001 else 0
-
-    def _log_lines(self):
-        """Return LOG_LINES recent items in chronological order."""
-        out = []
-        n   = min(self._log_pos, self.LOG_LINES)
-        for i in range(n):
-            idx = (self._log_pos - n + i) % self.LOG_LINES
-            out.append(self._log[idx])
-        while len(out) < self.LOG_LINES:
-            out.insert(0, "")
-        return out
-
-    def _redraw(self):
-        tw           = _tw()
-        bar, pct     = _bar(self.step, self.total, width=30)
-        elapsed      = time.time() - self.t0
-        phase_el     = time.time() - self.phase_t0
-        rate         = self._rate()
-        pidx         = next((i for i,(k,_) in enumerate(PHASES) if k==self.phase), 0)
-        col          = PHASE_COLORS[pidx % len(PHASE_COLORS)]
-        rule         = dim("─" * min(tw - 4, 72))
-        step_str     = f"step {self.step:,}" + (f"/{self.total:,}" if self.total else "")
-        s            = self.stats
-
-        def sv(k, c=teal):
-            return f"{dim(k)} {c(str(s.get(k,0)))}"
-
-        rate_str  = f"{rate:,.0f} {self.rate_unit}/s" if rate > 0 else "…"
-        next_str  = dim(f"next: {self.next_phase}") if self.next_phase else ""
-        log_items = self._log_lines()
-
-        lines = [
-            "",
-            f"  {bold(white('MSE Graph Language Model'))}  {dim('─  Training')}",
-            f"  {rule}",
-            (f"  {dim('Phase')}  {col(self.phase_label or self.phase)}"
-             f"  [{teal(bar)}]  {amber(f'{pct:3d}%')}  {dim(step_str)}"),
-            f"  {rule}",
-            f"  {cyan('▸')} {self.current_item}",
-            f"  {rule}",
-            f"    {log_items[0]}",
-            f"    {log_items[1]}",
-            f"    {log_items[2]}",
-            "",
-            (f"  {sv('vocab')}   {sv('edges',amber)}   {sv('bridges',purple)}"
-             f"   {sv('clusters',green)}   {sv('rels',red)}"),
-            (f"  {dim('elapsed')} {teal(f'{elapsed:.1f}s')}"
-             f"  ·  {dim(rate_str)}"
-             f"  ·  {dim(f'phase {phase_el:.1f}s')}"
-             f"  {next_str}"),
-            "",
-        ]
-
-        if not self._first:
-            _up(self.LINES)
-        self._first = False
-
-        for line in lines:
-            _clr()
-            print(line)
-        sys.stdout.flush()
-
-
-# ─── Training pipeline ────────────────────────────────────────────────────────
-
-def train_with_display(model, corpus_text=None, corpus_file=None,
-                       vocab_size=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE, display=None, out_path="runs/model"):
-    from tokenizer import split_sentences, segment, stream_word_freq, CharWordTokenizer
-    from config import SPECIAL_TOKENS, WORD_BOUND
-    from graph import EdgeMatrix, BridgeMatrix, RelationshipMatrix
-    from inference import InferenceEngine
-    from array import array
-
-    tok = CharWordTokenizer(vocab_size=vocab_size)
-    D   = display or Display(quiet=True)
-
-    # ══ Phase 1: Tokenizer ════════════════════════════════════════════════════
-    D.phase = "tokenize"; D.phase_label = PHASES[0][1]
-    D.phase_t0 = time.time(); D.next_phase = "Edge Matrix"; D.rate_unit = "word"
-    D.update(step=0, total=vocab_size,
-             stats={"vocab": len(SPECIAL_TOKENS), "edges": 0, "bridges": 0, "clusters": 0, "rels": 0})
-
-    if corpus_file:
-        # Word counting delegates to tokenizer.py's own
-        # stream_word_freq() instead of hand-rolling a second copy of
-        # segment()/split_sentences() here -- same reasoning as
-        # model.py's train_from_file(): two independently-maintained
-        # copies of "which characters/words exist" is exactly how a
-        # silent <UNK>-collision drift bug happens (see this file's
-        # git history / test.py's train.py-vs-model.py regression
-        # tests). Re-reading the file for split_sentences() afterward
-        # mirrors that same two-pass approach.
-        wf = Counter()
-        stream_word_freq(corpus_file, wf, TokenizerConfig.STREAM_CHUNK_SIZE)
-        with open(corpus_file, "r", encoding="utf-8", errors="ignore") as f:
-            sentences = split_sentences(f.read())
-    else:
-        sentences = split_sentences(corpus_text)
-        wf = Counter()
-        for s in sentences:
-            for w in segment(s):
-                wf[w] += 1
-
-    # Stage 1: characters -- delegates to CharacterVocabulary's own
-    # build() instead of hand-rolling a second copy of it here.
-    chars_before = tok.chars.vocab_size
-    tok.chars.build(wf.keys(), min_next_id=tok._next_free_id())
-    D.update(stats={"vocab": tok.chars.vocab_size})
-    D.item(dim(f"stage 1: learned {tok.chars.vocab_size - chars_before} base characters"))
-
-    # Stage 2: pre-define words -- delegates to TokenVocabulary's own
-    # build() (most-frequent-first, capped to vocab_size -- long tail
-    # falls back to live stage-1 spelling at encode() time, never
-    # <UNK>, see tokenizer.py's module docstring) instead of
-    # hand-rolling a second copy of that sort/assign loop here, same
-    # "don't duplicate the algorithm" reasoning the old BPE-merge
-    # delegation used to follow. Word pre-definition is a single fast
-    # pass, not an iterative merge loop -- nothing here to animate
-    # step-by-step the way BPE's merges once were, so this phase
-    # reports its result once rather than live per-word.
-    multi_char = {w: c for w, c in wf.items() if len(w) > 1}
-    requested = len(multi_char)
-    if requested > vocab_size:
-        keep = dict(sorted(multi_char.items(), key=lambda kv: (-kv[1], kv[0]))[:vocab_size])
-    else:
-        keep = multi_char
-    D.update(step=len(keep), total=max(len(keep), 1), stats={"vocab": tok.chars.vocab_size})
-    tok.words.build(keep)
-    top_preview = sorted(keep, key=lambda w: (-keep[w], w))[:5]
-    overflow = f"  ·  {requested - len(keep):,} more fall back to stage-1 spelling" if requested > len(keep) else ""
-    D.item(dim(f"stage 2: pre-defined {len(keep):,} words  ·  top: {', '.join(top_preview)}{overflow}"))
-
-    D.phase_done(PHASES[0][1], f"{tok.vocab_size_actual:,} tokens total  ·  "
-                                f"{tok.chars.vocab_size:,} chars  ·  "
-                                f"{tok.words.vocab_size - len(SPECIAL_TOKENS):,} pre-defined words")
-
-    sequences        = [tok.encode_for_training(s) for s in sentences]
-    vocab_size_actual = tok.vocab_size_actual
-
-    def dec(i):
-        if i == WORD_BOUND:
-            return ""
-        if tok.chars.is_char_id(i):
-            return tok.chars.decode_id(i) or f"#{i}"
-        return tok.words.decode_id(i) or f"#{i}"
-
-    # ══ Phase 2: Edge Matrix ══════════════════════════════════════════════════
-    D.phase = "edges"; D.phase_label = PHASES[1][1]
-    D.phase_t0 = time.time(); D.next_phase = "Bridge Matrix"; D.rate_unit = "pair"
-    total_pairs = sum(max(len(s)-1, 0) for s in sequences)
-    D.update(step=0, total=total_pairs)
-    D.item(dim(f"scanning {total_pairs} token pairs across {len(sequences)} sentences…"), force=True)
-
-    seen_e = set(); edges = []; edge_counts = {}; step = 0
-    for seq in sequences:
-        for i in range(len(seq)-1):
-            s, d = seq[i], seq[i+1]
-            pair = (s, d)
-            is_new = pair not in seen_e
-            if is_new:
-                seen_e.add(pair); edges.append(pair)
-            edge_counts[pair] = edge_counts.get(pair, 0) + 1
-            step += 1
-            D.update(step=step, total=total_pairs, stats={"edges": len(edges)})
-            D.item(
-                f"{amber('E')}  {teal(dec(s))} → {teal(dec(d))}"
-                + (f"  {green('✦ new')}  {dim(f'[{len(edges)}]')}" if is_new
-                   else f"  {dim('(dup)')}")
-            )
-
-    edges.sort(key=lambda p: p[0])
-    edge_matrix = EdgeMatrix()
-    edge_matrix.src   = array("i", [p[0] for p in edges])
-    edge_matrix.dst   = array("i", [p[1] for p in edges])
-    edge_matrix.count = array("i", [edge_counts[p] for p in edges])
-    edge_matrix.index = array("i", [0] * (vocab_size_actual + 1))
-    for sv in edge_matrix.src: edge_matrix.index[sv+1] += 1
-    for i in range(1, len(edge_matrix.index)): edge_matrix.index[i] += edge_matrix.index[i-1]
-    edge_matrix._vocab_size = vocab_size_actual
-    D.update(step=total_pairs, stats={"edges": len(edges)})
-    D.phase_done(PHASES[1][1], f"{len(edges):,} unique bigrams")
-
-    # ══ Phase 3: Bridge Matrix ════════════════════════════════════════════════
-    D.phase = "bridges"; D.phase_label = PHASES[2][1]
-    D.phase_t0 = time.time(); D.next_phase = "Cluster Assignment"; D.rate_unit = "triple"
-    total_triples = sum(max(len(s)-2, 0) for s in sequences)
-    D.update(step=0, total=total_triples)
-    D.item(dim(f"scanning {total_triples} token triples…"), force=True)
-
-    seen_b = set(); triples = []; step = 0
-    for seq in sequences:
-        for i in range(len(seq)-2):
-            src, br, tgt = seq[i], seq[i+1], seq[i+2]
-            entry = (src, tgt, br)
-            is_new = entry not in seen_b
-            if is_new:
-                seen_b.add(entry); triples.append(entry)
-            step += 1
-            D.update(step=step, total=total_triples, stats={"bridges": len(triples)})
-            D.item(
-                f"{purple('B')}  {teal(dec(src))} →[{white(dec(br))}]→ {teal(dec(tgt))}"
-                + (f"  {green('✦ new')}  {dim(f'[{len(triples)}]')}" if is_new
-                   else f"  {dim('(dup)')}")
-            )
-
-    triples.sort(key=lambda t: t[0])
-    n = len(triples)
-    D.update(step=total_triples, stats={"bridges": n})
-    D.phase_done(PHASES[2][1], f"{n:,} unique triples")
-
-    # ══ Phase 4: Cluster Assignment ═══════════════════════════════════════════
-    D.phase = "clusters"; D.phase_label = PHASES[3][1]
-    D.phase_t0 = time.time(); D.next_phase = "Relationship Matrix"; D.rate_unit = "cluster"
-    D.update(step=0, total=n*2)
-    D.item(dim(f"grouping {n} triples by (source,target) and (source,bridge)…"), force=True)
-
-    cluster_id = [0] * n
-    gst = defaultdict(list); gsb = defaultdict(list)
-    for idx, (s, t, b) in enumerate(triples):
-        gst[(s, t)].append(idx)
-        gsb[(s, b)].append(idx)
-
-    nc = 1; step = 0
-    # Pass 1 — bridge axis
-    for (s, t), idxs in gst.items():
-        step += len(idxs)
-        if len(idxs) > 1:
-            for i in idxs: cluster_id[i] = nc
-            members = [dec(triples[i][2]) for i in idxs]
-            D.update(step=step, total=n*2, stats={"clusters": nc})
-            D.item(
-                f"{green('C')}  cluster {white(str(nc))}  {dim('[bridge-axis]')}"
-                f"  {teal(dec(s))}→__→{teal(dec(t))}"
-                f"  {dim('members:')} {amber(str(members))}",
-                force=True
-            )
-            nc += 1
-        else:
-            D.update(step=step, total=n*2)
-            D.item(
-                f"{dim('C')}  {dim(dec(s))}→__→{dim(dec(t))}"
-                f"  {dim('only 1 member — cluster_id=0')}"
-            )
-
-    # Pass 2 — target axis
-    for (s, b), idxs in gsb.items():
-        step += len(idxs)
-        if len(idxs) > 1 and all(cluster_id[i] == 0 for i in idxs):
-            for i in idxs: cluster_id[i] = nc
-            members = [dec(triples[i][1]) for i in idxs]
-            D.update(step=step, total=n*2, stats={"clusters": nc})
-            D.item(
-                f"{green('C')}  cluster {white(str(nc))}  {dim('[target-axis]')}"
-                f"  {teal(dec(s))}→[{teal(dec(b))}]→__"
-                f"  {dim('members:')} {amber(str(members))}",
-                force=True
-            )
-            nc += 1
-        else:
-            D.update(step=step, total=n*2)
-            D.item(
-                f"{dim('C')}  {dim(dec(s))}→[{dim(dec(b))}]→__"
-                f"  {dim('(already clustered or singleton)')}"
-            )
-
-    clustered = sum(1 for c in cluster_id if c != 0)
-
-    # pack bridge matrix
-    bridge_matrix = BridgeMatrix()
-    bridge_matrix.source     = array("i", [t[0] for t in triples])
-    bridge_matrix.target     = array("i", [t[1] for t in triples])
-    bridge_matrix.bridge     = array("i", [t[2] for t in triples])
-    bridge_matrix.cluster_id = array("i", cluster_id)
-    bridge_matrix.index      = array("i", [0] * (vocab_size_actual + 1))
-    for sv in bridge_matrix.source: bridge_matrix.index[sv+1] += 1
-    for i in range(1, len(bridge_matrix.index)): bridge_matrix.index[i] += bridge_matrix.index[i-1]
-    bridge_matrix._vocab_size = vocab_size_actual
-    t_index = defaultdict(set)
-    for sv, tv, bv, cv in zip(bridge_matrix.source, bridge_matrix.target,
-                               bridge_matrix.bridge, bridge_matrix.cluster_id):
-        if cv != 0: t_index[bv].add(cv); t_index[tv].add(cv)
-    bridge_matrix.t_index = {k: sorted(v) for k, v in t_index.items()}
-
-    D.update(step=n*2, total=n*2, stats={"clusters": nc-1})
-    D.phase_done(PHASES[3][1], f"{nc-1} clusters  ·  {clustered:,}/{n:,} triples clustered")
-
-    # ══ Phase 5: Relationship Matrix ══════════════════════════════════════════
-    D.phase = "rels"; D.phase_label = PHASES[4][1]
-    D.phase_t0 = time.time(); D.next_phase = "Save"; D.rate_unit = "row"
-
-    # Dedup sentences by exact content first -- same principle Phase 3
-    # already applies to triples: two literally identical training
-    # sentences share ONE relationship_id, with rel_count tracking how
-    # many times that exact content occurred (see graph.py's
-    # RelationshipMatrix docstring). Must match RelationshipMatrix.build()
-    # exactly, or this hand-rolled display path silently drifts from the
-    # library path again -- see config.py's own warning about exactly
-    # this class of bug (train.py already caused it once, for
-    # EdgeMatrix.count, before test_train_py_cli_path_matches_model_api
-    # existed to catch it).
-    seq_to_rel_id = {}
-    unique_seqs = []
-    rel_counts = []
-    for seq in sequences:
-        key = tuple(seq)
-        rid = seq_to_rel_id.get(key)
-        if rid is None:
-            rid = len(unique_seqs)
-            seq_to_rel_id[key] = rid
-            unique_seqs.append(seq)
-            rel_counts.append(0)
-        rel_counts[rid] += 1
-
-    total_r = sum(max(len(s)-2, 0) for s in unique_seqs)
-    triple_to_id = {(s,t,b): i for i,(s,t,b) in enumerate(triples)}
-    D.update(step=0, total=total_r)
-    D.item(dim(f"linking {n} triples to {len(unique_seqs)} unique sentence "
-                f"rel_ids ({len(sequences)} raw sentences seen)…"), force=True)
-
-    rel_matrix = RelationshipMatrix()
-    rows = []; step = 0
-    # count how many DISTINCT relationship_ids each triple appears under
-    # (to detect shared) -- matches relationships_for_triple()'s dedup
-    # semantics now, not raw sentence-occurrence count.
-    triple_appearances = Counter()
-    for rel_id, seq in enumerate(unique_seqs):
-        for i in range(len(seq)-2):
-            src, br, tgt = seq[i], seq[i+1], seq[i+2]
-            tid = triple_to_id.get((src, tgt, br))
-            if tid is not None: triple_appearances[tid] += 1
-
-    for rel_id, seq in enumerate(unique_seqs):
-        for i in range(len(seq)-2):
-            src, br, tgt = seq[i], seq[i+1], seq[i+2]
-            tid = triple_to_id.get((src, tgt, br))
-            if tid is not None:
-                rows.append((tid, rel_id))
-                step += 1
-                appears = triple_appearances[tid]
-                D.update(step=step, total=total_r, stats={"rels": len(rows)})
-                flag = (f"  {red('✦ SHARED')} {dim(f'({appears} sentences)')}"
-                        if appears > 1 else f"  {dim('(unique)')}")
-                D.item(
-                    f"{red('R')}  triple {white(str(tid))}"
-                    f"  {teal(dec(src))}→[{teal(dec(br))}]→{teal(dec(tgt))}"
-                    f"  {dim('→')} rel:{amber(str(rel_id))}"
-                    + flag
-                )
-
-    rows.sort(key=lambda r: r[1])
-    rel_matrix._n_rels   = len(unique_seqs)
-    rel_matrix.rel_count = array("i", rel_counts)
-    rel_matrix.r_triple  = array("i", [r[0] for r in rows])
-    rel_matrix.r_rel     = array("i", [r[1] for r in rows])
-    rel_matrix.index     = array("i", [0] * (len(unique_seqs) + 1))
-    for r in rel_matrix.r_rel: rel_matrix.index[r+1] += 1
-    for i in range(1, len(rel_matrix.index)): rel_matrix.index[i] += rel_matrix.index[i-1]
-
-    D.update(step=total_r, stats={"rels": len(rows)})
-    D.phase_done(PHASES[4][1],
-                 f"{len(rows):,} rows  ·  {len(unique_seqs):,} unique sentences"
-                 f"  ({len(sequences):,} raw)")
-
-    # ══ Phase 6: Save ═════════════════════════════════════════════════════════
-    D.phase = "save"; D.phase_label = PHASES[5][1]
-    D.phase_t0 = time.time(); D.next_phase = ""; D.rate_unit = "file"
-    D.update(step=0, total=5)
-
-    model.tokenizer = tok
-    model.edges     = edge_matrix
-    model.bridges   = bridge_matrix
-    model.rels      = rel_matrix
-    model.engine    = InferenceEngine(edge_matrix, bridge_matrix, rel_matrix)
-
-    import json
-    os.makedirs(out_path, exist_ok=True)
-
-    tok.save(os.path.join(out_path, "vocabulary.json"))
-    D.update(step=1); D.item(dim("vocabulary.json"))
-    with open(os.path.join(out_path, "edges.json"), "w") as f:
-        json.dump(edge_matrix.to_dict(), f)
-    D.update(step=2); D.item(dim("edges.json"))
-    with open(os.path.join(out_path, "bridges.json"), "w") as f:
-        json.dump(bridge_matrix.to_dict(), f)
-    D.update(step=3); D.item(dim("bridges.json"))
-    with open(os.path.join(out_path, "relationships.json"), "w") as f:
-        json.dump(rel_matrix.to_dict(), f)
-    D.update(step=4); D.item(dim("relationships.json"))
-    with open(os.path.join(out_path, "meta.json"), "w") as f:
-        json.dump({"vocab_size_config": vocab_size, "stats": model.stats()}, f, indent=2)
-    D.update(step=5); D.item(dim("meta.json"), force=True)
-    D.phase_done(PHASES[5][1], os.path.abspath(out_path))
-
-    return model.stats()
-
-
-# ─── Incremental training CLI (no live display -- just before/after) ─────────
-
-def continue_training_cli(args):
-    from model import MSEGraphLanguageModel
-
+def _table(rows):
+    w = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"  {_dim(k.ljust(w))}  {_teal(v)}")
     print()
-    print(f"  {bold('MSE Graph Language Model')}  {dim('─  Continuing training')}")
-    print(f"  {dim('loading')}   {teal(os.path.abspath(args.continue_from))}")
 
-    model = MSEGraphLanguageModel.load(args.continue_from)
+
+# ================ Fresh training ==============================================================
+
+def train_fresh(args):
+    """Fresh training from --corpus (file or folder) or --text. All work happens in model.py."""
+    from model import MSEGraphLanguageModel, discover_corpus_files
+
+    quiet = args.quiet
+    def log(msg=""):
+        if not quiet:
+            print(msg)
+
+    model = MSEGraphLanguageModel(vocab_size=args.vocab_size)
+    files = []
+    if args.corpus:
+        files = discover_corpus_files(args.corpus, recursive=not args.no_recursive)
+
+    log(f"  {_bold('MSE Graph Language Model')}  {_dim('─  Training')}")
+    if args.corpus:
+        kind = "folder" if os.path.isdir(args.corpus) else "file"
+        log(f"  {_dim('corpus')}       {_teal(args.corpus)}  {_dim(f'({kind})')}")
+        note = "(top-level only)" if args.no_recursive and kind == "folder" else ""
+        log(f"  {_dim('files found')}  {_teal(str(len(files)))}" + (f"  {_dim(note)}" if note else ""))
+        if len(files) > 1:
+            log(f"  {_dim('batch_size')}   {_teal(str(args.batch_size))}  files per merge step")
+    else:
+        log(f"  {_dim('corpus')}       {_teal(_preview(args.text))}")
+    log(f"  {_dim('vocab_size')}   {_teal(str(args.vocab_size))}")
+    log()
+
+    t0 = time.time()
+    state = {"t_graph": None}
+
+    def progress(stage, done, total, info):
+        if quiet:
+            return
+        if stage == "vocab":
+            if done == 1:
+                print(f"  {_bold('Pass 1/2')}  building shared vocabulary…")
+            words = f"({info['distinct_words']:,} distinct words so far)"
+            print(f"\r    [{done}/{total}] {os.path.basename(info['path'])}  {_dim(words)}" + " " * 10,
+                  end="", flush=True)
+            if done == total:
+                print()
+                print(f"  {_green('✓')}  vocabulary pass done  {_dim(f'{time.time() - t0:.2f}s')}")
+                print()
+        elif stage == "graph":
+            if done == 1:
+                state["t_graph"] = time.time()
+                plural = f" in batches of {args.batch_size} file(s)" if total > 1 else ""
+                print(f"  {_bold('Pass 2/2')}  building graph{plural}…")
+            s = info["stats"]
+            elapsed = time.time() - state["t_graph"]
+            print(f"\r    [batch {done}/{total}]"
+                  f"  edges {s['edges']:,}  bridges {s['bridges']:,}"
+                  f"  clusters {s['clusters']:,}  rels {s['relationships']:,}"
+                  f"  {_dim(f'{elapsed:.1f}s')}" + " " * 6, end="", flush=True)
+            if done == total:
+                print()
+                print(f"  {_green('✓')}  graph built  {_dim(f'{elapsed:.2f}s')}")
+                print()
 
     if args.corpus:
-        with open(args.corpus, "r", encoding="utf-8", errors="ignore") as f:
-            new_text = f.read()
-        size = os.path.getsize(args.corpus)
-        print(f"  {dim('new corpus')}   {teal(args.corpus)}  {dim(f'({size:,} bytes)')}")
+        model.train_from_source(args.corpus, batch_size=args.batch_size,
+                                recursive=not args.no_recursive, progress=progress)
     else:
-        new_text = args.text
-        preview = new_text[:72].replace("\n", " ") + ("…" if len(new_text) > 72 else "")
-        print(f"  {dim('new corpus')}   {teal(preview)}")
+        log(f"  {_bold('Training')}  tokenizing and building the matrix from inline text…")
+        model.train(args.text)
+        log(f"  {_green('✓')}  trained  {_dim(f'{time.time() - t0:.2f}s')}")
+        log()
+
+    model.save(args.out)
+
+    stats = model.stats()
+    log(f"  {_green('─' * 60)}")
+    log(f"  {_green('✓')}  {_bold('Training complete')}")
+    log()
+    if not quiet:
+        rows = [("Output folder", os.path.abspath(args.out))]
+        if args.corpus:
+            rows.append(("Files processed", f"{len(files):,}"))
+        rows += [
+            ("Vocabulary",        f"{stats['vocab_size']:,} tokens"),
+            ("Slot fillers",      f"{stats['bridges']:,} unique triples"),
+            ("Slot groups",       f"{stats['clusters']:,} groups  ·  {stats['clustered_bridges']:,} triples grouped"),
+            ("Total time",        f"{time.time() - t0:.2f}s"),
+        ]
+        _table(rows)
+    return model
+
+
+# ======= Incremental training =================================================
+
+def train_continue(args):
+    """Add --corpus (file or folder) or --text to an already-trained model."""
+    from model import MSEGraphLanguageModel
+
+    quiet = args.quiet
+    def log(msg=""):
+        if not quiet:
+            print(msg)
 
     out_path = args.out or args.continue_from
-    print(f"  {dim('output')}   {teal(os.path.abspath(out_path))}")
+    log(f"  {_bold('MSE Graph Language Model')}  {_dim('─  Continuing training')}")
+    log(f"  {_dim('loading')}      {_teal(os.path.abspath(args.continue_from))}")
+    model = MSEGraphLanguageModel.load(args.continue_from)
+    if args.corpus:
+        kind = "folder" if os.path.isdir(args.corpus) else "file"
+        log(f"  {_dim('new corpus')}   {_teal(args.corpus)}  {_dim(f'({kind})')}")
+        log(f"  {_dim('batch_size')}   {_teal(str(args.batch_size))}  files per merge step")
+    else:
+        log(f"  {_dim('new corpus')}   {_teal(_preview(args.text))}")
+    log(f"  {_dim('output')}       {_teal(os.path.abspath(out_path))}")
     if args.extend_vocab:
-        print(f"  {dim('extend_vocab')}   {teal('yes')}"
-              f"  {dim(f'(target vocab_size {args.target_vocab_size})')}")
-    print()
+        log(f"  {_dim('extend_vocab')} {_teal('yes')}  {_dim(f'(target vocab_size {args.target_vocab_size})')}")
+    log()
 
-    summary = model.train_incremental(
-        new_text,
-        extend_vocab=args.extend_vocab,
-        target_vocab_size=args.target_vocab_size,
-    )
+    t0 = time.time()
+
+    def progress(stage, done, total, info):
+        if quiet:
+            return
+        if stage == "vocab":
+            print(f"\r    vocabulary [{done}/{total}] {os.path.basename(info['path'])}"
+                  f"  {_dim('(' + format(info['distinct_words'], ',') + ' distinct words so far)')}" + " " * 10,
+                  end="\n" if done == total else "", flush=True)
+        else:
+            s = info["stats"]
+            print(f"\r    [batch {done}/{total}]"
+                  f"  edges {s['edges']:,}  bridges {s['bridges']:,}"
+                  f"  clusters {s['clusters']:,}  rels {s['relationships']:,}"
+                  f"  {_dim(f'{time.time() - t0:.1f}s')}" + " " * 6,
+                  end="\n" if done == total else "", flush=True)
+
+    kw = dict(extend_vocab=args.extend_vocab, target_vocab_size=args.target_vocab_size)
+    if args.corpus:
+        summary = model.train_incremental_source(
+            args.corpus, batch_size=args.batch_size, recursive=not args.no_recursive,
+            progress=progress, **kw)
+    else:
+        summary = model.train_incremental(args.text, **kw)
     model.save(out_path)
 
     before, after = summary["before"], summary["after"]
-    rows = [
-        ("Sentences added",   str(summary["sentences_added"])),
-        ("Vocabulary added",  f"{summary['vocab_added']:,} tokens"
-                               f"  ({before['vocab_size']:,} → {after['vocab_size']:,})"),
-        ("Edge Matrix",       f"{before['edges']:,} → {after['edges']:,} unique bigrams"),
-        ("Bridge Matrix",     f"{before['bridges']:,} → {after['bridges']:,} unique triples"),
-        ("Clustered triples", f"{before['clustered_bridges']:,} → {after['clustered_bridges']:,}"
-                               f"  ({before['clusters']} → {after['clusters']} clusters)"),
-        ("Relationship rows", f"{before['relationship_rows']:,} → {after['relationship_rows']:,}"
-                               f"  ({before['relationships']} → {after['relationships']} unique sentences)"),
-    ]
-    if summary["ctm_invalidated"]:
-        rows.append(("Context Trigger Matrix", amber("invalidated — call build_context_triggers() again")))
-    rows.append(("Open Mode", "auto-rebuilt from the merged graphs (no separate step needed)"))
-
-    w = max(len(k) for k, _ in rows)
-    for k, v in rows:
-        print(f"  {dim(k.ljust(w))}  {teal(v)}")
-    print()
-    print(f"  {green('✓')}  {bold('Saved to')} {os.path.abspath(out_path)}")
-    print()
+    log()
+    log(f"  {_green('─' * 60)}")
+    log(f"  {_green('✓')}  {_bold('Saved to')} {os.path.abspath(out_path)}")
+    log()
+    if not quiet:
+        rows = [
+            ("Sentences added",  f"{summary['sentences_added']:,}"),
+            ("Vocabulary",       f"{before['vocab_size']:,} → {after['vocab_size']:,}  (+{summary['vocab_added']:,} tokens)"),
+            ("Adjacent pairs",   f"{before['edges']:,} → {after['edges']:,} unique bigrams"),
+            ("Slot fillers",     f"{before['bridges']:,} → {after['bridges']:,} unique triples"),
+            ("Slot groups",      f"{before['clusters']:,} → {after['clusters']:,} groups"
+                                 f"  ({before['clustered_bridges']:,} → {after['clustered_bridges']:,} triples grouped)"),
+            ("Sentence tiles",   f"{before['tile_rows']:,} → {after['tile_rows']:,}"
+                                 f"  ({before['relationships']:,} → {after['relationships']:,} unique sentences)"),
+        ]
+        rows.append(("Open Mode", "auto-rebuilt from the merged matrix"))
+        rows.append(("Total time", f"{time.time() - t0:.2f}s"))
+        _table(rows)
+    return model
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
+# ==== CLI ===============================================================
 
 def main():
-    p = argparse.ArgumentParser(description="Train an MSE Graph Language Model")
-    p.add_argument("--corpus",     help="Path to a text file (streamed)")
-    p.add_argument("--text",       help="Inline corpus string")
-    p.add_argument("--out",        help="Output folder (required for fresh training; "
+    p = argparse.ArgumentParser(
+        description="Train an MSE Graph Language Model from a file, a folder of .txt files, "
+                    "or inline text -- fresh, or added to an existing model with --continue-from.")
+    p.add_argument("--corpus", "--corpus-dir", dest="corpus", metavar="PATH",
+                   help="A text file OR a folder of .txt files (folders are scanned recursively)")
+    p.add_argument("--text",        help="Inline corpus string")
+    p.add_argument("--out",         help="Output folder (required for fresh training; "
                                          "defaults to --continue-from's folder otherwise)")
-    p.add_argument("--vocab-size", type=int, default=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE)
-    p.add_argument("--quiet",      action="store_true")
+    p.add_argument("--vocab-size",  type=int, default=TokenizerConfig.TRAIN_CLI_DEFAULT_VOCAB_SIZE)
+    p.add_argument("--batch-size",  type=int, default=TrainCorpusConfig.DEFAULT_BATCH_SIZE,
+                   help="Folder sources: files merged into the graph per step (fewer, bigger "
+                        "batches = fewer merge passes, more memory per step)")
+    p.add_argument("--no-recursive", action="store_true",
+                   help="Folder sources: only scan the top level, not subfolders")
+    p.add_argument("--quiet",       action="store_true")
     p.add_argument("--continue-from", metavar="FOLDER",
-                    help="Add this corpus to an already-trained model instead of "
-                         "training a fresh one. Loads FOLDER, merges the new corpus "
-                         "into it, saves to --out (or back to FOLDER if --out is omitted).")
+                   help="Add the corpus to an already-trained model instead of training a fresh "
+                        "one. Loads FOLDER, merges, saves to --out (or back to FOLDER).")
     p.add_argument("--extend-vocab", action="store_true",
-                    help="With --continue-from: also grow the vocabulary using the new "
-                         "corpus (requires --target-vocab-size). Default: keep the "
-                         "existing vocabulary frozen.")
+                   help="With --continue-from: also grow the vocabulary from the new corpus "
+                        "(requires --target-vocab-size). Default: vocabulary stays frozen.")
     p.add_argument("--target-vocab-size", type=int, default=None,
-                    help="New vocab_size ceiling when --extend-vocab is set; must be "
-                         "greater than the loaded model's current vocab_size.")
+                   help="New vocab_size ceiling when --extend-vocab is set")
     args = p.parse_args()
 
-    if not args.corpus and not args.text:
-        print("Provide --corpus <file> or --text <string>", file=sys.stderr)
-        sys.exit(1)
+    def die(msg):
+        print(msg, file=sys.stderr); sys.exit(1)
 
-    if args.continue_from:
-        continue_training_cli(args)
-        return
+    if bool(args.corpus) == bool(args.text):
+        die("Provide exactly one of --corpus <file-or-folder> or --text <string>")
+    if args.batch_size < 1:
+        die("--batch-size must be >= 1")
+    if args.extend_vocab and not args.target_vocab_size:
+        die("--extend-vocab requires --target-vocab-size")
+    if not args.continue_from and not args.out:
+        die("Provide --out <folder> (or use --continue-from to update a model in place)")
+    if args.corpus and not os.path.exists(args.corpus):
+        die(f"corpus not found: {args.corpus}")
 
-    if not args.out:
-        print("Provide --out <folder> (or use --continue-from to update a model in place)",
-              file=sys.stderr)
-        sys.exit(1)
-
-    from model import MSEGraphLanguageModel
-    model = MSEGraphLanguageModel(vocab_size=args.vocab_size)
-
-    print()
-    print(f"  {bold('MSE Graph Language Model')}  {dim('─  Training')}")
-    if args.corpus:
-        size = os.path.getsize(args.corpus) if os.path.exists(args.corpus) else 0
-        print(f"  {dim('corpus')}   {teal(args.corpus)}  {dim(f'({size:,} bytes)')}")
-    else:
-        preview = args.text[:72].replace("\n"," ") + ("…" if len(args.text)>72 else "")
-        print(f"  {dim('corpus')}   {teal(preview)}")
-    print(f"  {dim('vocab')}    {teal(str(args.vocab_size))}  target tokens")
-    print(f"  {dim('output')}   {teal(os.path.abspath(args.out))}")
-    print()
-
-    D = Display(quiet=args.quiet)
-    D.start()
-
-    stats = train_with_display(
-        model,
-        corpus_text=args.text,
-        corpus_file=args.corpus,
-        vocab_size=args.vocab_size,
-        display=D,
-        out_path=args.out,
-    )
-    D.finish(stats, os.path.abspath(args.out))
+    try:
+        (train_continue if args.continue_from else train_fresh)(args)
+    except (FileNotFoundError, ValueError) as e:
+        die(str(e))
 
 
 if __name__ == "__main__":

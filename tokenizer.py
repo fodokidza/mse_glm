@@ -201,7 +201,7 @@ def stream_word_freq(path, word_freq, chunk_size=TokenizerConfig.STREAM_CHUNK_SI
     Stream `path` in chunks, accumulating case-preserving word counts
     into the caller-provided `word_freq` Counter, so a caller with
     many files to combine into one shared vocabulary
-    (train_corpus.py's Pass 1) can share one counter across all of
+    (train.py's Pass 1) can share one counter across all of
     them without ever holding a whole file's text in memory at once.
     Returns the number of sentences seen in this one file. Uses this
     module's own case-preserving segment() for word segmentation, not

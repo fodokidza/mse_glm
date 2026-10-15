@@ -644,7 +644,7 @@ class RelationshipMatrix:
         A no-op after the first call on a given matrix -- build() and
         merge_incremental() both leave this cache populated -- so the
         reconstruction this replaces (previously paid on EVERY batch in
-        train_corpus.py's merge loop) now happens at most ONCE per
+        train.py's batch merge loop) now happens at most ONCE per
         loaded model, only if that model came from from_dict().
         """
         if self._seq_to_rel_id is not None and self._unique_seqs is not None:

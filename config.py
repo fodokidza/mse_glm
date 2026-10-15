@@ -79,7 +79,7 @@ class IVMConfig:
     candidates, so these are MIX weights, not count scales. Q3/Q4 (legality
     checks) carry no weight: they gate who may be picked, they don't score."""
     Q1_WEIGHT = 0.5
-    Q2_WEIGHT = 0.0003
+    Q2_WEIGHT = 0.05
     # How many of the top-scored candidates Q3/Q4 may work on. None = ALL of
     # them; a positive int N = only the top N (ties at the cut-off stay in).
     # If none of the window is a legal continuation the winner is <EOS>.
@@ -108,10 +108,10 @@ class NoiseConfig:
     # Cached rows are NOT recomputed if you change this mid-session: rebuild
     # model.token_vocab / model.noise_index (or restart) after changing it.
     STAGES_ENABLED = {
-        "stage1": True,
-        "stage2": True,
-        "stage3": True,
-        "stage4": False,
+        "stage1": False,
+        "stage2": False,
+        "stage3": False,
+        "stage4": True,
     }
 
     @classmethod
@@ -185,10 +185,10 @@ class GenerationConfig:
 
 
 class TrainCorpusConfig:
-    # train_corpus.py's --batch-size default: how many files are merged
+    # train.py's --batch-size default: how many files are merged
     # into the graph per train_incremental() step. 1 is the safest
     # default (smallest per-step memory footprint), not the fastest --
-    # see train_corpus.py's own module docstring for the cost tradeoff.
+    # see model.train_from_source()'s docstring for the cost tradeoff.
     DEFAULT_BATCH_SIZE = 10
 
 

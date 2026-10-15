@@ -25,6 +25,35 @@ from config import (TokenizerConfig, GenerationConfig, CTMConfig, InterpretConfi
                     NoiseConfig, PAD, UNK, BOS, EOS)
 
 
+def discover_corpus_files(path, recursive=True):
+    """
+    Resolve a training SOURCE to a deterministic, sorted list of file paths.
+
+    path is a text file (-> [path]) or a folder (-> every .txt file under it;
+    recursive=False scans only the top level). Sorted so re-running on the same
+    folder trains in the same order. Raises FileNotFoundError if the path does not
+    exist or a folder holds no .txt files.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"corpus not found: {path!r}")
+    if os.path.isfile(path):
+        return [path]
+    found = []
+    if recursive:
+        for root, _dirs, names in os.walk(path):
+            for fn in names:
+                if fn.lower().endswith(".txt"):
+                    found.append(os.path.join(root, fn))
+    else:
+        for fn in os.listdir(path):
+            full = os.path.join(path, fn)
+            if os.path.isfile(full) and fn.lower().endswith(".txt"):
+                found.append(full)
+    if not found:
+        raise FileNotFoundError(f"No .txt files found under {path!r}")
+    return sorted(found)
+
+
 class MSEGraphLanguageModel:
 
     def __init__(self, vocab_size=TokenizerConfig.DEFAULT_VOCAB_SIZE):
@@ -78,12 +107,106 @@ class MSEGraphLanguageModel:
         the full text in memory -- it just paid segment() twice on it
         instead of once (see train()'s docstring). Genuinely streamed,
         never-fully-materialized training across many files is still
-        available -- see train_corpus.py, which uses
+        available -- see train_from_source(), which uses
         tokenizer.stream_word_freq() directly for exactly that case.
         """
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
         self.train(text)
+
+    # ==== training from a file / folder (streamed, batched) =====================
+    # What train.py's --corpus uses. Two bounded-memory passes: (1) stream word
+    # frequencies across every file into ONE shared vocabulary, (2) encode and merge
+    # the files `batch_size` at a time. Pass 2 reads each file whole (a corpus split
+    # across many reasonably-sized files is the intended case) and every merge after
+    # the first goes through _merge_graphs(), so total cost grows with the number of
+    # batches -- a larger batch_size means fewer merge passes, more memory per step.
+    #
+    # progress(stage, done, total, info) is optional:
+    #   stage "vocab": info = {"path": file, "distinct_words": n so far}
+    #   stage "graph": info = {"stats": self.stats() after that batch}
+
+    def _stream_vocab(self, files, progress=None):
+        """Pass 1: shared word-frequency Counter over every file, streamed in chunks."""
+        from collections import Counter
+        from tokenizer import stream_word_freq
+        word_freq = Counter()
+        for i, path in enumerate(files, 1):
+            stream_word_freq(path, word_freq)
+            if progress:
+                progress("vocab", i, len(files),
+                         {"path": path, "distinct_words": len(word_freq)})
+        return word_freq
+
+    def _encode_files(self, paths):
+        """Read these files whole and encode their sentences with the CURRENT tokenizer."""
+        from tokenizer import segment
+        seqs = []
+        for path in paths:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            for s in split_sentences(text):
+                seqs.append(self.tokenizer.encode_for_training_words(segment(s)))
+        return seqs
+
+    def train_from_source(self, path, batch_size=10, recursive=True, progress=None):
+        """
+        Fresh training from a text file or a folder of .txt files (see
+        discover_corpus_files()). Builds one shared vocabulary first, then the
+        graph in batches of `batch_size` files. Returns the list of files used.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        files = discover_corpus_files(path, recursive=recursive)
+        self.tokenizer._train_from_word_freq(self._stream_vocab(files, progress))
+
+        batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
+        for bi, batch in enumerate(batches, 1):
+            seqs = self._encode_files(batch)
+            if bi == 1:
+                self._build_graphs(seqs)
+            else:
+                self._merge_graphs(seqs)
+            if progress:
+                progress("graph", bi, len(batches), {"stats": self.stats()})
+        return files
+
+    def train_incremental_source(self, path, batch_size=10, recursive=True, progress=None,
+                                 extend_vocab=False, target_vocab_size=None):
+        """
+        Add a text file / folder to an ALREADY-TRAINED model, in batches. Same
+        contract as train_incremental() (frozen vocabulary unless extend_vocab=True
+        with target_vocab_size), same before/after summary dict. With extend_vocab,
+        the vocabulary pass streams every file once before any batch is merged.
+        """
+        if self._strict is None:
+            raise RuntimeError(
+                "train_incremental_source() requires an already-trained or "
+                "loaded model. Call train()/train_from_source()/load() first.")
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if extend_vocab and not target_vocab_size:
+            raise ValueError(
+                "extend_vocab=True requires target_vocab_size > current vocab_size")
+        files = discover_corpus_files(path, recursive=recursive)
+        before = self.stats()
+
+        added_vocab = 0
+        if extend_vocab:
+            word_freq = self._stream_vocab(files, progress)
+            added_vocab = self.tokenizer.extend_vocab_from_word_freq(word_freq, target_vocab_size)
+
+        had_ctm = self.ctm is not None
+        added = 0
+        batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
+        for bi, batch in enumerate(batches, 1):
+            seqs = self._encode_files(batch)
+            added += len(seqs)
+            self._merge_graphs(seqs)
+            if progress:
+                progress("graph", bi, len(batches), {"stats": self.stats()})
+        return {"sentences_added": added, "vocab_added": added_vocab,
+                "before": before, "after": self.stats(), "ctm_invalidated": had_ctm}
 
     def train_incremental(self, corpus, extend_vocab=False, target_vocab_size=None):
         """
@@ -197,7 +320,7 @@ class MSEGraphLanguageModel:
         merge_incremental in graph.py) rather than a full recompute.
         Previously both were rebuilt from scratch over the union of
         old + new triples/sentences on every call -- correct, but it
-        meant batch N of a batched corpus (train_corpus.py) cost
+        meant batch N of a batched corpus (train.py --corpus) cost
         roughly proportional to the TOTAL corpus seen through batch N,
         not just batch N's own size, so N batches cost O(N *
         corpus_size_so_far) in total rather than O(corpus_size). The

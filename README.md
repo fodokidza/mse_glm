@@ -67,8 +67,7 @@ The optional `server.py` HTTP server additionally needs `flask`
 | `importance.py`       | Sequence reconstruction + per-triple importance/trigger tagging (Python API only) |
 | `ctm.py`               | Context Trigger Matrix — contextual disambiguation among cluster members |
 | `analyse.py`          | Read-only analysis CLI + `Analyser`/`CorpusAnalyser` Python API         |
-| `train.py`            | Fresh training + `--continue-from` incremental training, with live display |
-| `train_corpus.py`     | Large-corpus pipeline — train from a folder of `.txt` files             |
+| `train.py`            | The one training script: `--corpus` (file or folder) or `--text`, fresh or `--continue-from`, with live display |
 | `chat.py`             | Interactive REPL over a trained model                                  |
 | `server.py`           | Optional Flask HTTP API + web UI over a trained model (needs `flask`)   |
 | `benchmark_cache.py`  | Standalone script: times Open Mode's sparse score cache vs. live scoring, confirms they agree, on your own trained model (section 8) |
@@ -206,29 +205,32 @@ model.save("runs/model")
 
 ## 3. Train from a folder of .txt files
 
-For a large corpus split across many files. Two bounded-memory passes:
-builds one shared vocabulary by streaming word frequencies across every
-file first, then builds the graph in batches, reusing the same merge
-machinery as `--continue-from` above.
+`train.py --corpus` takes a text file **or** a folder (scanned recursively for
+`.txt`). For a folder it runs two bounded-memory passes: one shared vocabulary
+built by streaming word frequencies across every file, then the graph built in
+batches, reusing the same merge machinery as `--continue-from` above. The same
+options work fresh or with `--continue-from`.
 
 ```bash
-python3 train_corpus.py --corpus-dir data/ --out runs/big_model --vocab-size 8000
+python3 train.py --corpus data/ --out runs/big_model --vocab-size 8000
 
-# Merge 5 files per step instead of 1 (fewer full-recompute passes, more memory per step)
-python3 train_corpus.py --corpus-dir data/ --out runs/big_model --batch-size 5
+# Merge 5 files per step instead of the default (fewer full-recompute passes, more memory per step)
+python3 train.py --corpus data/ --out runs/big_model --batch-size 5
 
 # Only scan the top level of the folder, not subfolders
-python3 train_corpus.py --corpus-dir data/ --out runs/big_model --no-recursive
+python3 train.py --corpus data/ --out runs/big_model --no-recursive
 
-python3 train_corpus.py --corpus-dir data/ --out runs/big_model --quiet
+python3 train.py --corpus data/ --out runs/big_model --quiet
 ```
+
+`--corpus-dir` is still accepted as an alias of `--corpus`.
 
 | Flag             | Meaning                                                              |
 |------------------|------------------------------------------------------------------------|
-| `--corpus-dir`   | Folder containing `.txt` files — **required**                       |
-| `--out`          | Output folder — **required**                                        |
-| `--vocab-size`   | Target BPE vocabulary size (default 2000)                            |
-| `--batch-size`   | Files merged into the graph per step (default 1 — safest memory profile; raise for fewer, faster merge passes on large corpora) |
+| `--corpus`       | A text file or a folder of `.txt` files (`--corpus-dir` also works)  |
+| `--out`          | Output folder — required for fresh training                         |
+| `--vocab-size`   | Target BPE vocabulary size                                           |
+| `--batch-size`   | Files merged into the graph per step (raise for fewer, faster merge passes on large corpora) |
 | `--no-recursive` | Only scan the top level, skip subfolders                             |
 | `--quiet`        | Suppress progress output                                             |
 
@@ -808,7 +810,7 @@ large-corpus pipeline, save/load round-trips) and prints a final
 
 ```bash
 # 1. Train on a folder of files
-python3 train_corpus.py --corpus-dir data/ --out runs/model --vocab-size 4000
+python3 train.py --corpus data/ --out runs/model --vocab-size 4000
 
 # 2. Look at what it learned
 python3 analyse.py --model runs/model clusters --top 20
@@ -869,7 +871,7 @@ python3 train.py --continue-from runs/model --corpus more_data.txt \
 - **Incremental training auto-rebuilds Open Mode, but invalidates the
   Context Trigger Matrix.** Open Mode (`self._open`/`self.open_ctm`)
   is automatically kept in sync with the merged graphs after any
-  `--continue-from` or `train_corpus.py` run — no action needed. If
+  `--continue-from` run — no action needed. If
   you use `use_context_triggers=True` anywhere, rebuild the CTM
   after merging; `train_incremental()`'s return value tells you
   whether it was affected: `summary["ctm_invalidated"]`.
@@ -961,7 +963,7 @@ python3 train.py --continue-from runs/model --corpus more_data.txt \
   text introduces substantially new vocabulary, or unseen characters
   will collapse onto the same `<UNK>` id and can create false
   structural matches between unrelated words.
-- **`--batch-size` in `train_corpus.py` is a memory/speed knob, not a
+- **`--batch-size` in `train.py` is a memory/speed knob, not a
   correctness one** — the final model is identical regardless of
   batch size (verified in `test.py`). Raise it for large corpora to
   reduce the number of full-recompute merge passes.
