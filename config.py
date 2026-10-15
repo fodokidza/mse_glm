@@ -108,10 +108,10 @@ class NoiseConfig:
     # Cached rows are NOT recomputed if you change this mid-session: rebuild
     # model.token_vocab / model.noise_index (or restart) after changing it.
     STAGES_ENABLED = {
-        "stage1": False,
-        "stage2": False,
-        "stage3": False,
-        "stage4": True,
+        "stage1": True,
+        "stage2": True,
+        "stage3": True,
+        "stage4": False,
     }
 
     @classmethod
