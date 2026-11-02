@@ -7,7 +7,7 @@
 
 `git clone https://github.com/fodokidza/mse_glm.git && python3 test.py` → 2ms, no GPU, audit trail. AGPL + Commercial available 
 
-**Matrix-Structured Edge — Graph Language Model.** Deterministic,
+**Matrix-Structured Edge — Graph Language Model Architecture.** Deterministic,
 zero-weight, explainable. No embeddings, no gradient descent — every
 output traces back to specific rows in specific matrices built from
 training text.
